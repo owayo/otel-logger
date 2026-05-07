@@ -1,0 +1,16 @@
+# Sample Codex CLI configuration that ships telemetry to the local
+# otel-logger sidecar. Mount this file at /root/.codex/config.toml
+# (or whatever $CODEX_HOME points to).
+#
+# Reference:
+# - https://developers.openai.com/codex/config-reference
+# - https://developers.openai.com/codex/config-sample
+
+[otel]
+environment = "ci"
+log_user_prompt = false
+
+# Each signal points at the matching otel-logger HTTP endpoint.
+exporter = { otlp-http = { endpoint = "http://otel-logger:4318/v1/logs", protocol = "binary", headers = {} } }
+metrics_exporter = { otlp-http = { endpoint = "http://otel-logger:4318/v1/metrics", protocol = "binary", headers = {} } }
+trace_exporter = { otlp-http = { endpoint = "http://otel-logger:4318/v1/traces", protocol = "binary", headers = {} } }

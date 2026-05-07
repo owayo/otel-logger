@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.md
+LICENSE
+.dockerignore
+Dockerfile
+compose.yaml
+docker-compose.yaml
+docs/
+data/
+*.jsonl

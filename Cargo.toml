@@ -1,0 +1,88 @@
+[package]
+name = "otel-logger"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSONL"
+license = "MIT"
+repository = "https://github.com/owayo/otel-logger"
+readme = "README.md"
+keywords = ["opentelemetry", "otlp", "ci", "claude-code", "codex"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+
+[lib]
+name = "otel_logger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "otel-logger"
+path = "src/main.rs"
+
+[dependencies]
+# OTLP types & gRPC service traits (single source of truth, no proto drift)
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
+    "gen-tonic",
+    "trace",
+    "metrics",
+    "logs",
+    "with-serde",
+] }
+
+# gRPC stack
+tonic = { version = "0.14.6", default-features = false, features = [
+    "server",
+    "router",
+    "transport",
+    "codegen",
+] }
+tonic-prost = "0.14.6"
+prost = "0.14.3"
+
+# HTTP stack
+axum = { version = "0.8.9", default-features = false, features = [
+    "tokio",
+    "http1",
+    "http2",
+    "json",
+    "matched-path",
+    "original-uri",
+    "query",
+] }
+bytes = "1.11.1"
+http = "1.4.0"
+
+# async runtime
+tokio = { version = "1.52.2", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "fs",
+    "io-util",
+    "net",
+] }
+tokio-util = "0.7.18"
+
+# CLI
+clap = { version = "4.6.1", features = ["derive", "env"] }
+
+# serialization / output
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2"
+
+# misc
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+is-terminal = "0.4.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

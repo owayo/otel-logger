@@ -1,0 +1,91 @@
+# Sample compose stack: run otel-logger as a sidecar that receives OTLP
+# telemetry from Claude Code / Codex executed in another container.
+#
+# Usage:
+#   docker compose up otel-logger              # just start the receiver
+#   docker compose run --rm claude-code-sample # run a one-shot CLI job
+#   docker compose run --rm codex-sample       # run codex with telemetry on
+#
+# Telemetry will appear on otel-logger's stdout (docker compose logs) and in
+# ./data/otel-logger.jsonl as lossless JSON Lines.
+
+services:
+  otel-logger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: otel-logger:dev
+    ports:
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP
+    volumes:
+      - ./data:/var/log/otel-logger
+    command:
+      - --grpc-addr
+      - 0.0.0.0:4317
+      - --http-addr
+      - 0.0.0.0:4318
+      - --log-file
+      - /var/log/otel-logger/otel-logger.jsonl
+      - --color
+      - never
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/otel-logger", "--dry-run"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Sample: Claude Code execution that exports telemetry to otel-logger.
+  # Replace ARG-style env values with your real prompt / project mount.
+  claude-code-sample:
+    image: node:20-bookworm-slim
+    depends_on:
+      otel-logger:
+        condition: service_started
+    environment:
+      # Required to enable Claude Code telemetry at all.
+      CLAUDE_CODE_ENABLE_TELEMETRY: "1"
+
+      # Choose OTLP exporter for each signal. Logs+metrics are GA;
+      # traces require the BETA flag below.
+      OTEL_LOGS_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_TRACES_EXPORTER: otlp
+      CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
+
+      # Send to otel-logger over HTTP/protobuf on port 4318.
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-logger:4318
+
+      # Tag the run so the receiver can attribute telemetry correctly.
+      OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code,service.namespace=ci,deployment.environment=ci"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eux
+        npm install -g @anthropic-ai/claude-code
+        # Replace this with your actual Claude Code invocation.
+        claude --version
+
+  # Sample: Codex CLI execution. Codex contracts on config.toml [otel] rather
+  # than env vars, so this example mounts a config file from ./codex-config.
+  codex-sample:
+    image: node:20-bookworm-slim
+    depends_on:
+      otel-logger:
+        condition: service_started
+    environment:
+      CODEX_HOME: /root/.codex
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - ./codex-config:/root/.codex:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eux
+        npm install -g @openai/codex
+        codex --version
