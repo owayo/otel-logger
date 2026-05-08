@@ -19,7 +19,9 @@ services:
       - "4317:4317" # OTLP/gRPC
       - "4318:4318" # OTLP/HTTP
     volumes:
-      - ./data:/var/log/otel-logger
+      # JSONL output directory. Defaults to ./data (committed to the repo).
+      # Override per-machine via .env: OTEL_LOGGER_DATA_DIR=/absolute/path
+      - ${OTEL_LOGGER_DATA_DIR:-./data}:/var/log/otel-logger
     command:
       - --grpc-addr
       - 0.0.0.0:4317

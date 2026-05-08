@@ -25,3 +25,6 @@ target
 /data/
 *.jsonl
 otel-logger.jsonl
+
+# Local-only Docker Compose env (per-machine OTEL_LOGGER_DATA_DIR override).
+.env
