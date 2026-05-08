@@ -217,6 +217,15 @@ impl Aggregator {
                             session_updates += 1;
                         }
                     }
+                    // Fallback: when `codex.conversation_starts` is dropped
+                    // (e.g. codex CLI's OTLP exporter fails to flush before
+                    // the second invocation in the same job), the per-request
+                    // `handle_responses` span still carries the effort.
+                    if span.name == "handle_responses"
+                        && update_codex_effort_from_request_attrs(&mut g, &span.attributes)
+                    {
+                        session_updates += 1;
+                    }
                 }
             }
         }
@@ -514,6 +523,31 @@ fn codex_effort(g: &AggregatorInner) -> String {
         .as_ref()
         .map(|s| s.effort.clone())
         .unwrap_or_default()
+}
+
+/// Fallback effort source when `codex.conversation_starts` is missing.
+/// `codex.request.*` is internal Codex CLI telemetry rather than an OTel
+/// semantic convention, so we scope this to `handle_responses` spans only and
+/// only touch `effort` (provider/model are still owned by `conversation_starts`
+/// or the metric data point itself).
+fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyValue]) -> bool {
+    let Some(effort) = string_attr(attrs, "codex.request.reasoning_effort") else {
+        return false;
+    };
+    if effort.is_empty() {
+        return false;
+    }
+    match g.codex_last_session.as_mut() {
+        Some(session) => session.effort = effort.to_string(),
+        None => {
+            g.codex_last_session = Some(CodexSession {
+                provider: PROVIDER_OPENAI.to_string(),
+                model: String::new(),
+                effort: effort.to_string(),
+            });
+        }
+    }
+    true
 }
 
 /// Anthropic logs report `claude-opus-4-7`, while metrics/spans report
@@ -838,6 +872,52 @@ mod tests {
         }
     }
 
+    fn make_trace_req(
+        service: &str,
+        spans: Vec<opentelemetry_proto::tonic::trace::v1::Span>,
+    ) -> ExportTraceServiceRequest {
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans};
+
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", service)],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope::default()),
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn handle_responses_span(effort: &str) -> opentelemetry_proto::tonic::trace::v1::Span {
+        opentelemetry_proto::tonic::trace::v1::Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            trace_state: String::new(),
+            parent_span_id: vec![],
+            flags: 0,
+            name: "handle_responses".into(),
+            kind: 0,
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            attributes: vec![kv_str("codex.request.reasoning_effort", effort)],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+        }
+    }
+
     fn make_log_req(service: &str, body: &str, attrs: Vec<KeyValue>) -> ExportLogsServiceRequest {
         use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
         use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -1029,6 +1109,62 @@ mod tests {
         let bucket = agent.buckets.get(&bucket_key).unwrap();
         assert_eq!(bucket.stats.request_count, 2);
         assert_eq!(bucket.stats.duration_ms, 5000);
+    }
+
+    #[test]
+    fn codex_handle_responses_span_updates_effort_for_later_metrics() {
+        let agg = Aggregator::new();
+        // 1回目: conversation_starts が high で届く。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+        // 2回目: conversation_starts は届かず、handle_responses span だけが xhigh を運んでくる。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span("xhigh")],
+        ));
+        // その後に届くメトリクスは xhigh バケットに計上されるべき。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "input", 42.0)],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("xhigh bucket should be populated via span fallback");
+        assert_eq!(bucket.stats.input_tokens, 42);
+    }
+
+    #[test]
+    fn codex_handle_responses_span_without_conversation_starts_seeds_session() {
+        let agg = Aggregator::new();
+        // conversation_starts を一度も観測しないまま handle_responses span が先着しても、
+        // effort が回収できることを確認する (provider は OpenAI 既定にフォールバック)。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span("xhigh")],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "input", 7.0)],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("xhigh bucket should be populated via span fallback");
+        assert_eq!(bucket.stats.input_tokens, 7);
     }
 
     #[test]
