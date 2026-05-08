@@ -98,7 +98,9 @@ otel-logger [OPTIONS]
 | `--config`     |       | (auto)           | `OTEL_LOGGER_CONFIG`      | Path to a TOML config file (see below)                   |
 | `--grpc-addr`  |       | `0.0.0.0:4317`   | `OTEL_LOGGER_GRPC_ADDR`   | gRPC bind address (OTLP/gRPC)                            |
 | `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP bind address (OTLP/HTTP, both protobuf and JSON)    |
-| `--log-file`   |       | (none)           | `OTEL_LOGGER_LOG_FILE`    | Append received telemetry as JSON Lines                  |
+| `--log-file`   |       | (none)           | `OTEL_LOGGER_LOG_FILE`    | Append received telemetry as JSON Lines (mutually exclusive with `--log-dir`) |
+| `--log-dir`    |       | (none)           | `OTEL_LOGGER_LOG_DIR`     | Write daily-rotated JSONL into this directory: `otel-logger.YYYY-MM-DD` (local time) |
+| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of rotated JSONL to keep when `--log-dir` is used   |
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | Suppress the human-readable stdout stream                |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary on each api_request      |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |
@@ -128,6 +130,9 @@ The generated file looks like:
 ```toml
 # ~/.config/otel-logger/config.toml
 log-file = "/var/log/otel-logger/otel-logger.jsonl"
+# Or, daily-rotated output (mutually exclusive with `log-file`):
+# log-dir = "/var/log/otel-logger"
+# log-keep-days = 10                 # default: 10
 no-stdout = false
 summary = false
 color = "auto"  # "auto" | "always" | "never"

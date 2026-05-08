@@ -32,8 +32,21 @@ pub struct Cli {
 
     /// Persist received telemetry as lossless JSON Lines into this file.
     /// The file is opened in append mode and is fsync'd on graceful shutdown.
+    /// Mutually exclusive with `--log-dir`.
     #[arg(long, env = "OTEL_LOGGER_LOG_FILE", value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Persist JSON Lines into a directory with daily rotation.
+    /// Files are named `otel-logger.YYYY-MM-DD` in local time, retained for
+    /// `--log-keep-days` days. Mutually exclusive with `--log-file`.
+    #[arg(long, env = "OTEL_LOGGER_LOG_DIR", value_name = "DIR")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Number of rotated daily JSONL files to retain when `--log-dir` is used.
+    /// Older files are deleted on startup and capped during rotation.
+    /// Defaults to 10.
+    #[arg(long, env = "OTEL_LOGGER_LOG_KEEP_DAYS", value_name = "DAYS")]
+    pub log_keep_days: Option<u32>,
 
     /// Suppress the human-readable stdout stream.
     /// Useful when you only want the JSONL file to be written.
@@ -98,13 +111,27 @@ impl ColorMode {
     }
 }
 
+pub const DEFAULT_LOG_KEEP_DAYS: u32 = 10;
+
+/// Where the JSONL output goes. Either a single append-only file or a directory
+/// with daily rotation; never both simultaneously.
+#[derive(Debug, Clone)]
+pub enum LogSink {
+    File(PathBuf),
+    /// Directory plus the number of rotated daily files to retain.
+    Directory {
+        dir: PathBuf,
+        keep_days: u32,
+    },
+}
+
 /// Resolved configuration: every field has a definite value after merging
 /// CLI flags, environment variables, the config file, and built-in defaults.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub grpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
-    pub log_file: Option<PathBuf>,
+    pub log_sink: Option<LogSink>,
     pub no_stdout: bool,
     pub summary: bool,
     pub color: ColorMode,
@@ -113,8 +140,23 @@ pub struct Settings {
 
 impl Settings {
     /// Merge precedence: CLI flag > env (handled by clap) > config > default.
-    pub fn merge(cli: Cli, config: Config) -> Self {
-        Self {
+    pub fn merge(cli: Cli, config: Config) -> anyhow::Result<Self> {
+        let log_file = cli.log_file.or(config.log_file);
+        let log_dir = cli.log_dir.or(config.log_dir);
+        let keep_days = cli
+            .log_keep_days
+            .or(config.log_keep_days)
+            .unwrap_or(DEFAULT_LOG_KEEP_DAYS);
+        let log_sink = match (log_file, log_dir) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("`--log-file` and `--log-dir` are mutually exclusive");
+            }
+            (Some(file), None) => Some(LogSink::File(file)),
+            (None, Some(dir)) => Some(LogSink::Directory { dir, keep_days }),
+            (None, None) => None,
+        };
+
+        Ok(Self {
             grpc_addr: cli
                 .grpc_addr
                 .or(config.grpc_addr)
@@ -123,11 +165,11 @@ impl Settings {
                 .http_addr
                 .or(config.http_addr)
                 .unwrap_or_else(|| DEFAULT_HTTP_ADDR.parse().expect("valid default")),
-            log_file: cli.log_file.or(config.log_file),
+            log_sink,
             no_stdout: cli.no_stdout || config.no_stdout.unwrap_or(false),
             summary: cli.summary || config.summary.unwrap_or(false),
             color: cli.color.or(config.color).unwrap_or(ColorMode::Auto),
             dry_run: cli.dry_run,
-        }
+        })
     }
 }

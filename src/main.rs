@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     }
 
     let config = Config::load(cli.config.as_deref())?;
-    let settings = Settings::merge(cli, config);
+    let settings = Settings::merge(cli, config)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
             tracing::info!(
                 grpc = %grpc,
                 http = %http,
-                log_file = ?settings.log_file,
+                log_sink = ?settings.log_sink,
                 "dry run: probed both listeners successfully, exiting"
             );
             sink.flush().await?;

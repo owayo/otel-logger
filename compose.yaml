@@ -27,8 +27,12 @@ services:
       - 0.0.0.0:4317
       - --http-addr
       - 0.0.0.0:4318
-      - --log-file
-      - /var/log/otel-logger/otel-logger.jsonl
+      # Daily-rotated JSONL: writes otel-logger.YYYY-MM-DD into the volume.
+      # Files older than --log-keep-days are pruned at startup and during rotation.
+      - --log-dir
+      - /var/log/otel-logger
+      - --log-keep-days
+      - "10"
       - --color
       - never
     healthcheck:

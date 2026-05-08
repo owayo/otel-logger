@@ -20,8 +20,15 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger configuration file
 
 # Persist received OTLP telemetry as lossless JSON Lines. The parent directory
 # is created on startup; the file is opened in append mode and fsync'd on
-# graceful shutdown.
+# graceful shutdown. Mutually exclusive with `log-dir`.
 log-file = "/var/log/otel-logger/otel-logger.jsonl"
+
+# Alternative: write into a directory with daily rotation
+# (`otel-logger.YYYY-MM-DD` per day, in local time). Older files are pruned
+# at startup and capped during rotation to `log-keep-days` (default 10).
+# Mutually exclusive with `log-file`.
+# log-dir = "/var/log/otel-logger"
+# log-keep-days = 10
 
 # Suppress the human-readable stdout stream. Use this when you only want
 # the JSONL file to be written.
@@ -55,7 +62,14 @@ pub struct Config {
     /// HTTP bind address (OTLP/HTTP).
     pub http_addr: Option<SocketAddr>,
     /// Persist received telemetry as JSON Lines into this file.
+    /// Mutually exclusive with `log_dir`.
     pub log_file: Option<PathBuf>,
+    /// Persist JSON Lines into this directory with daily rotation.
+    /// Mutually exclusive with `log_file`.
+    pub log_dir: Option<PathBuf>,
+    /// Number of rotated daily JSONL files to retain (only meaningful with
+    /// `log_dir`). Defaults to 10 when omitted.
+    pub log_keep_days: Option<u32>,
     /// Suppress the human-readable stdout stream.
     pub no_stdout: Option<bool>,
     /// Append a cumulative usage summary to stdout on each `claude_code.api_request`.
