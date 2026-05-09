@@ -9,7 +9,7 @@ use crate::grpc::OtlpService;
 use crate::http;
 use crate::sink::Sink;
 
-/// Run the OTLP/gRPC server on `addr` until `shutdown` is cancelled.
+/// `shutdown` が cancel されるまで、`addr` で OTLP/gRPC server を動かす。
 pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
     let (trace_srv, metrics_srv, logs_srv) = OtlpService::new(sink).into_servers();
     tracing::info!(%addr, "OTLP/gRPC server listening");
@@ -23,8 +23,8 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
     Ok(())
 }
 
-/// Wait for SIGINT or (on Unix) SIGTERM. SIGTERM matters because container
-/// runtimes (Docker, Kubernetes) send it during shutdown.
+/// SIGINT または (Unix では) SIGTERM を待つ。Docker/Kubernetes などの container runtime は
+/// shutdown 時に SIGTERM を送るため、SIGTERM も扱う必要がある。
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -54,7 +54,7 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Orchestrate gRPC + HTTP listeners with cancellation-aware shutdown.
+/// cancellation を考慮しながら gRPC + HTTP listener をまとめて動かす。
 pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     let shutdown = CancellationToken::new();
 
@@ -105,9 +105,8 @@ async fn wait_for(id: tokio::task::Id, handle: tokio::task::JoinHandle<Result<()
     }
 }
 
-/// Bind a `TcpListener` and immediately close it. Used during dry-run to
-/// confirm the address is actually usable (catches port-in-use, permission,
-/// and address-resolution issues before we declare success).
+/// `TcpListener` を bind してすぐ閉じる。dry-run で address が実際に使えるか確認し、
+/// 成功扱いにする前に port 使用中、権限不足、address 解決失敗を検出する。
 pub async fn probe_bind(addr: SocketAddr) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await

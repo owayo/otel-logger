@@ -18,9 +18,8 @@ use crate::format;
 
 const ROTATION_PREFIX: &str = "otel-logger";
 
-/// Internal normalized record. JSONL serialization is lossless because the
-/// inner OTLP protobuf types are kept verbatim; pretty rendering pulls out
-/// only the noteworthy fields.
+/// 内部で扱う正規化済み record。内部の OTLP protobuf 型をそのまま保持するため、
+/// JSONL serialization は欠落しない。pretty rendering では注目すべき field だけを抜き出す。
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TelemetryRecord {
@@ -39,9 +38,8 @@ impl TelemetryRecord {
     }
 }
 
-/// JSONL output backend. Either a single append-only file or a daily-rotated
-/// directory writer (both expose a synchronous `std::io::Write` underneath,
-/// so all writes happen on a `spawn_blocking` thread).
+/// JSONL 出力 backend。追記専用ファイルか日次ローテーション付き directory writer のどちらか。
+/// どちらも内部は同期的な `std::io::Write` なので、書き込みは `spawn_blocking` 上で行う。
 enum JsonlWriter {
     File(StdMutex<StdBufWriter<std::fs::File>>),
     Roller(StdMutex<LogRoller>),
@@ -76,8 +74,8 @@ impl JsonlWriter {
     }
 }
 
-/// Output destination for received telemetry. Cloning is cheap (`Arc` inside),
-/// so all gRPC / HTTP handlers share the same sink.
+/// 受信した telemetry の出力先。内部が `Arc` なので clone は軽く、
+/// すべての gRPC / HTTP handler が同じ sink を共有する。
 #[derive(Clone)]
 pub struct Sink {
     inner: Arc<SinkInner>,
@@ -88,9 +86,8 @@ struct SinkInner {
     color: bool,
     summary_enabled: bool,
     file: Option<JsonlWriter>,
-    /// Coarse-grained mutex around stdout. Telemetry payloads can fan out
-    /// many lines per record, and interleaving with another writer would make
-    /// the human-readable stream unreadable.
+    /// stdout 全体を守る粗い mutex。telemetry payload は 1 record で多くの行に展開されるため、
+    /// 別 writer と interleave すると人が読める stream として壊れる。
     stdout_lock: Mutex<()>,
     aggregator: Aggregator,
 }
@@ -132,17 +129,16 @@ impl Sink {
         })
     }
 
-    /// Borrow the running cumulative-usage aggregator. The HTTP `/stats`
-    /// handler uses this to produce a snapshot on demand.
+    /// 実行中の累計使用量 aggregator を借用する。
+    /// HTTP `/stats` handler はこれを使い、要求時点の snapshot を生成する。
     pub fn aggregator(&self) -> &Aggregator {
         &self.inner.aggregator
     }
 
-    /// Persist a single telemetry batch.
-    /// Errors writing to one destination are logged but do not abort the other.
+    /// 単一の telemetry batch を保存する。
+    /// 一方の出力先への書き込み error はログに残すが、もう一方の出力は止めない。
     pub async fn record(&self, record: TelemetryRecord) {
-        // Update cumulative stats before writing so any summary line we append
-        // to stdout reflects the current batch.
+        // stdout に追記する summary が現在の batch を反映するよう、書き込み前に累計値を更新する。
         let samples_present = match &record {
             TelemetryRecord::Logs(req) => self.inner.aggregator.ingest_logs(req) > 0,
             TelemetryRecord::Traces(req) => self.inner.aggregator.ingest_traces(req) > 0,
@@ -205,8 +201,8 @@ impl Sink {
         Ok(())
     }
 
-    /// Flush any buffered writes. Called from graceful shutdown so SIGTERM
-    /// does not lose the trailing batch.
+    /// buffer 済み書き込みを flush する。SIGTERM でも末尾 batch を失わないよう、
+    /// graceful shutdown から呼び出す。
     pub async fn flush(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -217,8 +213,7 @@ impl Sink {
         })
         .await
         .context("join JSONL flush task")??;
-        // stdout is line-buffered when attached to a terminal; do a best-effort
-        // flush via spawn_blocking.
+        // terminal 接続時の stdout は line-buffered なので、spawn_blocking で best-effort flush する。
         let _ = tokio::task::spawn_blocking(|| {
             let _ = io::stdout().flush();
         })
@@ -257,9 +252,8 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<LogRoller> {
     Ok(appender)
 }
 
-/// Remove `otel-logger.*` files older than `keep_days` (by mtime). Mirrors
-/// claw-hooks's `cleanup_old_logs` so behavior is consistent across our
-/// internal CLIs.
+/// mtime 基準で `keep_days` より古い `otel-logger.*` ファイルを削除する。
+/// claw-hooks の `cleanup_old_logs` と揃え、社内 CLI 間で挙動を一貫させる。
 fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -295,7 +289,7 @@ mod tests {
     use super::*;
 
     fn touch_mtime(path: &Path, when: SystemTime) {
-        // `File::set_times` + `FileTimes::set_modified` are stable cross-platform.
+        // `File::set_times` + `FileTimes::set_modified` は cross-platform で安定している。
         let times = std::fs::FileTimes::new().set_modified(when);
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_times(times).unwrap();

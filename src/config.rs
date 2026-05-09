@@ -6,82 +6,79 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::ColorMode;
 
-/// Reference content emitted by `otel-logger init`. Embedded directly so the
-/// binary can generate a fresh configuration without needing the source tree.
-const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger configuration file
+/// `otel-logger init` が出力する参照用設定。source tree なしで新しい設定を
+/// 生成できるよう、binary に直接埋め込む。
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger 設定ファイル
 #
-# Default location: $XDG_CONFIG_HOME/otel-logger/config.toml
-#                  (or ~/.config/otel-logger/config.toml when XDG_CONFIG_HOME is unset)
+# 既定の場所: $XDG_CONFIG_HOME/otel-logger/config.toml
+#             (XDG_CONFIG_HOME 未設定時は ~/.config/otel-logger/config.toml)
 #
-# Override with `otel-logger --config /path/to/config.toml`.
+# `otel-logger --config /path/to/config.toml` で上書きできます。
 #
-# Precedence: CLI flag > environment variable > config file > built-in default.
-# Every key below is optional. Comment a key out to fall back to the default.
+# 優先順位: CLI flag > 環境変数 > 設定ファイル > 組み込み既定値。
+# 以下の key はすべて任意です。コメントアウトすると既定値に戻ります。
 
-# Persist received OTLP telemetry as lossless JSON Lines. The parent directory
-# is created on startup; the file is opened in append mode and fsync'd on
-# graceful shutdown. Mutually exclusive with `log-dir`.
+# 受信した OTLP telemetry を欠落のない JSON Lines として保存します。親ディレクトリは
+# 起動時に作成され、ファイルは追記モードで開かれ、graceful shutdown 時に fsync されます。
+# `log-dir` とは同時に指定できません。
 log-file = "/var/log/otel-logger/otel-logger.jsonl"
 
-# Alternative: write into a directory with daily rotation
-# (`otel-logger.YYYY-MM-DD` per day, in local time). Older files are pruned
-# at startup and capped during rotation to `log-keep-days` (default 10).
-# Mutually exclusive with `log-file`.
+# 代替: 日次ローテーション付きでディレクトリへ書き出します
+# (ローカル時刻で日ごとの `otel-logger.YYYY-MM-DD`)。古いファイルは起動時に整理され、
+# ローテーション時にも `log-keep-days` (既定値 10) の上限が適用されます。
+# `log-file` とは同時に指定できません。
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10
 
-# Suppress the human-readable stdout stream. Use this when you only want
-# the JSONL file to be written.
+# 人が読める stdout 出力を抑止します。JSONL ファイルだけを書き出したい場合に使います。
 no-stdout = false
 
-# Append a cumulative usage summary (input/output/cache tokens, cost, by
-# provider/model/effort) to stdout each time a `claude_code.api_request` log
-# or a Codex `handle_responses` trace span is received. The HTTP endpoint
-# `GET /stats` is always available regardless of this flag.
+# Claude/Codex の使用量更新時に、累計サマリー (input/output/cache tokens、cost、
+# provider/model/effort 別内訳) を stdout へ追記します。HTTP endpoint `GET /stats` は
+# このフラグに関係なく常に有効です。
 summary = false
 
-# Color mode for stdout: "auto" | "always" | "never". `auto` honors NO_COLOR
-# and skips ANSI codes when stdout is not a TTY.
+# stdout の色設定: "auto" | "always" | "never"。`auto` は NO_COLOR を尊重し、
+# stdout が TTY でない場合は ANSI code を出しません。
 color = "auto"
 
-# Bind addresses. Defaults are 0.0.0.0:4317 (OTLP/gRPC) and 0.0.0.0:4318 (OTLP/HTTP).
+# bind address。既定値は 0.0.0.0:4317 (OTLP/gRPC) と 0.0.0.0:4318 (OTLP/HTTP) です。
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
 "#;
 
-/// On-disk configuration loaded from `~/.config/otel-logger/config.toml`.
-/// Every field is optional so a partial config still merges cleanly with
-/// CLI flags and environment variables.
+/// `~/.config/otel-logger/config.toml` から読む永続設定。
+/// すべての field は任意なので、部分的な config でも CLI flags や環境変数と
+/// 正しく merge できる。
 ///
-/// Precedence: CLI flag > environment variable > config file > built-in default.
+/// 優先順位: CLI flag > 環境変数 > 設定ファイル > 組み込み既定値。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    /// gRPC bind address (OTLP/gRPC).
+    /// gRPC bind address (OTLP/gRPC)。
     pub grpc_addr: Option<SocketAddr>,
-    /// HTTP bind address (OTLP/HTTP).
+    /// HTTP bind address (OTLP/HTTP)。
     pub http_addr: Option<SocketAddr>,
-    /// Persist received telemetry as JSON Lines into this file.
-    /// Mutually exclusive with `log_dir`.
+    /// 受信した telemetry を JSON Lines としてこのファイルへ保存する。
+    /// `log_dir` とは同時に指定できない。
     pub log_file: Option<PathBuf>,
-    /// Persist JSON Lines into this directory with daily rotation.
-    /// Mutually exclusive with `log_file`.
+    /// JSON Lines を日次ローテーション付きでこのディレクトリへ保存する。
+    /// `log_file` とは同時に指定できない。
     pub log_dir: Option<PathBuf>,
-    /// Number of rotated daily JSONL files to retain (only meaningful with
-    /// `log_dir`). Defaults to 10 when omitted.
+    /// 保持する日次 JSONL ファイル数 (`log_dir` 指定時のみ有効)。
+    /// 省略時の既定値は 10。
     pub log_keep_days: Option<u32>,
-    /// Suppress the human-readable stdout stream.
+    /// 人が読める stdout 出力を抑止する。
     pub no_stdout: Option<bool>,
-    /// Append a cumulative usage summary to stdout on each `claude_code.api_request`.
+    /// 使用量更新時に stdout へ累計サマリーを追記する。
     pub summary: Option<bool>,
-    /// Color mode for the human-readable stdout stream.
+    /// 人が読める stdout 出力の色設定。
     pub color: Option<ColorMode>,
 }
 
 impl Config {
-    /// Load configuration. If `explicit` is given the file MUST exist.
-    /// Otherwise the default XDG path is consulted; a missing file is not an
-    /// error and yields an empty configuration.
+    /// 設定を読み込む。`explicit` が指定された場合、そのファイルは存在しなければならない。
+    /// それ以外では XDG の既定パスを参照し、存在しない場合はエラーにせず空設定にする。
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         match explicit {
             Some(path) => {
@@ -106,9 +103,9 @@ impl Config {
     }
 }
 
-/// Resolve the default config path: `$XDG_CONFIG_HOME/otel-logger/config.toml`
-/// when set, otherwise `$HOME/.config/otel-logger/config.toml`. Returns
-/// `None` only if both env vars are unset, which only happens in tests.
+/// 既定の設定パスを解決する。`$XDG_CONFIG_HOME/otel-logger/config.toml` が使えればそれを、
+/// そうでなければ `$HOME/.config/otel-logger/config.toml` を返す。両方の環境変数が
+/// 未設定の場合だけ `None` を返すが、通常は test でしか起きない。
 pub fn default_config_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("otel-logger").join("config.toml"));
@@ -122,16 +119,15 @@ pub fn default_config_path() -> Option<PathBuf> {
     )
 }
 
-/// Outcome of `write_default`. Used by callers to print a friendly message.
+/// `write_default` の結果。呼び出し側が分かりやすい message を出すために使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitOutcome {
     Created,
     Overwrote,
 }
 
-/// Write the bundled `DEFAULT_CONFIG_TEMPLATE` to `path`. Creates parent
-/// directories as needed. Refuses to overwrite an existing file unless
-/// `force` is set.
+/// 同梱している `DEFAULT_CONFIG_TEMPLATE` を `path` へ書き出す。
+/// 必要に応じて親ディレクトリを作成し、`force` 未指定なら既存ファイルの上書きを拒否する。
 pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
     let already_exists = path.exists();
     if already_exists && !force {

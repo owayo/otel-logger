@@ -10,80 +10,80 @@ HTTP_ADDR := http://localhost:4318
 
 # Cargo
 
-build: ## Build debug version
+build: ## debug build を作成する
 	cargo build
 
-release: ## Build release version
+release: ## release build を作成する
 	cargo build --release
 
-install: release ## Build release and install to /usr/local/bin
+install: release ## release build を作成し /usr/local/bin へ install する
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
-init: build ## Generate ~/.config/otel-logger/config.toml (refuses to overwrite)
+init: build ## ~/.config/otel-logger/config.toml を生成する (上書きしない)
 	./target/debug/$(BINARY_NAME) init
 
-init-force: build ## Same as init, but overwrite an existing file
+init-force: build ## init と同じだが既存ファイルを上書きする
 	./target/debug/$(BINARY_NAME) init -f
 
-run: ## Run the receiver locally with default ports
+run: ## 既定 port で receiver をローカル実行する
 	cargo run -- --log-file ./otel-logger.jsonl
 
-dry-run: ## Validate startup without binding ports
+dry-run: ## port を bind せず起動処理だけ検証する
 	cargo run -- --dry-run
 
-# Development
+# 開発
 
-test: ## Run tests
+test: ## test を実行する
 	cargo test
 
-fmt: ## Format code
+fmt: ## code を format する
 	cargo fmt
 
-fmt-check: ## Check formatting
+fmt-check: ## formatting を検証する
 	cargo fmt -- --check
 
-check: ## Run cargo check
+check: ## cargo check を実行する
 	cargo check --all-targets
 
-clippy: ## Run clippy
+clippy: ## clippy を実行する
 	cargo clippy --all-targets -- -D warnings
 
-clean: ## Clean build artifacts
+clean: ## build artifact を削除する
 	cargo clean
 
-# Docker Compose (default workflow)
+# Docker Compose (既定 workflow)
 
-up: ## Rebuild image and start otel-logger in foreground
+up: ## image を rebuild し otel-logger を foreground で起動する
 	docker compose up --build otel-logger
 
-up-d: ## Rebuild image and start otel-logger detached
+up-d: ## image を rebuild し otel-logger を detached で起動する
 	docker compose up -d --build otel-logger
 
-down: ## Stop and remove the compose stack
+down: ## compose stack を停止して削除する
 	docker compose down
 
-restart: ## Down + rebuild + up (full reset, foreground)
+restart: ## down + rebuild + up で全体を reset する (foreground)
 	docker compose down
 	docker compose up --build otel-logger
 
-logs: ## Tail otel-logger container logs
+logs: ## otel-logger container log を tail する
 	docker compose logs -f otel-logger
 
-stats: ## curl GET /stats from a running otel-logger container
+stats: ## 起動中の otel-logger container に GET /stats を送る
 	curl -s $(HTTP_ADDR)/stats | jq
 
-compose-build: ## Build the image without starting (uses cache)
+compose-build: ## 起動せず image だけ build する (cache 使用)
 	docker compose build otel-logger
 
-compose-build-no-cache: ## Rebuild from scratch (slow, ignores cache)
+compose-build-no-cache: ## cache を使わず最初から rebuild する (遅い)
 	docker compose build --no-cache otel-logger
 
-# Docker (standalone, no compose)
+# Docker (compose なしの standalone)
 
-docker: ## Build standalone Docker image
+docker: ## standalone Docker image を build する
 	docker build -t $(BINARY_NAME):dev .
 
-docker-run: docker ## Build and run standalone container with mounted JSONL
+docker-run: docker ## JSONL directory を mount して standalone container を起動する
 	docker run --rm -p 4317:4317 -p 4318:4318 \
 		-v $(CURDIR)/data:/var/log/otel-logger \
 		$(BINARY_NAME):dev \
@@ -91,8 +91,8 @@ docker-run: docker ## Build and run standalone container with mounted JSONL
 
 # Help
 
-help: ## Show this help message
-	@echo "$(BINARY_NAME) Build Commands"
+help: ## この help message を表示する
+	@echo "$(BINARY_NAME) build commands"
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""
@@ -100,11 +100,11 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Common workflows:"
-	@echo "  make init       # write ~/.config/otel-logger/config.toml"
+	@echo "  make init       # ~/.config/otel-logger/config.toml を書き出す"
 	@echo "  make up         # rebuild + start (foreground)"
 	@echo "  make up-d       # rebuild + start (detached)"
-	@echo "  make logs       # tail logs"
-	@echo "  make stats      # show cumulative usage stats"
+	@echo "  make logs       # log を tail する"
+	@echo "  make stats      # 累計 usage stats を表示する"
 	@echo "  make restart    # full reset (down + rebuild + up)"
 	@echo ""
 	@echo "Release:"

@@ -31,9 +31,9 @@ pub fn render(record: &TelemetryRecord, color: bool) -> String {
     out
 }
 
-/// Cumulative usage summary, formatted for the human-readable stdout stream.
-/// One block per agent (claude-code / codex), with per-(provider, model, effort)
-/// breakdowns indented underneath.
+/// 人が読める stdout 向けに整形した累計使用量サマリー。
+/// agent (claude-code / codex) ごとに 1 block を出し、その下に
+/// provider/model/effort ごとの内訳を indent して表示する。
 pub fn render_summary(snapshot: &UsageSnapshot, color: bool) -> String {
     let p = Painter { color };
     let mut out = String::new();
@@ -349,6 +349,7 @@ fn any_value_to_string(v: &AnyValue) -> String {
             format!("[{}]", parts.join(", "))
         }
         Some(OtlpValue::KvlistValue(kv)) => format_attrs(&kv.values),
+        Some(OtlpValue::StringValueStrindex(_)) => String::new(),
         None => String::new(),
     }
 }

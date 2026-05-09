@@ -102,7 +102,7 @@ otel-logger [OPTIONS]
 | `--log-dir`    |       | (none)           | `OTEL_LOGGER_LOG_DIR`     | Write daily-rotated JSONL into this directory: `otel-logger.YYYY-MM-DD` (local time) |
 | `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of rotated JSONL to keep when `--log-dir` is used   |
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | Suppress the human-readable stdout stream                |
-| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary on each api_request      |
+| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary when usage totals change |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |
 | `--dry-run`    | `-n`  | `false`          |                           | Validate startup but exit before binding                 |
 | `--help`       | `-h`  |                  |                           | Show help                                                |
@@ -280,12 +280,18 @@ ai-job:
 ## Cumulative usage stats
 
 `otel-logger` aggregates token / cost / duration usage from both agents and
-exposes the running totals two ways. The aggregator is **metrics-first**:
+exposes the running totals two ways. Claude usage is metrics-first for
+tokens/cost and log-assisted for request count/duration. Codex token usage is
+deduplicated across the two shapes Codex emits: observed Codex 0.129/0.130
+local and CI logs provide the most complete token counters on
+`codex.sse_event` / `response.completed`, and `codex.turn.token_usage`
+metrics remain the fallback when they are the first or only token source
+observed.
 
 | Agent       | tokens & cost                                            | request_count                       | duration                           | metadata                                                         |
 |-------------|----------------------------------------------------------|-------------------------------------|------------------------------------|------------------------------------------------------------------|
 | claude-code | metrics `claude_code.token.usage` + `claude_code.cost.usage` | log `claude_code.api_request`         | log `claude_code.api_request.duration_ms` | —                                                                |
-| codex       | metric `codex.turn.token_usage` (Histogram, `total` ignored) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms` | log/span event `codex.conversation_starts` for `provider`/`effort` |
+| codex       | log `codex.sse_event` / `response.completed` or fallback metric `codex.turn.token_usage` (Histogram, `total` ignored) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms` | log/span event `codex.conversation_starts` for `provider`/`effort` |
 
 Anthropic logs strip variant suffixes from `model` (e.g. `claude-opus-4-7`)
 while metrics carry the full name (`claude-opus-4-7[1m]`). The aggregator
@@ -293,6 +299,15 @@ canonicalizes log-side bare names to whichever full name was last seen on a
 metric, so 1M and standard variants do not fragment into separate buckets.
 Only `aggregationTemporality=DELTA` is honored; cumulative points are
 dropped with a warning.
+
+Codex emits both SSE completion logs and turn token metrics for the same
+usage. `otel-logger` accepts the first token source observed for each model
+and ignores the other source for that model's token counters to avoid
+double-counting.
+`tool_token_count` is not added because it overlaps the other token classes.
+If Codex token logs arrive before `conversation_starts`, the temporary
+`effort=unknown` bucket is folded into the later provider/model/effort bucket
+when the session metadata arrives.
 
 ### `GET /stats` (always on)
 
@@ -348,7 +363,7 @@ is always available — no flag required.
 
 When `--summary` (or `OTEL_LOGGER_SUMMARY=1` / `summary = true` in the config)
 is enabled, otel-logger appends a `[stats:<agent>]` block right after every
-usage-bearing batch it receives:
+batch that changes cumulative usage totals:
 
 ```
 [stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=21.04m since=2026-05-08T...

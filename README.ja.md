@@ -95,7 +95,7 @@ otel-logger [OPTIONS]
 | `--log-dir`    |       | (なし)           | `OTEL_LOGGER_LOG_DIR`     | 指定ディレクトリに日次ローテーションで JSONL を出力 (`otel-logger.YYYY-MM-DD`、ローカルタイム) |
 | `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | `--log-dir` 利用時に保持する日数                          |
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止                                    |
-| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | api_request 受信ごとに累計サマリーを stdout に追記           |
+| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に累計サマリーを stdout に追記       |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (`NO_COLOR` を尊重)            |
 | `--dry-run`    | `-n`  | `false`          |                           | 起動チェックのみ実施し、ポートをバインドせず終了            |
 | `--help`       | `-h`  |                  |                           | ヘルプ表示                                                 |
@@ -263,14 +263,18 @@ ai-job:
 
 ## 累計トークン統計
 
-`otel-logger` は両エージェントのトークン / コスト / duration を集計し、2 つの方法で公開します。集計は **メトリクス主軸** です。
+`otel-logger` は両エージェントのトークン / コスト / duration を集計し、2 つの方法で公開します。
+Claude は token/cost を metrics 主軸、request count/duration を log 補完で扱います。
+Codex の token usage は Codex が出す 2 つの形を重複排除して集計します。実際の Codex 0.129/0.130 のローカルログと CI artifact では `codex.sse_event` / `response.completed` log が最も完全な token counter を持つため、これが最初の token source ならそれを採用し、`codex.turn.token_usage` metrics は最初または唯一の token source として観測された場合の fallback として使います。
 
 | エージェント | tokens & cost                                              | request_count                       | duration                              | メタデータ                                                       |
 |--------------|------------------------------------------------------------|-------------------------------------|---------------------------------------|------------------------------------------------------------------|
 | claude-code  | metrics `claude_code.token.usage` + `claude_code.cost.usage` | log `claude_code.api_request`         | log `claude_code.api_request.duration_ms` | —                                                                |
-| codex        | metric `codex.turn.token_usage` (Histogram、`total` は無視) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms`     | log/span event `codex.conversation_starts` (`provider`/`effort` 補完) |
+| codex        | log `codex.sse_event` / `response.completed` または fallback metric `codex.turn.token_usage` (Histogram、`total` は無視) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms`     | log/span event `codex.conversation_starts` (`provider`/`effort` 補完) |
 
 Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
+
+Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。
 
 ### `GET /stats` (常時有効)
 
@@ -322,7 +326,7 @@ bucket key は `provider/model/effort` 形式です。Codex 側は ChatGPT / Ope
 
 ### `--summary` (stdout、opt-in)
 
-`--summary` (または `OTEL_LOGGER_SUMMARY=1` / 設定ファイルの `summary = true`) を有効にすると、トークン/コスト情報を含むバッチを受信するたびに `[stats:<agent>]` ブロックが追記されます。
+`--summary` (または `OTEL_LOGGER_SUMMARY=1` / 設定ファイルの `summary = true`) を有効にすると、使用量の累計が更新されるバッチを受信するたびに `[stats:<agent>]` ブロックが追記されます。
 
 ```
 [stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=21.04m since=2026-05-08T...

@@ -19,8 +19,8 @@ name = "otel-logger"
 path = "src/main.rs"
 
 [dependencies]
-# OTLP types & gRPC service traits (single source of truth, no proto drift)
-opentelemetry-proto = { version = "0.31", default-features = false, features = [
+# OTLP 型と gRPC service trait (proto drift を避けるため単一の真実として使う)
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
     "gen-tonic",
     "trace",
     "metrics",
@@ -28,7 +28,7 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
     "with-serde",
 ] }
 
-# gRPC stack
+# gRPC 関連
 tonic = { version = "0.14.6", default-features = false, features = [
     "server",
     "router",
@@ -38,7 +38,7 @@ tonic = { version = "0.14.6", default-features = false, features = [
 tonic-prost = "0.14.6"
 prost = "0.14.3"
 
-# HTTP stack
+# HTTP 関連
 axum = { version = "0.8.9", default-features = false, features = [
     "tokio",
     "http1",
@@ -51,8 +51,8 @@ axum = { version = "0.8.9", default-features = false, features = [
 bytes = "1.11.1"
 http = "1.4.0"
 
-# async runtime
-tokio = { version = "1.52.2", features = [
+# 非同期 runtime
+tokio = { version = "1.52.3", features = [
     "rt-multi-thread",
     "macros",
     "signal",
@@ -66,12 +66,12 @@ tokio-util = "0.7.18"
 # CLI
 clap = { version = "4.6.1", features = ["derive", "env"] }
 
-# serialization / output
+# シリアライズ / 出力
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.1.2"
 
-# misc
+# その他
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "macros"] }
@@ -79,7 +79,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 is-terminal = "0.4.17"
 
-# Daily log rotation for the JSONL output (mirrors claw-hooks).
+# JSONL 出力の日次ローテーション (claw-hooks と揃える)。
 logroller = "0.1.10"
 
 [dev-dependencies]

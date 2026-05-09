@@ -25,8 +25,8 @@ const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_OPENAI: &str = "OpenAI";
 const UNKNOWN: &str = "unknown";
 
-/// Per-bucket running totals. Fields outside the agent's vocabulary stay 0
-/// (e.g. `cost_usd` for Codex, `reasoning_output_tokens` for Claude).
+/// バケットごとの累計値。エージェントが持たない語彙のフィールドは 0 のままにする
+/// (例: Codex の `cost_usd`、Claude の `reasoning_output_tokens`)。
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ModelStats {
     pub request_count: u64,
@@ -52,9 +52,8 @@ impl ModelStats {
     }
 }
 
-/// Internal provider × model × effort triple used as a `BTreeMap` key for
-/// breakdowns. Not exposed: `BucketStats` (the value type) carries the same
-/// fields for serialization.
+/// 内部集計で `BTreeMap` のキーに使う provider × model × effort の組。
+/// 公開せず、シリアライズ用の値型 `BucketStats` 側にも同じ情報を持たせる。
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Bucket {
     provider: String,
@@ -78,7 +77,7 @@ impl Bucket {
         }
     }
 
-    /// Stable string key for serialization output: `provider/model/effort`.
+    /// シリアライズ出力で使う安定したキー: `provider/model/effort`。
     fn key(&self) -> String {
         format!("{}/{}/{}", self.provider, self.model, self.effort)
     }
@@ -91,7 +90,7 @@ fn non_empty(s: String) -> String {
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct AgentStats {
     pub total: ModelStats,
-    /// Per-(provider, model, effort) bucket. Map key is `Bucket::key()`.
+    /// provider/model/effort ごとのバケット。Map のキーは `Bucket::key()`。
     pub buckets: BTreeMap<String, BucketStats>,
 }
 
@@ -133,25 +132,36 @@ struct AggregatorInner {
     last_updated: Option<OffsetDateTime>,
     agents: BTreeMap<String, AgentStats>,
 
-    /// Claude model name canonicalization. Anthropic logs strip variant
-    /// suffixes from `model` (e.g. `claude-opus-4-7`), but the matching
-    /// metrics + spans carry the full name (`claude-opus-4-7[1m]`). We track
-    /// every full name we have seen on a metric and use it to upgrade later
-    /// log-side bucket keys so 1M and standard variants don't fragment.
+    /// Claude モデル名の正規化。Anthropic のログでは `model` から
+    /// `claude-opus-4-7` のようにバリアント接尾辞が落ちる一方、対応する
+    /// metrics/spans には `claude-opus-4-7[1m]` のような完全名が入る。
+    /// metric で観測した完全名を覚えておき、後続のログ側バケットを昇格して
+    /// 1M 版と通常版が別集計にならないようにする。
     claude_canonical_models: HashMap<String, String>,
 
-    /// Latest Codex session metadata observed via `codex.conversation_starts`
-    /// log/event. Codex metrics do not carry `reasoning_effort`, so we
-    /// fall back to the most recent session-level value.
+    /// `codex.conversation_starts` の log/event から最後に観測した Codex セッション情報。
+    /// Codex metrics には `reasoning_effort` が載らないため、直近のセッション値に
+    /// フォールバックする。
     codex_last_session: Option<CodexSession>,
+
+    /// Codex は SSE 完了ログと turn metrics の両方で token usage を出す。
+    /// metrics 側に conversation id が無いため、両方に存在する model 単位で
+    /// 最初に観測したソースを採用し、二重計上を避ける。
+    codex_token_sources: HashMap<String, CodexTokenSource>,
 }
 
 #[derive(Debug, Clone)]
 struct CodexSession {
     provider: String,
-    #[allow(dead_code)] // kept for future correlation
+    #[allow(dead_code)] // 将来の相関付け用に保持する。
     model: String,
     effort: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTokenSource {
+    Logs,
+    Metrics,
 }
 
 impl Aggregator {
@@ -163,13 +173,14 @@ impl Aggregator {
                 agents: BTreeMap::new(),
                 claude_canonical_models: HashMap::new(),
                 codex_last_session: None,
+                codex_token_sources: HashMap::new(),
             }),
         }
     }
 
-    /// Ingest log events. Token/cost are no longer derived from logs (metrics
-    /// own those); logs only contribute `request_count` and `duration_ms` for
-    /// Claude, and Codex session metadata used to fill in `effort`.
+    /// log events を取り込む。Claude はログから `request_count` と `duration_ms` を補い、
+    /// Codex は `effort` 補完用のセッション情報と、実ログで metrics より多く観測できる
+    /// SSE 完了ログの token usage を取り込む。
     pub fn ingest_logs(&self, req: &ExportLogsServiceRequest) -> usize {
         let mut count = 0;
         let mut g = self.inner.write().expect("aggregator lock poisoned");
@@ -187,7 +198,20 @@ impl Aggregator {
                     if (service == SERVICE_CODEX_TUI || service == SERVICE_CODEX_EXEC)
                         && let Some(session) = extract_codex_conversation_starts(log)
                     {
-                        g.codex_last_session = Some(session);
+                        update_codex_session(&mut g, session);
+                    }
+                    if (service == SERVICE_CODEX_TUI || service == SERVICE_CODEX_EXEC)
+                        && let Some((bucket, stats)) = extract_codex_sse_response_completed(&g, log)
+                    {
+                        let source_key = codex_token_source_key(&bucket.model);
+                        if g.codex_token_sources.get(&source_key)
+                            != Some(&CodexTokenSource::Metrics)
+                        {
+                            record_into(&mut g, AGENT_CODEX, &bucket, &stats);
+                            g.codex_token_sources
+                                .insert(source_key, CodexTokenSource::Logs);
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -195,10 +219,9 @@ impl Aggregator {
         count
     }
 
-    /// Ingest trace spans. Codex session info still arrives as span events
-    /// (`codex.conversation_starts`) on `session_init`, so we read those to
-    /// capture `reasoning_effort`. All token/cost accounting now lives in
-    /// metrics ingestion.
+    /// trace spans を取り込む。Codex のセッション情報は `session_init` 上の
+    /// `codex.conversation_starts` span event としても届くため、ここから
+    /// `reasoning_effort` を回収する。token/cost の計上は別経路に寄せる。
     pub fn ingest_traces(&self, req: &ExportTraceServiceRequest) -> usize {
         let mut g = self.inner.write().expect("aggregator lock poisoned");
         let mut session_updates = 0;
@@ -213,14 +236,12 @@ impl Aggregator {
                         if ev.name == "codex.conversation_starts"
                             && let Some(session) = extract_session_from_attrs(&ev.attributes)
                         {
-                            g.codex_last_session = Some(session);
+                            update_codex_session(&mut g, session);
                             session_updates += 1;
                         }
                     }
-                    // Fallback: when `codex.conversation_starts` is dropped
-                    // (e.g. codex CLI's OTLP exporter fails to flush before
-                    // the second invocation in the same job), the per-request
-                    // `handle_responses` span still carries the effort.
+                    // `codex.conversation_starts` が落ちても、同じジョブの後続実行では
+                    // `handle_responses` span に effort が残るため、そこから補完する。
                     if span.name == "handle_responses"
                         && update_codex_effort_from_request_attrs(&mut g, &span.attributes)
                     {
@@ -229,16 +250,14 @@ impl Aggregator {
                 }
             }
         }
-        // Spans are no longer sample-bearing for usage stats; only return >0
-        // when we learned something so the caller can still emit a summary.
+        // spans 自体は usage stats のサンプルではない。セッション情報を更新できた時だけ
+        // >0 を返し、呼び出し側が必要に応じてサマリーを出せるようにする。
         session_updates
     }
 
-    /// Ingest metric data. This is now the source of truth for tokens/cost
-    /// (Claude) and tokens/duration/request count (Codex). Only DELTA
-    /// temporality is honored; CUMULATIVE points are dropped with a warning
-    /// because correctly carrying state across restarts would require
-    /// persistence we don't have today.
+    /// metric data を取り込む。Claude の token/cost と Codex の duration/request count
+    /// はここで集計する。temporality は DELTA のみ扱い、CUMULATIVE は再起動をまたいだ
+    /// 状態保持が必要になるため警告して破棄する。
     pub fn ingest_metrics(&self, req: &ExportMetricsServiceRequest) -> usize {
         let mut count = 0;
         let mut g = self.inner.write().expect("aggregator lock poisoned");
@@ -298,10 +317,9 @@ fn record_into(g: &mut AggregatorInner, agent: &str, bucket: &Bucket, stats: &Mo
     entry.stats.add(stats);
 }
 
-/// `claude_code.api_request` carries `request_count` (1) and `duration_ms`,
-/// but its `model` attribute drops variant suffixes like `[1m]`. We map the
-/// bare name back to a previously-seen full name so it merges into the same
-/// bucket as the metrics.
+/// `claude_code.api_request` は `request_count` (1) と `duration_ms` を持つが、
+/// `model` 属性から `[1m]` のようなバリアント接尾辞が落ちる。過去に観測した完全名へ
+/// 戻して、metrics と同じバケットに入るようにする。
 fn extract_claude_api_request_meta(
     g: &mut AggregatorInner,
     log: &LogRecord,
@@ -329,9 +347,9 @@ fn extract_claude_api_request_meta(
 }
 
 fn extract_codex_conversation_starts(log: &LogRecord) -> Option<CodexSession> {
-    // Codex emits this either as a top-level log event or as a span event;
-    // here we only handle the log-record form. We accept either body or
-    // event.name carrying the marker so we're robust to both shapes.
+    // Codex はこれを top-level log event または span event として送る。
+    // ここでは log record 形式だけを扱い、body と event.name のどちらに目印が
+    // 入っていても拾えるようにする。
     let body_matches = log
         .body
         .as_ref()
@@ -367,6 +385,47 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
         model,
         effort,
     })
+}
+
+fn extract_codex_sse_response_completed(
+    g: &AggregatorInner,
+    log: &LogRecord,
+) -> Option<(Bucket, ModelStats)> {
+    let attrs = &log.attributes;
+    if string_attr(attrs, "event.name") != Some("codex.sse_event")
+        || string_attr(attrs, "event.kind") != Some("response.completed")
+    {
+        return None;
+    }
+
+    let input_tokens = u64_attr(attrs, "input_token_count");
+    let output_tokens = u64_attr(attrs, "output_token_count");
+    let cache_read_tokens = u64_attr(attrs, "cached_token_count");
+    let reasoning_output_tokens = u64_attr(attrs, "reasoning_token_count");
+    if input_tokens == 0
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && reasoning_output_tokens == 0
+    {
+        return None;
+    }
+
+    let model = string_attr(attrs, "model")
+        .or_else(|| string_attr(attrs, "slug"))
+        .map(str::to_string)
+        .or_else(|| g.codex_last_session.as_ref().map(|s| s.model.clone()))
+        .unwrap_or_default();
+    let stats = ModelStats {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        reasoning_output_tokens,
+        ..Default::default()
+    };
+    Some((
+        Bucket::from_parts(codex_provider(g), model, codex_effort(g)),
+        stats,
+    ))
 }
 
 fn ingest_claude_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
@@ -441,6 +500,10 @@ fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
         let model = string_attr(&dp.attributes, "model")
             .map(str::to_string)
             .unwrap_or_default();
+        let source_key = codex_token_source_key(&model);
+        if g.codex_token_sources.get(&source_key) == Some(&CodexTokenSource::Logs) {
+            continue;
+        }
         let token_type = string_attr(&dp.attributes, "token_type").unwrap_or("");
         let provider = codex_provider(g);
         let effort = codex_effort(g);
@@ -451,11 +514,13 @@ fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
             "output" => stats.output_tokens = value,
             "cached_input" => stats.cache_read_tokens = value,
             "reasoning_output" => stats.reasoning_output_tokens = value,
-            // `total` double-counts the others; ignore.
+            // `total` は他の token 種別と重複するため無視する。
             _ => continue,
         }
         let bucket = Bucket::from_parts(provider, model, effort);
         record_into(g, AGENT_CODEX, &bucket, &stats);
+        g.codex_token_sources
+            .insert(source_key, CodexTokenSource::Metrics);
         hits += 1;
     }
     hits
@@ -525,11 +590,49 @@ fn codex_effort(g: &AggregatorInner) -> String {
         .unwrap_or_default()
 }
 
-/// Fallback effort source when `codex.conversation_starts` is missing.
-/// `codex.request.*` is internal Codex CLI telemetry rather than an OTel
-/// semantic convention, so we scope this to `handle_responses` spans only and
-/// only touch `effort` (provider/model are still owned by `conversation_starts`
-/// or the metric data point itself).
+fn codex_token_source_key(model: &str) -> String {
+    non_empty(model.to_string())
+}
+
+fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
+    let provider = session.provider.clone();
+    let model = session.model.clone();
+    let effort = session.effort.clone();
+    g.codex_last_session = Some(session);
+    merge_codex_unknown_effort(g, &provider, &model, &effort);
+}
+
+fn merge_codex_unknown_effort(g: &mut AggregatorInner, provider: &str, model: &str, effort: &str) {
+    if model.is_empty() || effort.is_empty() || effort == UNKNOWN {
+        return;
+    }
+    let from = Bucket::from_parts(provider.to_string(), model.to_string(), UNKNOWN.to_string());
+    let to = Bucket::from_parts(provider.to_string(), model.to_string(), effort.to_string());
+    if from == to {
+        return;
+    }
+    let Some(agent_stats) = g.agents.get_mut(AGENT_CODEX) else {
+        return;
+    };
+    let Some(from_stats) = agent_stats.buckets.remove(&from.key()) else {
+        return;
+    };
+    let entry = agent_stats
+        .buckets
+        .entry(to.key())
+        .or_insert_with(|| BucketStats {
+            provider: to.provider,
+            model: to.model,
+            effort: to.effort,
+            stats: ModelStats::default(),
+        });
+    entry.stats.add(&from_stats.stats);
+}
+
+/// `codex.conversation_starts` が欠けた時の effort 補完元。
+/// `codex.request.*` は OTel semantic convention ではなく Codex CLI 内部の
+/// telemetry なので、対象は `handle_responses` spans に限定し、`effort` だけを更新する
+/// (provider/model は `conversation_starts` または metric data point 側に任せる)。
 fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyValue]) -> bool {
     let Some(effort) = string_attr(attrs, "codex.request.reasoning_effort") else {
         return false;
@@ -537,30 +640,31 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
     if effort.is_empty() {
         return false;
     }
-    match g.codex_last_session.as_mut() {
-        Some(session) => session.effort = effort.to_string(),
-        None => {
-            g.codex_last_session = Some(CodexSession {
-                provider: PROVIDER_OPENAI.to_string(),
-                model: String::new(),
-                effort: effort.to_string(),
-            });
+    let session = match g.codex_last_session.clone() {
+        Some(mut session) => {
+            session.effort = effort.to_string();
+            session
         }
-    }
+        None => CodexSession {
+            provider: PROVIDER_OPENAI.to_string(),
+            model: String::new(),
+            effort: effort.to_string(),
+        },
+    };
+    update_codex_session(g, session);
     true
 }
 
-/// Anthropic logs report `claude-opus-4-7`, while metrics/spans report
-/// `claude-opus-4-7[1m]`. Treat the first segment before `[` as the bare
-/// name and remember the full name so subsequent log records merge into the
-/// same bucket as the metrics.
+/// Anthropic logs では `claude-opus-4-7`、metrics/spans では
+/// `claude-opus-4-7[1m]` のように報告される。`[` より前を bare name として扱い、
+/// 完全名を覚えて後続ログを metrics と同じバケットへ寄せる。
 fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
     let bare = match full.find('[') {
         Some(i) => &full[..i],
         None => full,
     };
     if bare.is_empty() || bare == full {
-        // No suffix to canonicalize; nothing to remember.
+        // 正規化すべき接尾辞がないため、追加で覚えるものはない。
         if !full.is_empty() {
             g.claude_canonical_models
                 .entry(full.to_string())
@@ -575,8 +679,8 @@ fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
     }
     g.claude_canonical_models
         .insert(bare.clone(), full.to_string());
-    // If a bucket was already created under the bare name, fold its stats
-    // into the full-name bucket so the snapshot doesn't show duplicates.
+    // bare name のバケットが先に作られていた場合は、snapshot に重複表示されないよう
+    // 完全名のバケットへ統合する。
     if let Some(agent_stats) = g.agents.get_mut(AGENT_CLAUDE) {
         merge_bare_into_full(agent_stats, &bare, full);
     }
@@ -704,6 +808,10 @@ fn int_attr(attrs: &[KeyValue], key: &str) -> Option<i64> {
     }
 }
 
+fn u64_attr(attrs: &[KeyValue], key: &str) -> u64 {
+    int_attr(attrs, key).unwrap_or(0).max(0) as u64
+}
+
 fn format_rfc3339(t: OffsetDateTime) -> String {
     t.format(&Rfc3339)
         .unwrap_or_else(|_| t.unix_timestamp().to_string())
@@ -722,6 +830,7 @@ mod tests {
         KeyValue {
             key: key.to_string(),
             value: Some(value),
+            key_strindex: 0,
         }
     }
     fn kv_str(key: &str, value: &str) -> KeyValue {
@@ -729,6 +838,14 @@ mod tests {
             key,
             AnyValue {
                 value: Some(OtlpValue::StringValue(value.to_string())),
+            },
+        )
+    }
+    fn kv_int(key: &str, value: i64) -> KeyValue {
+        kv(
+            key,
+            AnyValue {
+                value: Some(OtlpValue::IntValue(value)),
             },
         )
     }
@@ -918,6 +1035,34 @@ mod tests {
         }
     }
 
+    fn conversation_starts_span(
+        attrs: Vec<KeyValue>,
+    ) -> opentelemetry_proto::tonic::trace::v1::Span {
+        opentelemetry_proto::tonic::trace::v1::Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            trace_state: String::new(),
+            parent_span_id: vec![],
+            flags: 0,
+            name: "session_init".into(),
+            kind: 0,
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: vec![opentelemetry_proto::tonic::trace::v1::span::Event {
+                time_unix_nano: 0,
+                name: "codex.conversation_starts".into(),
+                attributes: attrs,
+                dropped_attributes_count: 0,
+            }],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+        }
+    }
+
     fn make_log_req(service: &str, body: &str, attrs: Vec<KeyValue>) -> ExportLogsServiceRequest {
         use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
         use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -984,7 +1129,7 @@ mod tests {
     #[test]
     fn claude_log_request_count_merges_into_metric_bucket() {
         let agg = Aggregator::new();
-        // Metrics arrive first and establish the canonical full-name bucket.
+        // metrics が先に届き、正規の完全名バケットを確立する。
         let metric_req = make_metric_req(
             SERVICE_CLAUDE,
             vec![
@@ -993,7 +1138,7 @@ mod tests {
             ],
         );
         agg.ingest_metrics(&metric_req);
-        // Log arrives with the bare model name; should merge into [1m] bucket.
+        // ログは bare model 名で届くが、[1m] バケットへ統合されるべき。
         let log_req = make_log_req(
             SERVICE_CLAUDE,
             "claude_code.api_request",
@@ -1028,7 +1173,7 @@ mod tests {
     #[test]
     fn claude_log_then_metric_folds_bare_bucket_into_full() {
         let agg = Aggregator::new();
-        // Log arrives first under the bare name.
+        // ログが先に bare name で届く。
         let log_req = make_log_req(
             SERVICE_CLAUDE,
             "claude_code.api_request",
@@ -1044,7 +1189,7 @@ mod tests {
             ],
         );
         agg.ingest_logs(&log_req);
-        // Then metrics teach us the full name; the bare bucket must fold in.
+        // その後 metrics で完全名が分かるため、bare バケットを統合する必要がある。
         let metric_req = make_metric_req(
             SERVICE_CLAUDE,
             vec![claude_token_metric(
@@ -1089,6 +1234,146 @@ mod tests {
         assert_eq!(bucket.stats.output_tokens, 20);
         assert_eq!(bucket.stats.cache_read_tokens, 50);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
+    }
+
+    #[test]
+    fn codex_sse_response_completed_log_counts_token_usage() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+                kv_str("output_token_count", "20"),
+                kv_int("cached_token_count", 50),
+                kv_int("reasoning_token_count", 30),
+                kv_str("tool_token_count", "120"),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 30);
+        assert_eq!(bucket.stats.request_count, 0);
+    }
+
+    #[test]
+    fn codex_late_conversation_start_moves_sse_tokens_to_effort_bucket() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![conversation_starts_span(vec![
+                kv_str("event.name", "codex.conversation_starts"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ])],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+        );
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    #[test]
+    fn codex_sse_token_log_prevents_later_metric_double_count() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "input", 999.0)],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    #[test]
+    fn codex_token_source_is_tracked_per_model() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.5", "input", 999.0),
+                codex_token_metric("gpt-5.4-mini", "input", 40.0),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let gpt55 = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        let gpt54 = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.4-mini/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(gpt55.stats.input_tokens, 100);
+        assert_eq!(gpt54.stats.input_tokens, 40);
     }
 
     #[test]
@@ -1170,7 +1455,7 @@ mod tests {
     #[test]
     fn cumulative_temporality_is_dropped() {
         let agg = Aggregator::new();
-        // Build a Cumulative Sum manually.
+        // Cumulative Sum を手動で組み立てる。
         let mut metric = claude_token_metric("claude-opus-4-7[1m]", "max", "input", 999);
         if let Some(MetricData::Sum(ref mut sum)) = metric.data {
             sum.aggregation_temporality = AggregationTemporality::Cumulative as i32;
