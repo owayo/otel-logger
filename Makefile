@@ -18,6 +18,9 @@ release: ## release build を作成する
 
 install: release ## release build を作成し /usr/local/bin へ install する
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
+	@if command -v codesign >/dev/null 2>&1; then \
+		codesign --force --sign - $(INSTALL_PATH)/$(BINARY_NAME); \
+	fi
 
 init: build ## ~/.config/otel-logger/config.toml を生成する (上書きしない)
 	./target/debug/$(BINARY_NAME) init

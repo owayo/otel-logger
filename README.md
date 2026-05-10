@@ -305,6 +305,10 @@ usage. `otel-logger` accepts the first token source observed for each model
 and ignores the other source for that model's token counters to avoid
 double-counting.
 `tool_token_count` is not added because it overlaps the other token classes.
+Real logs also include tool-only `response.completed` events where
+`input_token_count == tool_token_count` and output/cache/reasoning are all
+zero; Codex excludes those from turn metrics and `handle_responses` span
+usage, so `otel-logger` does not count them as token usage.
 If Codex token logs arrive before `conversation_starts`, the temporary
 `effort=unknown` bucket is folded into the later provider/model/effort bucket
 when the session metadata arrives.

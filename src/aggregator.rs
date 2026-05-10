@@ -402,6 +402,17 @@ fn extract_codex_sse_response_completed(
     let output_tokens = u64_attr(attrs, "output_token_count");
     let cache_read_tokens = u64_attr(attrs, "cached_token_count");
     let reasoning_output_tokens = u64_attr(attrs, "reasoning_token_count");
+    let tool_tokens = u64_attr(attrs, "tool_token_count");
+    // 実ログでは tool context だけの完了イベントが先に届く。turn metrics と
+    // `handle_responses` span usage には含まれないため、usage としては数えない。
+    if input_tokens != 0
+        && input_tokens == tool_tokens
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && reasoning_output_tokens == 0
+    {
+        return None;
+    }
     if input_tokens == 0
         && output_tokens == 0
         && cache_read_tokens == 0
@@ -1275,6 +1286,28 @@ mod tests {
         assert_eq!(bucket.stats.cache_read_tokens, 50);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
         assert_eq!(bucket.stats.request_count, 0);
+    }
+
+    #[test]
+    fn codex_sse_tool_only_completion_is_ignored() {
+        let agg = Aggregator::new();
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "13145"),
+                kv_str("output_token_count", "0"),
+                kv_int("cached_token_count", 0),
+                kv_int("reasoning_token_count", 0),
+                kv_str("tool_token_count", "13145"),
+            ],
+        ));
+
+        assert_eq!(count, 0);
+        assert!(!agg.snapshot().agents.contains_key(AGENT_CODEX));
     }
 
     #[test]

@@ -19,10 +19,11 @@ cargo test
 cargo build --release
 ```
 
-`make install` は release build 後に `/usr/local/bin/otel-logger` へ配置する。
+`make install` は release build 後に `/usr/local/bin/otel-logger` へ配置する。macOS では配置後に ad-hoc 署名する。
 
 ## 実装上の注意
 
 - 受信した OTLP payload は JSON Lines で欠落なく保存する方針を守る。
 - Claude / Codex の累計統計は二重計上を避ける。特に Codex は SSE 完了ログと turn metrics の両方に token usage が出るため、model ごとに片方だけを token source として採用する。
+- Codex の SSE 完了ログで `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only event は、turn metrics / `handle_responses` span usage と合わせるため token usage に加算しない。
 - コメントは、外部に出る CLI help では英日併記、内部実装の説明では日本語を基本にする。
