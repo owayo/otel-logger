@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "otel-logger"
-version = "26.5.102"
+version = "26.5.103"
 dependencies = [
  "anyhow",
  "axum",

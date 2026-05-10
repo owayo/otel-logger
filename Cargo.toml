@@ -1,6 +1,6 @@
 [package]
 name = "otel-logger"
-version = "26.5.102"
+version = "26.5.103"
 edition = "2024"
 rust-version = "1.88"
 description = "OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSONL"
