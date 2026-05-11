@@ -26,8 +26,7 @@ fn main() -> Result<()> {
         let sink = Sink::from_settings(&settings).await?;
 
         if settings.dry_run {
-            let grpc = server::probe_bind(settings.grpc_addr).await?;
-            let http = server::probe_bind(settings.http_addr).await?;
+            let (grpc, http) = server::probe_binds(settings.grpc_addr, settings.http_addr).await?;
             tracing::info!(
                 grpc = %grpc,
                 http = %http,

@@ -97,7 +97,7 @@ otel-logger [OPTIONS]
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止                                    |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に累計サマリーを stdout に追記       |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (`NO_COLOR` を尊重)            |
-| `--dry-run`    | `-n`  | `false`          |                           | 起動チェックのみ実施し、ポートをバインドせず終了            |
+| `--dry-run`    | `-n`  | `false`          |                           | 両 listener の同時 bind を含む起動チェックを実施して終了     |
 | `--help`       | `-h`  |                  |                           | ヘルプ表示                                                 |
 | `--version`    | `-V`  |                  |                           | バージョン表示                                             |
 
@@ -274,7 +274,7 @@ Codex の token usage は Codex が出す 2 つの形を重複排除して集計
 
 Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
 
-Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。実ログでは `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。
+Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。実ログでは `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` がある SSE 完了ログは、直近 session ではなく同じ `conversation.id` の `codex.conversation_starts` メタデータに紐付けるため、複数 conversation が混在しても別 effort bucket に誤帰属しません。
 
 ### `GET /stats` (常時有効)
 
@@ -376,7 +376,7 @@ make docker     # コンテナイメージのビルド
 - `tonic` が OTLP の 3 つの gRPC サービス (`TraceService` / `MetricsService` / `LogsService`) をポート 4317 で公開
 - `axum` がポート 4318 で `/v1/traces`、`/v1/metrics`、`/v1/logs` を受け、`application/x-protobuf` (prost デコード) と `application/json` (serde デコード) の両方に対応
 - 両トランスポートが共通の `Sink` に流れ込み、stdout pretty と JSONL の両方へ書き出す
-- `tokio_util::sync::CancellationToken` と SIGINT / SIGTERM を待つ `tokio::select!` で graceful shutdown。末尾のバッチも欠落しません
+- `tokio_util::sync::CancellationToken` と SIGINT / SIGTERM を待つ `tokio::select!` で graceful shutdown。gRPC / HTTP task の終了を待ってから最後に JSONL を flush するため、末尾のバッチも欠落しません
 
 ## ライセンス
 

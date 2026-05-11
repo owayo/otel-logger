@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- chef ----------
-# cargo-chef caches dependency compilation between builds. Crucial because
-# tonic / opentelemetry-proto take several minutes to compile from scratch.
+# cargo-chef で依存コンパイルをビルド間キャッシュする。tonic / opentelemetry-proto は
+# 初回コンパイルが数分かかるため、アプリ本体の変更と分離する。
 FROM rust:1.90-slim-bookworm AS chef
 WORKDIR /app
 RUN apt-get update \
@@ -26,8 +26,8 @@ RUN cargo build --release --bin otel-logger \
  && strip target/release/otel-logger
 
 # ---------- runtime ----------
-# distroless/cc-debian12 ships glibc + libgcc + libssl just in case. nonroot
-# variant runs as uid 65532 by default.
+# distroless/cc-debian12 は glibc / libgcc / libssl を含む。nonroot variant は
+# 既定で uid 65532 として実行される。
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=builder /app/target/release/otel-logger /usr/local/bin/otel-logger
 EXPOSE 4317 4318

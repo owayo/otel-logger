@@ -1,13 +1,13 @@
-# Sample compose stack: run otel-logger as a sidecar that receives OTLP
-# telemetry from Claude Code / Codex executed in another container.
+# compose サンプル: otel-logger をサイドカーとして起動し、別コンテナで動く
+# Claude Code / Codex からの OTLP telemetry を受ける。
 #
-# Usage:
-#   docker compose up otel-logger              # just start the receiver
-#   docker compose run --rm claude-code-sample # run a one-shot CLI job
-#   docker compose run --rm codex-sample       # run codex with telemetry on
+# 使い方:
+#   docker compose up otel-logger              # receiver だけ起動する
+#   docker compose run --rm claude-code-sample # 1 回限りの CLI job を実行する
+#   docker compose run --rm codex-sample       # telemetry 有効の Codex を実行する
 #
-# Telemetry will appear on otel-logger's stdout (docker compose logs) and in
-# ./data/otel-logger.jsonl as lossless JSON Lines.
+# telemetry は otel-logger の stdout (docker compose logs) と、
+# 欠落のない JSON Lines として ./data/otel-logger.jsonl に出力される。
 
 services:
   otel-logger:
@@ -19,16 +19,16 @@ services:
       - "4317:4317" # OTLP/gRPC
       - "4318:4318" # OTLP/HTTP
     volumes:
-      # JSONL output directory. Defaults to ./data (committed to the repo).
-      # Override per-machine via .env: OTEL_LOGGER_DATA_DIR=/absolute/path
+      # JSONL 出力ディレクトリ。既定は repo に含まれる ./data。
+      # 環境ごとの差し替えは .env で行う: OTEL_LOGGER_DATA_DIR=/absolute/path
       - ${OTEL_LOGGER_DATA_DIR:-./data}:/var/log/otel-logger
     command:
       - --grpc-addr
       - 0.0.0.0:4317
       - --http-addr
       - 0.0.0.0:4318
-      # Daily-rotated JSONL: writes otel-logger.YYYY-MM-DD into the volume.
-      # Files older than --log-keep-days are pruned at startup and during rotation.
+      # 日次ローテーション JSONL: volume 内に otel-logger.YYYY-MM-DD を書く。
+      # --log-keep-days より古いファイルは起動時とローテーション時に削除される。
       - --log-dir
       - /var/log/otel-logger
       - --log-keep-days
@@ -41,29 +41,29 @@ services:
       timeout: 3s
       retries: 3
 
-  # Sample: Claude Code execution that exports telemetry to otel-logger.
-  # Replace ARG-style env values with your real prompt / project mount.
+  # サンプル: telemetry を otel-logger へ送る Claude Code 実行コンテナ。
+  # 実運用では prompt や project mount を用途に合わせて置き換える。
   claude-code-sample:
     image: node:20-bookworm-slim
     depends_on:
       otel-logger:
         condition: service_started
     environment:
-      # Required to enable Claude Code telemetry at all.
+      # Claude Code telemetry を有効化するために必須。
       CLAUDE_CODE_ENABLE_TELEMETRY: "1"
 
-      # Choose OTLP exporter for each signal. Logs+metrics are GA;
-      # traces require the BETA flag below.
+      # signal ごとの OTLP exporter を選ぶ。Logs+metrics は GA、
+      # traces は下の BETA flag が必要。
       OTEL_LOGS_EXPORTER: otlp
       OTEL_METRICS_EXPORTER: otlp
       OTEL_TRACES_EXPORTER: otlp
       CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
 
-      # Send to otel-logger over HTTP/protobuf on port 4318.
+      # port 4318 の HTTP/protobuf で otel-logger へ送る。
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-logger:4318
 
-      # Tag the run so the receiver can attribute telemetry correctly.
+      # receiver が telemetry を正しく識別できるよう run に tag を付ける。
       OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code,service.namespace=ci,deployment.environment=ci"
     working_dir: /workspace
     volumes:
@@ -73,11 +73,11 @@ services:
       - |
         set -eux
         npm install -g @anthropic-ai/claude-code
-        # Replace this with your actual Claude Code invocation.
+        # 実際の Claude Code 起動コマンドに置き換える。
         claude --version
 
-  # Sample: Codex CLI execution. Codex contracts on config.toml [otel] rather
-  # than env vars, so this example mounts a config file from ./codex-config.
+  # サンプル: Codex CLI 実行コンテナ。Codex は env vars ではなく config.toml の
+  # [otel] を契約にするため、./codex-config の設定ファイルを mount する。
   codex-sample:
     image: node:20-bookworm-slim
     depends_on:

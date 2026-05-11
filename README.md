@@ -104,7 +104,7 @@ otel-logger [OPTIONS]
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | Suppress the human-readable stdout stream                |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary when usage totals change |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |
-| `--dry-run`    | `-n`  | `false`          |                           | Validate startup but exit before binding                 |
+| `--dry-run`    | `-n`  | `false`          |                           | Validate startup, including simultaneous listener bind, then exit |
 | `--help`       | `-h`  |                  |                           | Show help                                                |
 | `--version`    | `-V`  |                  |                           | Show version                                             |
 
@@ -312,6 +312,10 @@ usage, so `otel-logger` does not count them as token usage.
 If Codex token logs arrive before `conversation_starts`, the temporary
 `effort=unknown` bucket is folded into the later provider/model/effort bucket
 when the session metadata arrives.
+When `conversation.id` is present, SSE completion logs use the matching
+`codex.conversation_starts` metadata instead of the last observed session, so
+interleaved Codex conversations do not move token usage into the wrong effort
+bucket.
 
 ### `GET /stats` (always on)
 
@@ -418,7 +422,7 @@ make docker     # build the container image
 - `tonic` exposes the three OTLP gRPC services (`TraceService`, `MetricsService`, `LogsService`) on port 4317.
 - `axum` serves `/v1/traces`, `/v1/metrics`, `/v1/logs` on port 4318 and accepts both `application/x-protobuf` (decoded with `prost`) and `application/json` (decoded via `serde`).
 - Both transports converge on a shared `Sink` that writes pretty stdout and lossless JSONL.
-- `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown so the trailing batch never disappears.
+- `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; gRPC/HTTP tasks are awaited before the final JSONL flush so the trailing batch never disappears.
 
 ## License
 

@@ -35,7 +35,7 @@ jobs:
       - name: Bump version
         id: bump
         run: |
-          # Use 2-digit year (YY) for Windows MSI compatibility (major version must be <= 255)
+          # Windows MSI 互換のため 2 桁年 (YY) を使う (major version は 255 以下が必要)
           YEAR=$(date +%y)
           MONTH=$(date +%-m)
 
@@ -46,7 +46,7 @@ jobs:
             OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            # Handle both 2-digit and 4-digit year formats
+            # 2 桁年と 4 桁年の両形式を扱う
             OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
@@ -60,7 +60,7 @@ jobs:
           NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
           echo "New version: ${NEW_VERSION}"
 
-          # Only replace the first occurrence (package version, not dependency versions)
+          # dependency version ではなく package version の先頭 1 件だけを置換する
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
           if [ -f "Cargo.lock" ]; then
@@ -279,17 +279,17 @@ jobs:
           VERSION="${{ needs.prepare-release.outputs.version }}"
           TAG="${{ needs.prepare-release.outputs.tag }}"
 
-          # Source archive SHA256
+          # source archive の SHA256
           curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz" -o source.tar.gz
           SHA256_SOURCE=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256_source=${SHA256_SOURCE}" >> $GITHUB_OUTPUT
 
-          # Download release binaries
+          # release binary を取得する
           curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/otel-logger-aarch64-apple-darwin.tar.gz" -o mac_arm64.tar.gz
           curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/otel-logger-x86_64-apple-darwin.tar.gz" -o mac_x86_64.tar.gz
           curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/otel-logger-x86_64-unknown-linux-gnu.tar.gz" -o linux_x86_64.tar.gz
 
-          # Create bottle tarball function
+          # bottle tarball 作成関数
           create_bottle() {
             local src_tarball=$1
             local bottle_tag=$2
@@ -334,14 +334,14 @@ jobs:
           SHA256_BOTTLE_SONOMA="${{ steps.bottles.outputs.sha256_bottle_sonoma }}"
           SHA256_BOTTLE_X86_64_LINUX="${{ steps.bottles.outputs.sha256_bottle_x86_64_linux }}"
 
-          # Clone homebrew tap
+          # homebrew tap を clone する
           git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-otel-logger.git"
           cd homebrew-otel-logger
 
-          # Create Formula directory if not exists
+          # Formula ディレクトリが無ければ作成する
           mkdir -p Formula
 
-          # Create/update formula
+          # formula を作成または更新する
           cat > Formula/otel-logger.rb << 'FORMULA'
           class OtelLogger < Formula
             desc "OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSONL"
@@ -369,7 +369,7 @@ jobs:
           end
           FORMULA
 
-          # Replace placeholders with actual values
+          # placeholder を実値へ置換する
           sed -i "s|URL_SOURCE_PLACEHOLDER|https://github.com/owayo/otel-logger/archive/refs/tags/${TAG}.tar.gz|g" Formula/otel-logger.rb
           sed -i "s|SHA256_SOURCE_PLACEHOLDER|${SHA256_SOURCE}|g" Formula/otel-logger.rb
           sed -i "s|ROOT_URL_PLACEHOLDER|https://github.com/owayo/otel-logger/releases/download/${TAG}|g" Formula/otel-logger.rb
@@ -377,10 +377,10 @@ jobs:
           sed -i "s|SHA256_BOTTLE_SONOMA_PLACEHOLDER|${SHA256_BOTTLE_SONOMA}|g" Formula/otel-logger.rb
           sed -i "s|SHA256_BOTTLE_X86_64_LINUX_PLACEHOLDER|${SHA256_BOTTLE_X86_64_LINUX}|g" Formula/otel-logger.rb
 
-          # Remove leading spaces from heredoc
+          # heredoc 由来の先頭スペースを削除する
           sed -i 's/^          //' Formula/otel-logger.rb
 
-          # Commit and push
+          # commit して push する
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/otel-logger.rb

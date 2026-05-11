@@ -144,6 +144,11 @@ struct AggregatorInner {
     /// フォールバックする。
     codex_last_session: Option<CodexSession>,
 
+    /// `conversation.id` ごとの Codex セッション情報。
+    /// SSE 完了ログには `conversation.id` が載るため、同時進行のセッションが混ざっても
+    /// 最後に見た別セッションの effort へ誤って寄せないようにする。
+    codex_sessions: HashMap<String, CodexSession>,
+
     /// Codex は SSE 完了ログと turn metrics の両方で token usage を出す。
     /// metrics 側に conversation id が無いため、両方に存在する model 単位で
     /// 最初に観測したソースを採用し、二重計上を避ける。
@@ -152,8 +157,8 @@ struct AggregatorInner {
 
 #[derive(Debug, Clone)]
 struct CodexSession {
+    conversation_id: String,
     provider: String,
-    #[allow(dead_code)] // 将来の相関付け用に保持する。
     model: String,
     effort: String,
 }
@@ -173,6 +178,7 @@ impl Aggregator {
                 agents: BTreeMap::new(),
                 claude_canonical_models: HashMap::new(),
                 codex_last_session: None,
+                codex_sessions: HashMap::new(),
                 codex_token_sources: HashMap::new(),
             }),
         }
@@ -371,6 +377,9 @@ fn extract_codex_conversation_starts(log: &LogRecord) -> Option<CodexSession> {
 }
 
 fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
+    let conversation_id = string_attr(attrs, "conversation.id")
+        .map(str::to_string)
+        .unwrap_or_default();
     let provider = string_attr(attrs, "provider_name")
         .map(str::to_string)
         .unwrap_or_else(|| PROVIDER_OPENAI.to_string());
@@ -380,7 +389,11 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
     let effort = string_attr(attrs, "reasoning_effort")
         .map(str::to_string)
         .unwrap_or_default();
+    if conversation_id.is_empty() && model.is_empty() && effort.is_empty() {
+        return None;
+    }
     Some(CodexSession {
+        conversation_id,
         provider,
         model,
         effort,
@@ -421,10 +434,12 @@ fn extract_codex_sse_response_completed(
         return None;
     }
 
+    let session = codex_session_for_attrs(g, attrs).or(g.codex_last_session.as_ref());
     let model = string_attr(attrs, "model")
-        .or_else(|| string_attr(attrs, "slug"))
+        .filter(|model| !model.is_empty())
+        .or_else(|| string_attr(attrs, "slug").filter(|slug| !slug.is_empty()))
         .map(str::to_string)
-        .or_else(|| g.codex_last_session.as_ref().map(|s| s.model.clone()))
+        .or_else(|| session.map(|s| s.model.clone()))
         .unwrap_or_default();
     let stats = ModelStats {
         input_tokens,
@@ -434,7 +449,11 @@ fn extract_codex_sse_response_completed(
         ..Default::default()
     };
     Some((
-        Bucket::from_parts(codex_provider(g), model, codex_effort(g)),
+        Bucket::from_parts(
+            codex_provider_from_session(session),
+            model,
+            codex_effort_from_session(session),
+        ),
         stats,
     ))
 }
@@ -588,17 +607,32 @@ fn ingest_codex_duration(g: &mut AggregatorInner, metric: &Metric) -> usize {
 }
 
 fn codex_provider(g: &AggregatorInner) -> String {
-    g.codex_last_session
-        .as_ref()
+    codex_provider_from_session(g.codex_last_session.as_ref())
+}
+
+fn codex_effort(g: &AggregatorInner) -> String {
+    codex_effort_from_session(g.codex_last_session.as_ref())
+}
+
+fn codex_provider_from_session(session: Option<&CodexSession>) -> String {
+    session
         .map(|s| s.provider.clone())
         .unwrap_or_else(|| PROVIDER_OPENAI.to_string())
 }
 
-fn codex_effort(g: &AggregatorInner) -> String {
-    g.codex_last_session
-        .as_ref()
-        .map(|s| s.effort.clone())
-        .unwrap_or_default()
+fn codex_effort_from_session(session: Option<&CodexSession>) -> String {
+    session.map(|s| s.effort.clone()).unwrap_or_default()
+}
+
+fn codex_session_for_attrs<'a>(
+    g: &'a AggregatorInner,
+    attrs: &[KeyValue],
+) -> Option<&'a CodexSession> {
+    let conversation_id = string_attr(attrs, "conversation.id")?;
+    if conversation_id.is_empty() {
+        return None;
+    }
+    g.codex_sessions.get(conversation_id)
 }
 
 fn codex_token_source_key(model: &str) -> String {
@@ -609,6 +643,10 @@ fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
     let provider = session.provider.clone();
     let model = session.model.clone();
     let effort = session.effort.clone();
+    if !session.conversation_id.is_empty() {
+        g.codex_sessions
+            .insert(session.conversation_id.clone(), session.clone());
+    }
     g.codex_last_session = Some(session);
     merge_codex_unknown_effort(g, &provider, &model, &effort);
 }
@@ -657,6 +695,9 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
             session
         }
         None => CodexSession {
+            conversation_id: string_attr(attrs, "conversation.id")
+                .map(str::to_string)
+                .unwrap_or_default(),
             provider: PROVIDER_OPENAI.to_string(),
             model: String::new(),
             effort: effort.to_string(),
@@ -1286,6 +1327,66 @@ mod tests {
         assert_eq!(bucket.stats.cache_read_tokens, 50);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
         assert_eq!(bucket.stats.request_count, 0);
+    }
+
+    #[test]
+    fn codex_sse_uses_matching_conversation_effort_when_sessions_interleave() {
+        let agg = Aggregator::new();
+        // 実ログでは複数 conversation の SSE が混在するため、最後に見た session ではなく
+        // `conversation.id` が一致する session の effort を使う必要がある。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-xhigh"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-medium"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-xhigh"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+                kv_str("output_token_count", "20"),
+                kv_int("cached_token_count", 50),
+                kv_int("reasoning_token_count", 30),
+                kv_str("tool_token_count", "120"),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/medium"))
+        );
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 30);
     }
 
     #[test]

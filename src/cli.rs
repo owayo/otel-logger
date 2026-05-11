@@ -73,9 +73,9 @@ pub struct Cli {
     #[arg(long, value_enum, env = "OTEL_LOGGER_COLOR", value_name = "WHEN")]
     pub color: Option<ColorMode>,
 
-    /// Validate startup without binding listeners.
+    /// Validate startup and listener bind availability.
     /// 起動処理 (引数解析、ログファイル open、address 解決) だけ検証し、
-    /// listener を bind せず終了する。CI の smoke test に使う。
+    /// gRPC / HTTP listener が同時に bind できることを確認して終了する。CI の smoke test に使う。
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 }
