@@ -434,7 +434,14 @@ fn extract_codex_sse_response_completed(
         return None;
     }
 
-    let session = codex_session_for_attrs(g, attrs).or(g.codex_last_session.as_ref());
+    // `conversation.id` がある SSE は、その conversation の session にだけ紐付ける。
+    // 未受信の場合に `codex_last_session` へフォールバックすると、並行/継続 conversation の
+    // effort を誤って付与する恐れがある。id が無い古い telemetry のみ last session を使う。
+    let session = if string_attr(attrs, "conversation.id").is_some_and(|id| !id.is_empty()) {
+        codex_session_for_attrs(g, attrs)
+    } else {
+        g.codex_last_session.as_ref()
+    };
     let model = string_attr(attrs, "model")
         .filter(|model| !model.is_empty())
         .or_else(|| string_attr(attrs, "slug").filter(|slug| !slug.is_empty()))
@@ -1409,6 +1416,92 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(!agg.snapshot().agents.contains_key(AGENT_CODEX));
+    }
+
+    #[test]
+    fn codex_sse_with_unknown_conversation_id_does_not_borrow_other_session_effort() {
+        let agg = Aggregator::new();
+        // 既知の session (medium) を一つ登録しておく。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-medium"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+
+        // session が未受信の別 conversation.id を持つ SSE が届いたとき、
+        // medium バケットへは入らず unknown バケットへ落ちる必要がある。
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-missing"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/medium")),
+            "別 conversation の medium バケットへ誤って計上されてはならない"
+        );
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    #[test]
+    fn codex_late_conversation_start_moves_unknown_conversation_sse_tokens() {
+        let agg = Aggregator::new();
+        // 先に SSE 完了ログを受け、その時点では session が未受信なので unknown へ入る。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-late"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        // 後から conversation_starts が届けば、unknown -> high へマージされる。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-late"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+        );
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
     }
 
     #[test]

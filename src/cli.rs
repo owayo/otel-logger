@@ -185,3 +185,136 @@ impl Settings {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_cli() -> Cli {
+        Cli {
+            command: None,
+            config: None,
+            grpc_addr: None,
+            http_addr: None,
+            log_file: None,
+            log_dir: None,
+            log_keep_days: None,
+            no_stdout: false,
+            summary: false,
+            color: None,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn merge_defaults_when_nothing_specified() {
+        let settings = Settings::merge(empty_cli(), Config::default()).unwrap();
+        assert_eq!(settings.grpc_addr.to_string(), "0.0.0.0:4317");
+        assert_eq!(settings.http_addr.to_string(), "0.0.0.0:4318");
+        assert!(settings.log_sink.is_none());
+        assert!(!settings.no_stdout);
+        assert!(!settings.summary);
+        assert_eq!(settings.color, ColorMode::Auto);
+        assert!(!settings.dry_run);
+    }
+
+    #[test]
+    fn merge_log_file_and_log_dir_are_mutually_exclusive() {
+        let mut cli = empty_cli();
+        cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
+        cli.log_dir = Some(PathBuf::from("/tmp/dir"));
+        let err = Settings::merge(cli, Config::default()).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn merge_log_file_from_cli_uses_file_sink() {
+        let mut cli = empty_cli();
+        cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
+        let settings = Settings::merge(cli, Config::default()).unwrap();
+        match settings.log_sink {
+            Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/tmp/a.jsonl")),
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_log_dir_from_config_uses_directory_sink_with_keep_days() {
+        let cli = empty_cli();
+        let config = Config {
+            log_dir: Some(PathBuf::from("/var/log/otel")),
+            log_keep_days: Some(7),
+            ..Config::default()
+        };
+        let settings = Settings::merge(cli, config).unwrap();
+        match settings.log_sink {
+            Some(LogSink::Directory { dir, keep_days }) => {
+                assert_eq!(dir, PathBuf::from("/var/log/otel"));
+                assert_eq!(keep_days, 7);
+            }
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_log_dir_falls_back_to_default_keep_days() {
+        let cli = empty_cli();
+        let config = Config {
+            log_dir: Some(PathBuf::from("/var/log/otel")),
+            ..Config::default()
+        };
+        // log_keep_days を未指定にすると DEFAULT_LOG_KEEP_DAYS が使われる。
+        let settings = Settings::merge(cli, config).unwrap();
+        match settings.log_sink {
+            Some(LogSink::Directory { keep_days, .. }) => {
+                assert_eq!(keep_days, DEFAULT_LOG_KEEP_DAYS);
+            }
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_cli_overrides_config_log_file() {
+        let mut cli = empty_cli();
+        cli.log_file = Some(PathBuf::from("/cli.jsonl"));
+        let config = Config {
+            log_file: Some(PathBuf::from("/config.jsonl")),
+            ..Config::default()
+        };
+        let settings = Settings::merge(cli, config).unwrap();
+        match settings.log_sink {
+            Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_boolean_flags_or_together() {
+        // CLI=false でも Config=true なら有効化される。
+        let cli = empty_cli();
+        let config = Config {
+            no_stdout: Some(true),
+            summary: Some(true),
+            ..Config::default()
+        };
+        let settings = Settings::merge(cli, config).unwrap();
+        assert!(settings.no_stdout);
+        assert!(settings.summary);
+    }
+
+    #[test]
+    fn color_mode_auto_disables_when_no_color_env_is_set() {
+        // SAFETY: テスト中の単純な env 操作で、process scope は隔離されていない点に注意。
+        // 並列実行されうるため、固有の env 名にして他テストと衝突しないようにすべきだが、
+        // ここでは NO_COLOR の存在判定ロジックそのものを検証する。
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        assert!(!ColorMode::Auto.enabled_for_stdout());
+        unsafe { std::env::remove_var("NO_COLOR") };
+    }
+
+    #[test]
+    fn color_mode_always_and_never_ignore_terminal_state() {
+        assert!(ColorMode::Always.enabled_for_stdout());
+        assert!(!ColorMode::Never.enabled_for_stdout());
+    }
+}

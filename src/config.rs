@@ -150,3 +150,76 @@ pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
         InitOutcome::Created
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_explicit_path_returns_error_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.toml");
+        let err = Config::load(Some(&missing)).unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn load_explicit_path_parses_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+grpc-addr = "127.0.0.1:14317"
+http-addr = "127.0.0.1:14318"
+log-file = "/tmp/test.jsonl"
+no-stdout = true
+summary = true
+color = "never"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.grpc_addr.unwrap().to_string(), "127.0.0.1:14317");
+        assert_eq!(config.http_addr.unwrap().to_string(), "127.0.0.1:14318");
+        assert_eq!(config.log_file.unwrap(), PathBuf::from("/tmp/test.jsonl"));
+        assert_eq!(config.no_stdout, Some(true));
+        assert_eq!(config.summary, Some(true));
+        assert_eq!(config.color, Some(crate::cli::ColorMode::Never));
+    }
+
+    #[test]
+    fn load_rejects_unknown_fields() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "unknown-key = true\n").unwrap();
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("parse TOML"));
+    }
+
+    #[test]
+    fn write_default_creates_file_and_refuses_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        // 親ディレクトリも合わせて作成する。
+        let outcome = write_default(&path, false).unwrap();
+        assert_eq!(outcome, InitOutcome::Created);
+        assert!(path.exists());
+        // force なしで再書き込みは失敗する。
+        let err = write_default(&path, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // force ありなら overwrite を返す。
+        let outcome = write_default(&path, true).unwrap();
+        assert_eq!(outcome, InitOutcome::Overwrote);
+    }
+
+    #[test]
+    fn write_default_content_is_loadable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        write_default(&path, false).unwrap();
+        // 生成したテンプレートが Config として往復解析可能であることを確認する。
+        Config::load(Some(&path)).unwrap();
+    }
+}

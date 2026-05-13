@@ -182,3 +182,53 @@ pub async fn serve(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_ct(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn detect_encoding_defaults_to_protobuf_when_header_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(detect_encoding(&headers).unwrap(), Encoding::Protobuf);
+    }
+
+    #[test]
+    fn detect_encoding_recognises_protobuf_and_json() {
+        let h_proto = headers_with_ct(PROTOBUF_CT);
+        let h_json = headers_with_ct(JSON_CT);
+        assert_eq!(detect_encoding(&h_proto).unwrap(), Encoding::Protobuf);
+        assert_eq!(detect_encoding(&h_json).unwrap(), Encoding::Json);
+    }
+
+    #[test]
+    fn detect_encoding_ignores_parameters_in_content_type() {
+        // OTLP spec では `application/x-protobuf; charset=utf-8` のような表記も許容される。
+        let h = headers_with_ct("application/x-protobuf; charset=utf-8");
+        assert_eq!(detect_encoding(&h).unwrap(), Encoding::Protobuf);
+    }
+
+    #[test]
+    fn detect_encoding_rejects_unknown_content_type() {
+        let h = headers_with_ct("text/plain");
+        let err = detect_encoding(&h).unwrap_err();
+        match err {
+            HttpError::UnsupportedContentType(ct) => assert_eq!(ct, "text/plain"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_request_returns_error_for_malformed_protobuf() {
+        // 0xFF だけの bytes は proto Message として decode できない。
+        let result: Result<ExportTraceServiceRequest, _> =
+            decode_request(Encoding::Protobuf, &[0xFF]);
+        assert!(result.is_err());
+    }
+}

@@ -312,10 +312,13 @@ usage, so `otel-logger` does not count them as token usage.
 If Codex token logs arrive before `conversation_starts`, the temporary
 `effort=unknown` bucket is folded into the later provider/model/effort bucket
 when the session metadata arrives.
-When `conversation.id` is present, SSE completion logs use the matching
-`codex.conversation_starts` metadata instead of the last observed session, so
-interleaved Codex conversations do not move token usage into the wrong effort
-bucket.
+When `conversation.id` is present on an SSE completion log, the aggregator
+uses only the matching `codex.conversation_starts` metadata — it never falls
+back to the last observed session of a different `conversation.id`. If the
+matching `conversation_starts` has not been seen yet, the entry lands in an
+`effort=unknown` bucket and is merged into the correct effort bucket once the
+metadata catches up. This keeps interleaved or long-running Codex
+conversations from moving token usage into the wrong effort bucket.
 
 ### `GET /stats` (always on)
 
