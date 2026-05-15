@@ -24,6 +24,7 @@ cargo build --release
 ## 実装上の注意
 
 - 受信した OTLP payload は JSON Lines で欠落なく保存する方針を守る。
+- Claude の API request ログには token/cost が含まれ、metrics より新しい分まで即時に届くことがある。累計統計では同じ model/effort のログが見えたらログ側を token/cost source として採用し、先に計上した metrics 分は取り消して二重計上を避ける。
 - Claude / Codex の累計統計は二重計上を避ける。特に Codex は SSE 完了ログと turn metrics の両方に token usage が出るため、model ごとに片方だけを token source として採用する。
 - Codex の SSE 完了ログで `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only event は、turn metrics / `handle_responses` span usage と合わせるため token usage に加算しない。
 - Codex の SSE 完了ログは `conversation.id` で `codex.conversation_starts` の provider/model/effort に紐付ける。複数 conversation が混在するため、単純な「直近 session」だけで effort を決めない。`conversation.id` が付与されているが対応する session が未受信の場合は、別 conversation の `codex_last_session` にフォールバックせず、`effort=unknown` のまま処理する (後で session が届けば `merge_codex_unknown_effort` で正しいバケットへ統合される)。

@@ -50,6 +50,32 @@ impl ModelStats {
         self.cost_usd += sample.cost_usd;
         self.duration_ms += sample.duration_ms;
     }
+
+    fn subtract(&mut self, sample: &ModelStats) {
+        self.request_count = self.request_count.saturating_sub(sample.request_count);
+        self.input_tokens = self.input_tokens.saturating_sub(sample.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_sub(sample.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_sub(sample.cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_sub(sample.cache_creation_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_sub(sample.reasoning_output_tokens);
+        self.cost_usd = (self.cost_usd - sample.cost_usd).max(0.0);
+        self.duration_ms = self.duration_ms.saturating_sub(sample.duration_ms);
+    }
+
+    fn has_usage(&self) -> bool {
+        self.input_tokens != 0
+            || self.output_tokens != 0
+            || self.cache_read_tokens != 0
+            || self.cache_creation_tokens != 0
+            || self.reasoning_output_tokens != 0
+            || self.cost_usd != 0.0
+    }
 }
 
 /// 内部集計で `BTreeMap` のキーに使う provider × model × effort の組。
@@ -139,6 +165,15 @@ struct AggregatorInner {
     /// 1M 版と通常版が別集計にならないようにする。
     claude_canonical_models: HashMap<String, String>,
 
+    /// Claude は API request ログと metrics の両方に token/cost を持つ。
+    /// ログは request_id 単位で即時に届き、metrics より新しい分まで含むため、
+    /// ログが見えた model/effort ではログを token source として採用する。
+    claude_usage_sources: HashMap<String, ClaudeUsageSource>,
+
+    /// metrics を先に計上した後で同じ model/effort の API request ログが届いた場合に、
+    /// 二重計上を避けるため取り消す metrics 側の累計 usage。
+    claude_metric_usage: HashMap<String, ModelStats>,
+
     /// `codex.conversation_starts` の log/event から最後に観測した Codex セッション情報。
     /// Codex metrics には `reasoning_effort` が載らないため、直近のセッション値に
     /// フォールバックする。
@@ -169,6 +204,12 @@ enum CodexTokenSource {
     Metrics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeUsageSource {
+    Logs,
+    Metrics,
+}
+
 impl Aggregator {
     pub fn new() -> Self {
         Self {
@@ -177,6 +218,8 @@ impl Aggregator {
                 last_updated: None,
                 agents: BTreeMap::new(),
                 claude_canonical_models: HashMap::new(),
+                claude_usage_sources: HashMap::new(),
+                claude_metric_usage: HashMap::new(),
                 codex_last_session: None,
                 codex_sessions: HashMap::new(),
                 codex_token_sources: HashMap::new(),
@@ -195,9 +238,11 @@ impl Aggregator {
             for scope_logs in &resource_logs.scope_logs {
                 for log in &scope_logs.log_records {
                     if service == SERVICE_CLAUDE
-                        && let Some((bucket, stats)) = extract_claude_api_request_meta(&mut g, log)
+                        && let Some((bucket, request_stats, usage_stats)) =
+                            extract_claude_api_request_meta(&mut g, log)
                     {
-                        record_into(&mut g, AGENT_CLAUDE, &bucket, &stats);
+                        record_into(&mut g, AGENT_CLAUDE, &bucket, &request_stats);
+                        record_claude_log_usage(&mut g, &bucket, &usage_stats);
                         count += 1;
                         continue;
                     }
@@ -323,13 +368,60 @@ fn record_into(g: &mut AggregatorInner, agent: &str, bucket: &Bucket, stats: &Mo
     entry.stats.add(stats);
 }
 
+fn subtract_from(g: &mut AggregatorInner, agent: &str, bucket: &Bucket, stats: &ModelStats) {
+    let Some(agent_stats) = g.agents.get_mut(agent) else {
+        return;
+    };
+    agent_stats.total.subtract(stats);
+    if let Some(bucket_stats) = agent_stats.buckets.get_mut(&bucket.key()) {
+        bucket_stats.stats.subtract(stats);
+    }
+}
+
+fn record_claude_log_usage(g: &mut AggregatorInner, bucket: &Bucket, stats: &ModelStats) {
+    if !stats.has_usage() {
+        return;
+    }
+    let source_key = claude_usage_source_key(&bucket.model, &bucket.effort);
+    if g.claude_usage_sources.get(&source_key) == Some(&ClaudeUsageSource::Metrics)
+        && let Some(metric_stats) = g.claude_metric_usage.remove(&source_key)
+    {
+        subtract_from(g, AGENT_CLAUDE, bucket, &metric_stats);
+    }
+    record_into(g, AGENT_CLAUDE, bucket, stats);
+    g.claude_usage_sources
+        .insert(source_key, ClaudeUsageSource::Logs);
+}
+
+fn record_claude_metric_usage(
+    g: &mut AggregatorInner,
+    bucket: &Bucket,
+    stats: &ModelStats,
+) -> bool {
+    if !stats.has_usage() {
+        return false;
+    }
+    let source_key = claude_usage_source_key(&bucket.model, &bucket.effort);
+    if g.claude_usage_sources.get(&source_key) == Some(&ClaudeUsageSource::Logs) {
+        return false;
+    }
+    record_into(g, AGENT_CLAUDE, bucket, stats);
+    g.claude_usage_sources
+        .insert(source_key.clone(), ClaudeUsageSource::Metrics);
+    g.claude_metric_usage
+        .entry(source_key)
+        .or_default()
+        .add(stats);
+    true
+}
+
 /// `claude_code.api_request` は `request_count` (1) と `duration_ms` を持つが、
 /// `model` 属性から `[1m]` のようなバリアント接尾辞が落ちる。過去に観測した完全名へ
 /// 戻して、metrics と同じバケットに入るようにする。
 fn extract_claude_api_request_meta(
     g: &mut AggregatorInner,
     log: &LogRecord,
-) -> Option<(Bucket, ModelStats)> {
+) -> Option<(Bucket, ModelStats, ModelStats)> {
     let body = log.body.as_ref()?.value.as_ref()?;
     let body_str = match body {
         OtlpValue::StringValue(s) => s.as_str(),
@@ -344,12 +436,24 @@ fn extract_claude_api_request_meta(
     let effort = string_attr(attrs, "effort")
         .map(str::to_string)
         .unwrap_or_default();
-    let stats = ModelStats {
+    let request_stats = ModelStats {
         request_count: 1,
         duration_ms: int_attr(attrs, "duration_ms").unwrap_or(0).max(0) as u64,
         ..Default::default()
     };
-    Some((Bucket::from_parts(PROVIDER_ANTHROPIC, model, effort), stats))
+    let usage_stats = ModelStats {
+        input_tokens: u64_attr(attrs, "input_tokens"),
+        output_tokens: u64_attr(attrs, "output_tokens"),
+        cache_read_tokens: u64_attr(attrs, "cache_read_tokens"),
+        cache_creation_tokens: u64_attr(attrs, "cache_creation_tokens"),
+        cost_usd: f64_attr(attrs, "cost_usd").unwrap_or(0.0).max(0.0),
+        ..Default::default()
+    };
+    Some((
+        Bucket::from_parts(PROVIDER_ANTHROPIC, model, effort),
+        request_stats,
+        usage_stats,
+    ))
 }
 
 fn extract_codex_conversation_starts(log: &LogRecord) -> Option<CodexSession> {
@@ -492,8 +596,9 @@ fn ingest_claude_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
             _ => continue,
         }
         let bucket = Bucket::from_parts(PROVIDER_ANTHROPIC, model, effort);
-        record_into(g, AGENT_CLAUDE, &bucket, &stats);
-        hits += 1;
+        if record_claude_metric_usage(g, &bucket, &stats) {
+            hits += 1;
+        }
     }
     hits
 }
@@ -519,8 +624,9 @@ fn ingest_claude_cost(g: &mut AggregatorInner, metric: &Metric) -> usize {
             ..Default::default()
         };
         let bucket = Bucket::from_parts(PROVIDER_ANTHROPIC, model, effort);
-        record_into(g, AGENT_CLAUDE, &bucket, &stats);
-        hits += 1;
+        if record_claude_metric_usage(g, &bucket, &stats) {
+            hits += 1;
+        }
     }
     hits
 }
@@ -644,6 +750,15 @@ fn codex_session_for_attrs<'a>(
 
 fn codex_token_source_key(model: &str) -> String {
     non_empty(model.to_string())
+}
+
+fn claude_usage_source_key(model: &str, effort: &str) -> String {
+    let bare_model = model.split_once('[').map(|(bare, _)| bare).unwrap_or(model);
+    format!(
+        "{}/{}",
+        non_empty(bare_model.to_string()),
+        non_empty(effort.to_string())
+    )
 }
 
 fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
@@ -867,6 +982,22 @@ fn int_attr(attrs: &[KeyValue], key: &str) -> Option<i64> {
     }
 }
 
+fn f64_attr(attrs: &[KeyValue], key: &str) -> Option<f64> {
+    let v = attrs
+        .iter()
+        .find(|kv| kv.key == key)?
+        .value
+        .as_ref()?
+        .value
+        .as_ref()?;
+    match v {
+        OtlpValue::DoubleValue(d) => Some(*d),
+        OtlpValue::IntValue(i) => Some(*i as f64),
+        OtlpValue::StringValue(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 fn u64_attr(attrs: &[KeyValue], key: &str) -> u64 {
     int_attr(attrs, key).unwrap_or(0).max(0) as u64
 }
@@ -905,6 +1036,14 @@ mod tests {
             key,
             AnyValue {
                 value: Some(OtlpValue::IntValue(value)),
+            },
+        )
+    }
+    fn kv_double(key: &str, value: f64) -> KeyValue {
+        kv(
+            key,
+            AnyValue {
+                value: Some(OtlpValue::DoubleValue(value)),
             },
         )
     }
@@ -1272,6 +1411,115 @@ mod tests {
     }
 
     #[test]
+    fn claude_api_request_log_counts_usage_without_metrics() {
+        let agg = Aggregator::new();
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-7"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 3),
+                kv_int("output_tokens", 20),
+                kv_int("cache_read_tokens", 100),
+                kv_int("cache_creation_tokens", 7),
+                kv_double("cost_usd", 0.0123),
+                kv_int("duration_ms", 1200),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket = agent.buckets.get("anthropic/claude-opus-4-7/max").unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 3);
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(bucket.stats.cache_read_tokens, 100);
+        assert_eq!(bucket.stats.cache_creation_tokens, 7);
+        assert_eq!(bucket.stats.duration_ms, 1200);
+        assert!((bucket.stats.cost_usd - 0.0123).abs() < 1e-9);
+    }
+
+    #[test]
+    fn claude_log_usage_prevents_later_metric_double_count() {
+        let agg = Aggregator::new();
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-7"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 10),
+                kv_int("output_tokens", 5),
+                kv_double("cost_usd", 0.5),
+                kv_int("duration_ms", 900),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+        let metric_req = make_metric_req(
+            SERVICE_CLAUDE,
+            vec![
+                claude_token_metric("claude-opus-4-7", "max", "input", 999),
+                claude_cost_metric("claude-opus-4-7", "max", 9.0),
+            ],
+        );
+        agg.ingest_metrics(&metric_req);
+        let snap = agg.snapshot();
+        let bucket = snap
+            .agents
+            .get(AGENT_CLAUDE)
+            .unwrap()
+            .buckets
+            .get("anthropic/claude-opus-4-7/max")
+            .unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 10);
+        assert_eq!(bucket.stats.output_tokens, 5);
+        assert_eq!(bucket.stats.duration_ms, 900);
+        assert!((bucket.stats.cost_usd - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn claude_log_usage_replaces_earlier_metric_source() {
+        let agg = Aggregator::new();
+        let metric_req = make_metric_req(
+            SERVICE_CLAUDE,
+            vec![
+                claude_token_metric("claude-opus-4-7[1m]", "max", "input", 999),
+                claude_cost_metric("claude-opus-4-7[1m]", "max", 9.0),
+            ],
+        );
+        agg.ingest_metrics(&metric_req);
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-7"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 10),
+                kv_int("output_tokens", 5),
+                kv_double("cost_usd", 0.5),
+                kv_int("duration_ms", 900),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        assert!(!agent.buckets.contains_key("anthropic/claude-opus-4-7/max"));
+        let bucket = agent
+            .buckets
+            .get("anthropic/claude-opus-4-7[1m]/max")
+            .unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 10);
+        assert_eq!(bucket.stats.output_tokens, 5);
+        assert_eq!(bucket.stats.duration_ms, 900);
+        assert!((bucket.stats.cost_usd - 0.5).abs() < 1e-9);
+        assert_eq!(agent.total.input_tokens, 10);
+        assert!((agent.total.cost_usd - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn codex_token_metric_skips_total_and_maps_others() {
         let agg = Aggregator::new();
         let req = make_metric_req(
@@ -1281,7 +1529,7 @@ mod tests {
                 codex_token_metric("gpt-5.5", "output", 20.0),
                 codex_token_metric("gpt-5.5", "cached_input", 50.0),
                 codex_token_metric("gpt-5.5", "reasoning_output", 30.0),
-                codex_token_metric("gpt-5.5", "total", 9999.0), // must be ignored
+                codex_token_metric("gpt-5.5", "total", 9999.0), // 重複するため無視される
             ],
         );
         agg.ingest_metrics(&req);

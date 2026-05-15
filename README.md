@@ -41,6 +41,8 @@ the agent emits during a CI job and surface it where developers already look.
 - Accepts both `application/x-protobuf` and `application/json` on HTTP
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
 - JSON Lines persistence, `fsync`'d on graceful shutdown
+- Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
+  de-duplication between logs and metrics
 - Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
 - Single static-ish binary (~7 MB stripped) and a distroless container image
 - Examples for Docker Compose, GitHub Actions, and GitLab CI
@@ -158,6 +160,15 @@ otel-logger --grpc-addr 127.0.0.1:0 --http-addr 0.0.0.0:4318
 # Smoke test from CI
 otel-logger --dry-run
 ```
+
+### Usage summary
+
+`--summary` appends cumulative Claude/Codex usage totals to stdout whenever the
+receiver ingests a new usage sample. `GET /stats` always returns the same
+snapshot as JSON. Claude API request logs are treated as the preferred source
+for token/cost usage when both logs and metrics are present, because logs arrive
+per request and can include usage that has not yet been exported as metrics.
+Matching metrics are de-duplicated instead of being added twice.
 
 ## Sending telemetry from Claude Code
 

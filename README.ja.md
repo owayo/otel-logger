@@ -38,6 +38,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - HTTP は `application/x-protobuf` と `application/json` の両方を受信
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
 - JSON Lines は graceful shutdown 時に `fsync`
+- Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
 - SIGINT / SIGTERM 対応 (`docker stop` で末尾バッチが落ちない)
 - Stripped で約 7 MB の単一バイナリ。distroless コンテナイメージ同梱
 - Docker Compose / GitHub Actions / GitLab CI の利用例を同梱
@@ -149,6 +150,10 @@ otel-logger --grpc-addr 127.0.0.1:0 --http-addr 0.0.0.0:4318
 # CI でのスモークテスト
 otel-logger --dry-run
 ```
+
+### 使用量サマリー
+
+`--summary` を指定すると、Claude/Codex の使用量サンプルを取り込むたびに累計サマリーを stdout へ追記します。`GET /stats` は同じ累計値を常に JSON で返します。Claude の API request ログと metrics の両方に token/cost が存在する場合は、request 単位で即時に届き metrics より新しい分まで含みうるログ側を優先し、対応する metrics は二重に加算しません。
 
 ## Claude Code からの送信
 
