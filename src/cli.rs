@@ -153,19 +153,25 @@ pub struct Settings {
 impl Settings {
     /// merge 優先順位: CLI flag > env (clap が処理) > config > default。
     pub fn merge(cli: Cli, config: Config) -> anyhow::Result<Self> {
-        let log_file = cli.log_file.or(config.log_file);
-        let log_dir = cli.log_dir.or(config.log_dir);
         let keep_days = cli
             .log_keep_days
             .or(config.log_keep_days)
             .unwrap_or(DEFAULT_LOG_KEEP_DAYS);
-        let log_sink = match (log_file, log_dir) {
+
+        let log_sink = match (cli.log_file, cli.log_dir) {
             (Some(_), Some(_)) => {
                 anyhow::bail!("`--log-file` and `--log-dir` are mutually exclusive");
             }
             (Some(file), None) => Some(LogSink::File(file)),
             (None, Some(dir)) => Some(LogSink::Directory { dir, keep_days }),
-            (None, None) => None,
+            (None, None) => match (config.log_file, config.log_dir) {
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("`log-file` and `log-dir` are mutually exclusive");
+                }
+                (Some(file), None) => Some(LogSink::File(file)),
+                (None, Some(dir)) => Some(LogSink::Directory { dir, keep_days }),
+                (None, None) => None,
+            },
         };
 
         Ok(Self {
@@ -228,6 +234,17 @@ mod tests {
     }
 
     #[test]
+    fn merge_config_log_file_and_log_dir_are_mutually_exclusive() {
+        let config = Config {
+            log_file: Some(PathBuf::from("/tmp/a.jsonl")),
+            log_dir: Some(PathBuf::from("/tmp/dir")),
+            ..Config::default()
+        };
+        let err = Settings::merge(empty_cli(), config).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
     fn merge_log_file_from_cli_uses_file_sink() {
         let mut cli = empty_cli();
         cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
@@ -284,6 +301,36 @@ mod tests {
         let settings = Settings::merge(cli, config).unwrap();
         match settings.log_sink {
             Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_cli_log_file_overrides_config_log_dir() {
+        let mut cli = empty_cli();
+        cli.log_file = Some(PathBuf::from("/cli.jsonl"));
+        let config = Config {
+            log_dir: Some(PathBuf::from("/config-dir")),
+            ..Config::default()
+        };
+        let settings = Settings::merge(cli, config).unwrap();
+        match settings.log_sink {
+            Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
+            other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_cli_log_dir_overrides_config_log_file() {
+        let mut cli = empty_cli();
+        cli.log_dir = Some(PathBuf::from("/cli-dir"));
+        let config = Config {
+            log_file: Some(PathBuf::from("/config.jsonl")),
+            ..Config::default()
+        };
+        let settings = Settings::merge(cli, config).unwrap();
+        match settings.log_sink {
+            Some(LogSink::Directory { dir, .. }) => assert_eq!(dir, PathBuf::from("/cli-dir")),
             other => panic!("unexpected log_sink: {other:?}"),
         }
     }

@@ -271,7 +271,7 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !filename.starts_with(ROTATION_PREFIX) {
+        if !is_rotated_log_filename(filename) {
             continue;
         }
         if let Ok(metadata) = entry.metadata()
@@ -282,6 +282,19 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_rotated_log_filename(filename: &str) -> bool {
+    let Some(date) = filename.strip_prefix(&format!("{ROTATION_PREFIX}.")) else {
+        return false;
+    };
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -300,19 +313,31 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let old = dir.path().join("otel-logger.2020-01-01");
         let recent = dir.path().join("otel-logger.2099-01-01");
+        let pid = dir.path().join("otel-logger.pid");
+        let stderr = dir.path().join("otel-logger.stderr.log");
+        let jsonl = dir.path().join("otel-logger.jsonl");
         let unrelated = dir.path().join("other-app.log");
         std::fs::write(&old, "old").unwrap();
         std::fs::write(&recent, "recent").unwrap();
+        std::fs::write(&pid, "12345").unwrap();
+        std::fs::write(&stderr, "stderr").unwrap();
+        std::fs::write(&jsonl, "jsonl").unwrap();
         std::fs::write(&unrelated, "other").unwrap();
 
         let three_days_ago = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         touch_mtime(&old, three_days_ago);
+        touch_mtime(&pid, three_days_ago);
+        touch_mtime(&stderr, three_days_ago);
+        touch_mtime(&jsonl, three_days_ago);
         touch_mtime(&unrelated, three_days_ago);
 
         cleanup_old_rotated_logs(dir.path(), 1).unwrap();
 
         assert!(!old.exists(), "old otel-logger file should be deleted");
         assert!(recent.exists(), "recent otel-logger file should be kept");
+        assert!(pid.exists(), "pid file must not be touched");
+        assert!(stderr.exists(), "stderr file must not be touched");
+        assert!(jsonl.exists(), "non-rotated JSONL file must not be touched");
         assert!(unrelated.exists(), "unrelated file must not be touched");
     }
 }

@@ -118,6 +118,14 @@ to point at a different file. Every key is optional; missing keys fall back
 to the built-in default.
 
 **Precedence** (highest wins): CLI flag > environment variable > config file > default.
+For the mutually exclusive log sinks, this precedence also applies across
+`log-file` and `log-dir`: specifying `--log-file` ignores a configured
+`log-dir`, and specifying `--log-dir` ignores a configured `log-file`.
+
+When `log-dir` is used, retention cleanup only removes daily rotated files
+named `otel-logger.YYYY-MM-DD`. Other files in the same directory, such as
+`otel-logger.pid`, `otel-logger.stderr.log`, or a standalone
+`otel-logger.jsonl`, are left untouched.
 
 Generate a fully-commented starter file with the bundled command:
 

@@ -21,12 +21,14 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger 設定ファイル
 # 受信した OTLP telemetry を欠落のない JSON Lines として保存します。親ディレクトリは
 # 起動時に作成され、ファイルは追記モードで開かれ、graceful shutdown 時に fsync されます。
 # `log-dir` とは同時に指定できません。
+# CLI や環境変数で `log-dir` を指定した場合は、そちらが優先されます。
 log-file = "/var/log/otel-logger/otel-logger.jsonl"
 
 # 代替: 日次ローテーション付きでディレクトリへ書き出します
 # (ローカル時刻で日ごとの `otel-logger.YYYY-MM-DD`)。古いファイルは起動時に整理され、
 # ローテーション時にも `log-keep-days` (既定値 10) の上限が適用されます。
 # `log-file` とは同時に指定できません。
+# CLI や環境変数で `log-file` を指定した場合は、そちらが優先されます。
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10
 
