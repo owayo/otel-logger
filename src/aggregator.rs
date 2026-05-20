@@ -76,6 +76,19 @@ impl ModelStats {
             || self.reasoning_output_tokens != 0
             || self.cost_usd != 0.0
     }
+
+    /// `request_count` / `duration_ms` も含めた「何か値が入っているか」の判定。
+    /// バケット削除条件で使う (`has_usage` は token/cost 系のみ判定するため不十分)。
+    fn has_any_value(&self) -> bool {
+        self.has_usage() || self.request_count != 0 || self.duration_ms != 0
+    }
+
+    /// `self - other` を saturating で返す (`self` は変更しない)。
+    fn saturating_sub_stats(&self, other: &ModelStats) -> ModelStats {
+        let mut out = self.clone();
+        out.subtract(other);
+        out
+    }
 }
 
 /// 内部集計で `BTreeMap` のキーに使う provider × model × effort の組。
@@ -188,6 +201,20 @@ struct AggregatorInner {
     /// metrics 側に conversation id が無いため、両方に存在する model 単位で
     /// 最初に観測したソースを採用し、二重計上を避ける。
     codex_token_sources: HashMap<String, CodexTokenSource>,
+
+    /// `conversation.id` 付きの SSE 完了ログを受信したが、対応する `conversation_starts`
+    /// session が未受信のため `effort=unknown` バケットに入った usage の内訳。
+    /// 後から session が届いた conversation の分だけを切り出して effort バケットへ
+    /// 移すために使う。並行する別 conversation の usage を巻き込まないことが目的。
+    codex_unknown_effort_sse: HashMap<UnknownEffortKey, ModelStats>,
+}
+
+/// `codex_unknown_effort_sse` 用の合成キー。
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct UnknownEffortKey {
+    provider: String,
+    model: String,
+    conversation_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +250,7 @@ impl Aggregator {
                 codex_last_session: None,
                 codex_sessions: HashMap::new(),
                 codex_token_sources: HashMap::new(),
+                codex_unknown_effort_sse: HashMap::new(),
             }),
         }
     }
@@ -252,13 +280,32 @@ impl Aggregator {
                         update_codex_session(&mut g, session);
                     }
                     if (service == SERVICE_CODEX_TUI || service == SERVICE_CODEX_EXEC)
-                        && let Some((bucket, stats)) = extract_codex_sse_response_completed(&g, log)
+                        && let Some(parsed) = extract_codex_sse_response_completed(&g, log)
                     {
+                        let CodexSseExtraction {
+                            bucket,
+                            stats,
+                            unknown_conversation_id,
+                        } = parsed;
                         let source_key = codex_token_source_key(&bucket.model);
                         if g.codex_token_sources.get(&source_key)
                             != Some(&CodexTokenSource::Metrics)
                         {
                             record_into(&mut g, AGENT_CODEX, &bucket, &stats);
+                            // unknown effort で計上した分のうち、conversation.id が分かっている
+                            // ものは、後で session が届いたら正しい effort バケットへ移せるよう
+                            // pending として控えておく (model/conversation の組ごとに合算)。
+                            if let Some(cid) = unknown_conversation_id {
+                                let key = UnknownEffortKey {
+                                    provider: bucket.provider.clone(),
+                                    model: bucket.model.clone(),
+                                    conversation_id: cid,
+                                };
+                                g.codex_unknown_effort_sse
+                                    .entry(key)
+                                    .or_default()
+                                    .add(&stats);
+                            }
                             g.codex_token_sources
                                 .insert(source_key, CodexTokenSource::Logs);
                             count += 1;
@@ -504,10 +551,19 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
     })
 }
 
+struct CodexSseExtraction {
+    bucket: Bucket,
+    stats: ModelStats,
+    /// `conversation.id` 付きで届いたが、対応する session が未受信のため effort=unknown と
+    /// なった場合に限り `Some(id)` を返す。後続の `update_codex_session` で当該 conversation
+    /// の usage だけを切り出して effort バケットへ移すために使う。
+    unknown_conversation_id: Option<String>,
+}
+
 fn extract_codex_sse_response_completed(
     g: &AggregatorInner,
     log: &LogRecord,
-) -> Option<(Bucket, ModelStats)> {
+) -> Option<CodexSseExtraction> {
     let attrs = &log.attributes;
     if string_attr(attrs, "event.name") != Some("codex.sse_event")
         || string_attr(attrs, "event.kind") != Some("response.completed")
@@ -541,7 +597,9 @@ fn extract_codex_sse_response_completed(
     // `conversation.id` がある SSE は、その conversation の session にだけ紐付ける。
     // 未受信の場合に `codex_last_session` へフォールバックすると、並行/継続 conversation の
     // effort を誤って付与する恐れがある。id が無い古い telemetry のみ last session を使う。
-    let session = if string_attr(attrs, "conversation.id").is_some_and(|id| !id.is_empty()) {
+    let conversation_id = string_attr(attrs, "conversation.id").map(str::to_string);
+    let has_conversation_id = conversation_id.as_deref().is_some_and(|id| !id.is_empty());
+    let session = if has_conversation_id {
         codex_session_for_attrs(g, attrs)
     } else {
         g.codex_last_session.as_ref()
@@ -559,14 +617,23 @@ fn extract_codex_sse_response_completed(
         reasoning_output_tokens,
         ..Default::default()
     };
-    Some((
-        Bucket::from_parts(
-            codex_provider_from_session(session),
-            model,
-            codex_effort_from_session(session),
-        ),
+    let bucket = Bucket::from_parts(
+        codex_provider_from_session(session),
+        model,
+        codex_effort_from_session(session),
+    );
+    // session 未受信のまま unknown effort バケットへ落ちる conversation.id 付き SSE は、
+    // 後で session が届いたときにバケット移動できるよう pending として保留する目印を返す。
+    let unknown_conversation_id = if has_conversation_id && bucket.effort == UNKNOWN {
+        conversation_id
+    } else {
+        None
+    };
+    Some(CodexSseExtraction {
+        bucket,
         stats,
-    ))
+        unknown_conversation_id,
+    })
 }
 
 fn ingest_claude_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
@@ -765,15 +832,29 @@ fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
     let provider = session.provider.clone();
     let model = session.model.clone();
     let effort = session.effort.clone();
-    if !session.conversation_id.is_empty() {
+    let conversation_id = session.conversation_id.clone();
+    if !conversation_id.is_empty() {
         g.codex_sessions
-            .insert(session.conversation_id.clone(), session.clone());
+            .insert(conversation_id.clone(), session.clone());
     }
     g.codex_last_session = Some(session);
-    merge_codex_unknown_effort(g, &provider, &model, &effort);
+    merge_codex_unknown_effort(g, &provider, &model, &conversation_id, &effort);
 }
 
-fn merge_codex_unknown_effort(g: &mut AggregatorInner, provider: &str, model: &str, effort: &str) {
+/// `conversation_starts` (または相当する span event) が遅れて届いたとき、
+/// それまで `effort=unknown` に積み上げていた SSE 完了 token を新しい effort バケットへ移す。
+///
+/// `conversation_id` が分かる場合は当該 conversation の累計だけ動かす。複数 conversation が
+/// 同じ provider/model を共有している状況で、他の (未解決の) conversation 分まで巻き込まない
+/// ようにするのが目的。conversation_id が無い古い telemetry のみ、unknown バケット全体を
+/// 寄せる旧挙動を維持する。
+fn merge_codex_unknown_effort(
+    g: &mut AggregatorInner,
+    provider: &str,
+    model: &str,
+    conversation_id: &str,
+    effort: &str,
+) {
     if model.is_empty() || effort.is_empty() || effort == UNKNOWN {
         return;
     }
@@ -782,22 +863,70 @@ fn merge_codex_unknown_effort(g: &mut AggregatorInner, provider: &str, model: &s
     if from == to {
         return;
     }
+    if !conversation_id.is_empty() {
+        let key = UnknownEffortKey {
+            provider: from.provider.clone(),
+            model: from.model.clone(),
+            conversation_id: conversation_id.to_string(),
+        };
+        let Some(pending) = g.codex_unknown_effort_sse.remove(&key) else {
+            return;
+        };
+        move_codex_bucket_stats(g, &from, &to, &pending);
+        return;
+    }
+    // conversation_id が空: 古い telemetry 互換。unknown バケットの残り全体を新 effort へ移す。
+    // ただし他 conversation の pending と取り違えないよう、pending として保留されている分は
+    // 残しておく (該当 conversation の session 到達時に正しく動かすため)。
+    let pending_total = sum_pending_for_model(g, &from.provider, &from.model);
+    let Some(agent_stats) = g.agents.get(AGENT_CODEX) else {
+        return;
+    };
+    let Some(from_stats) = agent_stats.buckets.get(&from.key()).cloned() else {
+        return;
+    };
+    let movable = from_stats.stats.saturating_sub_stats(&pending_total);
+    if !movable.has_any_value() {
+        return;
+    }
+    move_codex_bucket_stats(g, &from, &to, &movable);
+}
+
+fn move_codex_bucket_stats(
+    g: &mut AggregatorInner,
+    from: &Bucket,
+    to: &Bucket,
+    stats: &ModelStats,
+) {
     let Some(agent_stats) = g.agents.get_mut(AGENT_CODEX) else {
         return;
     };
-    let Some(from_stats) = agent_stats.buckets.remove(&from.key()) else {
-        return;
-    };
+    if let Some(from_entry) = agent_stats.buckets.get_mut(&from.key()) {
+        from_entry.stats.subtract(stats);
+        if !from_entry.stats.has_any_value() {
+            agent_stats.buckets.remove(&from.key());
+        }
+    }
     let entry = agent_stats
         .buckets
         .entry(to.key())
         .or_insert_with(|| BucketStats {
-            provider: to.provider,
-            model: to.model,
-            effort: to.effort,
+            provider: to.provider.clone(),
+            model: to.model.clone(),
+            effort: to.effort.clone(),
             stats: ModelStats::default(),
         });
-    entry.stats.add(&from_stats.stats);
+    entry.stats.add(stats);
+}
+
+fn sum_pending_for_model(g: &AggregatorInner, provider: &str, model: &str) -> ModelStats {
+    let mut total = ModelStats::default();
+    for (key, stats) in &g.codex_unknown_effort_sse {
+        if key.provider == provider && key.model == model {
+            total.add(stats);
+        }
+    }
+    total
 }
 
 /// `codex.conversation_starts` が欠けた時の effort 補完元。
@@ -1939,5 +2068,108 @@ mod tests {
         agg.ingest_metrics(&req);
         let snap = agg.snapshot();
         assert!(snap.agents.is_empty());
+    }
+
+    /// 並行する複数 conversation のうち、片方だけ session が遅延到着しても、
+    /// もう一方の conversation の pending tokens を巻き込まないことを確認する
+    /// (`merge_codex_unknown_effort` の regression test)。
+    #[test]
+    fn codex_late_session_only_moves_matching_conversation_tokens() {
+        let agg = Aggregator::new();
+        // 2 つの conversation が同じ model で並行し、どちらも session 未着のまま
+        // unknown effort バケットへ積まれている状況を作る。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-a"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-b"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "50"),
+            ],
+        ));
+        // conv-a 用 session が遅れて high で届く。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        // conv-a の 100 tokens だけが high バケットへ移動する。
+        let high = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .expect("conv-a 用 high バケットは作成されているはず");
+        assert_eq!(high.stats.input_tokens, 100);
+        // conv-b の 50 tokens は unknown に残ったまま。
+        let unknown = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .expect("conv-b の pending は unknown バケットに残る");
+        assert_eq!(unknown.stats.input_tokens, 50);
+        // 全体合計は変わらないこと (二重計上・取りこぼしが無い)。
+        assert_eq!(agent.total.input_tokens, 150);
+    }
+
+    /// `conversation_id` 付きの SSE 完了ログを受けた後、別 conversation の session が
+    /// 届いても、unknown バケットの内容が無関係な effort バケットへ移動しないことを確認する。
+    #[test]
+    fn codex_session_for_unrelated_conversation_does_not_move_pending_tokens() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-a"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        // 関係ない conv-b の session が medium で届く。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-b"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/medium")),
+            "conv-b の session で conv-a の pending を medium へ動かしてはならない"
+        );
+        let unknown = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(unknown.stats.input_tokens, 100);
     }
 }

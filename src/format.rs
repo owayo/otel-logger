@@ -428,10 +428,81 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// pretty 出力向けの値を escape する。
+///
+/// 制御文字 (ANSI escape、改行、復帰、tab、その他 C0 / C1 領域) は terminal escape
+/// injection を避けるため必ず escape する。空白・引用符・等号を含む値は人が
+/// パースしやすいよう quote する。JSON Lines 出力には影響しない (raw 値を保持)。
 fn quote_for_pretty(s: &str) -> String {
-    if s.contains(' ') || s.contains('"') || s.contains('=') {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
+    let needs_quote = s.is_empty()
+        || s.chars()
+            .any(|c| c == ' ' || c == '"' || c == '=' || needs_escape(c));
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut buf = String::with_capacity(s.len() + 2);
+    buf.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => buf.push_str("\\\\"),
+            '"' => buf.push_str("\\\""),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            c if needs_escape(c) => {
+                use std::fmt::Write as _;
+                let _ = write!(buf, "\\u{{{:04x}}}", c as u32);
+            }
+            c => buf.push(c),
+        }
+    }
+    buf.push('"');
+    buf
+}
+
+fn needs_escape(c: char) -> bool {
+    // C0 制御文字 (0x00..=0x1F) と DEL (0x7F)、および C1 制御文字 (0x80..=0x9F) を escape。
+    // 改行/復帰/tab も含むが、これらは `quote_for_pretty` 側で読みやすい表現に置換する。
+    let code = c as u32;
+    code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_for_pretty_passes_through_plain_text() {
+        assert_eq!(quote_for_pretty("plain-value"), "plain-value");
+    }
+
+    #[test]
+    fn quote_for_pretty_wraps_values_with_spaces_or_equals() {
+        assert_eq!(quote_for_pretty("a b"), "\"a b\"");
+        assert_eq!(quote_for_pretty("k=v"), "\"k=v\"");
+    }
+
+    #[test]
+    fn quote_for_pretty_escapes_ansi_and_control_characters() {
+        // OTLP payload にリモートから届く可能性のある ANSI escape や改行を
+        // terminal にそのまま出さない (escape injection 対策)。
+        assert_eq!(
+            quote_for_pretty("alert\x1b[31mRED\x1b[0m"),
+            "\"alert\\u{001b}[31mRED\\u{001b}[0m\""
+        );
+        assert_eq!(quote_for_pretty("line1\nline2"), "\"line1\\nline2\"");
+        assert_eq!(quote_for_pretty("tab\there"), "\"tab\\there\"");
+        assert_eq!(quote_for_pretty("bell\x07end"), "\"bell\\u{0007}end\"");
+    }
+
+    #[test]
+    fn quote_for_pretty_escapes_embedded_quote_and_backslash() {
+        assert_eq!(quote_for_pretty(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn quote_for_pretty_leaves_unicode_letters_alone() {
+        // 通常の Unicode (制御文字以外) はそのまま出す。
+        assert_eq!(quote_for_pretty("こんにちは"), "こんにちは");
     }
 }

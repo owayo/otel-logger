@@ -40,6 +40,10 @@ enum HttpError {
     BadProtobuf(#[from] prost::DecodeError),
     #[error("failed to decode JSON body: {0}")]
     BadJson(#[from] serde_json::Error),
+    /// JSONL や stdout への永続化に失敗した。受信した payload を欠落させたくないので
+    /// クライアントに 5xx を返し、OTLP exporter 側で retry させる。
+    #[error("failed to persist telemetry: {0}")]
+    Persistence(#[source] anyhow::Error),
 }
 
 impl IntoResponse for HttpError {
@@ -47,6 +51,7 @@ impl IntoResponse for HttpError {
         let status = match &self {
             HttpError::UnsupportedContentType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             HttpError::BadProtobuf(_) | HttpError::BadJson(_) => StatusCode::BAD_REQUEST,
+            HttpError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()
     }
@@ -109,7 +114,9 @@ async fn handle_traces(
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
     let req: ExportTraceServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Traces(Box::new(req))).await;
+    sink.record(TelemetryRecord::Traces(Box::new(req)))
+        .await
+        .map_err(HttpError::Persistence)?;
     Ok(encode_response(
         encoding,
         &ExportTraceServiceResponse {
@@ -125,7 +132,9 @@ async fn handle_metrics(
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
     let req: ExportMetricsServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Metrics(Box::new(req))).await;
+    sink.record(TelemetryRecord::Metrics(Box::new(req)))
+        .await
+        .map_err(HttpError::Persistence)?;
     Ok(encode_response(
         encoding,
         &ExportMetricsServiceResponse {
@@ -141,7 +150,9 @@ async fn handle_logs(
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
     let req: ExportLogsServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Logs(Box::new(req))).await;
+    sink.record(TelemetryRecord::Logs(Box::new(req)))
+        .await
+        .map_err(HttpError::Persistence)?;
     Ok(encode_response(
         encoding,
         &ExportLogsServiceResponse {

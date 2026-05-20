@@ -130,23 +130,43 @@ pub enum InitOutcome {
 
 /// 同梱している `DEFAULT_CONFIG_TEMPLATE` を `path` へ書き出す。
 /// 必要に応じて親ディレクトリを作成し、`force` 未指定なら既存ファイルの上書きを拒否する。
+/// `force=false` の場合は `create_new` で atomic に open するため、`exists()` 後に
+/// 別 process が同名ファイルを作っても上書き拒否の約束を破らない。
 pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
-    let already_exists = path.exists();
-    if already_exists && !force {
-        anyhow::bail!(
-            "{} already exists; pass --force / -f to overwrite",
-            path.display()
-        );
-    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create parent directory of {}", path.display()))?;
     }
-    std::fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    // open 直前の `exists()` は TOCTOU を抱えるが、`force=false` の上書き拒否は
+    // `create_new` 側で保証されている。ここで見たいのは Overwrote / Created の
+    // 報告用シグナルだけで、判定が後追いで race してもファイル状態は壊れない。
+    let pre_existed = path.try_exists().unwrap_or(false);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!(
+                "{} already exists; pass --force / -f to overwrite",
+                path.display()
+            );
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("open config file {}", path.display()));
+        }
+    };
+    use std::io::Write as _;
+    file.write_all(DEFAULT_CONFIG_TEMPLATE.as_bytes())
         .with_context(|| format!("write config file {}", path.display()))?;
-    Ok(if already_exists {
+    Ok(if force && pre_existed {
         InitOutcome::Overwrote
     } else {
         InitOutcome::Created

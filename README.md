@@ -40,9 +40,12 @@ the agent emits during a CI job and surface it where developers already look.
 - OTLP/gRPC (4317) and OTLP/HTTP (4318) on the same process
 - Accepts both `application/x-protobuf` and `application/json` on HTTP
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
+  - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads are escaped before reaching the terminal (JSONL output stays lossless)
 - JSON Lines persistence, `fsync`'d on graceful shutdown
+  - Persistence failures surface as HTTP 5xx / gRPC `Status::internal` so OTLP exporters can retry instead of silently dropping payloads
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
+  - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
 - Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
 - Single static-ish binary (~7 MB stripped) and a distroless container image
 - Examples for Docker Compose, GitHub Actions, and GitLab CI

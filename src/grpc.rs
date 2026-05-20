@@ -45,6 +45,12 @@ impl OtlpService {
     }
 }
 
+/// JSONL 永続化失敗を gRPC client へ `Status::internal` として返す。
+/// 受信した payload を欠落させないために、exporter 側で retry を促す。
+fn persistence_status(e: anyhow::Error) -> Status {
+    Status::internal(format!("failed to persist telemetry: {e}"))
+}
+
 #[tonic::async_trait]
 impl TraceService for OtlpService {
     async fn export(
@@ -54,7 +60,8 @@ impl TraceService for OtlpService {
         let payload = request.into_inner();
         self.sink
             .record(TelemetryRecord::Traces(Box::new(payload)))
-            .await;
+            .await
+            .map_err(persistence_status)?;
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success: None,
         }))
@@ -70,7 +77,8 @@ impl MetricsService for OtlpService {
         let payload = request.into_inner();
         self.sink
             .record(TelemetryRecord::Metrics(Box::new(payload)))
-            .await;
+            .await
+            .map_err(persistence_status)?;
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success: None,
         }))
@@ -86,7 +94,8 @@ impl LogsService for OtlpService {
         let payload = request.into_inner();
         self.sink
             .record(TelemetryRecord::Logs(Box::new(payload)))
-            .await;
+            .await
+            .map_err(persistence_status)?;
         Ok(Response::new(ExportLogsServiceResponse {
             partial_success: None,
         }))

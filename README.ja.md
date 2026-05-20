@@ -37,8 +37,11 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - OTLP/gRPC (4317) と OTLP/HTTP (4318) を同一プロセスで起動
 - HTTP は `application/x-protobuf` と `application/json` の両方を受信
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
+  - 受信した payload に ANSI escape や C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
 - JSON Lines は graceful shutdown 時に `fsync`
+  - JSONL の永続化に失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
+  - Codex で `effort=unknown` に積まれた pending token は `conversation.id` 単位で保留し、対応する `codex.conversation_starts` が後から届いた conversation の分だけを新 effort バケットへ振り替える (並行する別 conversation の token を巻き込まない)
 - SIGINT / SIGTERM 対応 (`docker stop` で末尾バッチが落ちない)
 - Stripped で約 7 MB の単一バイナリ。distroless コンテナイメージ同梱
 - Docker Compose / GitHub Actions / GitLab CI の利用例を同梱

@@ -136,8 +136,12 @@ impl Sink {
     }
 
     /// 単一の telemetry batch を保存する。
-    /// 一方の出力先への書き込み error はログに残すが、もう一方の出力は止めない。
-    pub async fn record(&self, record: TelemetryRecord) {
+    ///
+    /// JSONL 出力が設定されている場合、永続化に失敗したら `Err` を返す。受信した
+    /// payload を欠落なく保存する方針なので、失敗を握りつぶさず呼び出し元 (HTTP / gRPC
+    /// handler) に伝え、OTLP exporter 側で retry できるようにする。
+    /// stdout はベストエフォートで、書き込みに失敗しても tracing にだけ記録する。
+    pub async fn record(&self, record: TelemetryRecord) -> Result<()> {
         // stdout に追記する summary が現在の batch を反映するよう、書き込み前に累計値を更新する。
         let samples_present = match &record {
             TelemetryRecord::Logs(req) => self.inner.aggregator.ingest_logs(req) > 0,
@@ -150,10 +154,10 @@ impl Sink {
             None
         };
 
-        if self.inner.file.is_some()
-            && let Err(e) = self.write_jsonl(&record).await
-        {
-            tracing::error!(error = %e, kind = record.kind(), "failed to write JSONL");
+        if self.inner.file.is_some() {
+            self.write_jsonl(&record)
+                .await
+                .with_context(|| format!("persist {} batch to JSONL", record.kind()))?;
         }
 
         if self.inner.stdout_enabled
@@ -161,6 +165,7 @@ impl Sink {
         {
             tracing::error!(error = %e, kind = record.kind(), "failed to write stdout");
         }
+        Ok(())
     }
 
     async fn write_jsonl(&self, record: &TelemetryRecord) -> Result<()> {
@@ -339,5 +344,43 @@ mod tests {
         assert!(stderr.exists(), "stderr file must not be touched");
         assert!(jsonl.exists(), "non-rotated JSONL file must not be touched");
         assert!(unrelated.exists(), "unrelated file must not be touched");
+    }
+
+    fn settings_with_log_file(path: std::path::PathBuf) -> crate::cli::Settings {
+        use crate::cli::{ColorMode, LogSink};
+        crate::cli::Settings {
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            log_sink: Some(LogSink::File(path)),
+            no_stdout: true,
+            summary: false,
+            color: ColorMode::Never,
+            dry_run: false,
+        }
+    }
+
+    /// 正常系: JSONL writer が成功すれば `record` は Ok を返し、ファイルに 1 行追記される。
+    #[tokio::test]
+    async fn record_persists_payload_and_returns_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("otel-logger.jsonl");
+        let sink = Sink::from_settings(&settings_with_log_file(log_path.clone()))
+            .await
+            .unwrap();
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![],
+        };
+        sink.record(TelemetryRecord::Logs(Box::new(req)))
+            .await
+            .expect("record で永続化に成功すること");
+        sink.flush().await.unwrap();
+
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            body.contains("\"kind\":\"logs\""),
+            "JSON Lines に追記される"
+        );
+        assert!(body.ends_with('\n'), "各レコードは改行で終わる");
     }
 }
