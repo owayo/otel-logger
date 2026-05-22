@@ -40,9 +40,10 @@ the agent emits during a CI job and surface it where developers already look.
 - OTLP/gRPC (4317) and OTLP/HTTP (4318) on the same process
 - Accepts both `application/x-protobuf` and `application/json` on HTTP
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
-  - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads are escaped before reaching the terminal (JSONL output stays lossless)
+  - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
 - JSON Lines persistence, `fsync`'d on graceful shutdown
   - Persistence failures surface as HTTP 5xx / gRPC `Status::internal` so OTLP exporters can retry instead of silently dropping payloads
+  - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
@@ -409,6 +410,8 @@ Counters are process-lifetime cumulative; restarting otel-logger resets them.
 ## Output format
 
 ### stdout (pretty)
+
+Dynamic payload fields such as service names, span names, metric names, severity text, and attribute keys are escaped before printing.
 
 ```
 [trace]  2026-05-07T22:01:14.123Z service=claude-code scope=anthropic.claude_code span=tool.call dur=812ms status=OK trace=4d2... span_id=8ab...

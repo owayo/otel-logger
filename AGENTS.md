@@ -23,7 +23,7 @@ cargo build --release
 
 ## 実装上の注意
 
-- 受信した OTLP payload は JSON Lines で欠落なく保存する方針を守る。JSONL 書き込みに失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (`sink::Sink::record` の戻り値経由)。stdout への pretty 出力はベストエフォートで、失敗してもログだけ残して継続する。
+- 受信した OTLP payload は JSON Lines で欠落なく保存する方針を守る。JSONL 書き込みに失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (`sink::Sink::record` の戻り値経由)。累計使用量は JSONL 永続化に成功した batch だけを集計し、retry 対象を二重計上しない。stdout への pretty 出力はベストエフォートで、失敗してもログだけ残して継続する。
 - Claude の API request ログには token/cost が含まれ、metrics より新しい分まで即時に届くことがある。累計統計では同じ model/effort のログが見えたらログ側を token/cost source として採用し、先に計上した metrics 分は取り消して二重計上を避ける。
 - Claude / Codex の累計統計は二重計上を避ける。特に Codex は SSE 完了ログと turn metrics の両方に token usage が出るため、model ごとに片方だけを token source として採用する。
 - Codex の SSE 完了ログで `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only event は、turn metrics / `handle_responses` span usage と合わせるため token usage に加算しない。
@@ -32,5 +32,5 @@ cargo build --release
 - `log-file` / `log-dir` の相互排他は優先順位 (CLI/環境変数 > 設定ファイル > 既定値) を守る。上位で片方を指定した場合、下位のもう片方は衝突扱いにしない。
 - `log-dir` cleanup は `otel-logger.YYYY-MM-DD` 形式の日次ローテーションファイルだけを削除する。`otel-logger.pid`、`otel-logger.stderr.log`、単体の `otel-logger.jsonl` など、同じ prefix の別用途ファイルは削除しない。
 - `otel-logger init` の上書き拒否は `OpenOptions::create_new` で atomic に行い、`exists()` 後の TOCTOU race で `--force` 未指定の既存ファイルを壊さない。
-- pretty stdout 出力 (`format::quote_for_pretty`) では ANSI escape を含む C0/C1 制御文字を必ず escape する。OTLP は既定で `0.0.0.0` に bind するため、信頼できない telemetry source からの terminal escape injection を防ぐ。JSONL 出力は lossless のまま raw 値を保持する。
+- pretty stdout 出力 (`format::quote_for_pretty`) では ANSI escape を含む C0/C1 制御文字を必ず escape する。body/属性値だけでなく service 名、scope 名、span 名、metric 名、severity text、属性キー、累計サマリー内の provider/model/effort も対象にする。OTLP は既定で `0.0.0.0` に bind するため、信頼できない telemetry source からの terminal escape injection を防ぐ。JSONL 出力は lossless のまま raw 値を保持する。
 - コメントは、外部に出る CLI help では英日併記、内部実装の説明では日本語を基本にする。

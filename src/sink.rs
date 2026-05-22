@@ -43,6 +43,8 @@ impl TelemetryRecord {
 enum JsonlWriter {
     File(StdMutex<StdBufWriter<std::fs::File>>),
     Roller(StdMutex<LogRoller>),
+    #[cfg(test)]
+    Fail,
 }
 
 impl JsonlWriter {
@@ -56,6 +58,8 @@ impl JsonlWriter {
                 let mut g = m.lock().expect("jsonl roller mutex poisoned");
                 g.write_all(line).context("append JSONL line (rotated)")
             }
+            #[cfg(test)]
+            Self::Fail => anyhow::bail!("forced JSONL failure"),
         }
     }
 
@@ -70,6 +74,8 @@ impl JsonlWriter {
                 let mut g = m.lock().expect("jsonl roller mutex poisoned");
                 g.flush().context("flush JSONL roller")
             }
+            #[cfg(test)]
+            Self::Fail => Ok(()),
         }
     }
 }
@@ -142,7 +148,14 @@ impl Sink {
     /// handler) に伝え、OTLP exporter 側で retry できるようにする。
     /// stdout はベストエフォートで、書き込みに失敗しても tracing にだけ記録する。
     pub async fn record(&self, record: TelemetryRecord) -> Result<()> {
-        // stdout に追記する summary が現在の batch を反映するよう、書き込み前に累計値を更新する。
+        if self.inner.file.is_some() {
+            self.write_jsonl(&record)
+                .await
+                .with_context(|| format!("persist {} batch to JSONL", record.kind()))?;
+        }
+
+        // JSONL 永続化が成功した batch だけを集計する。失敗時は exporter が retry するため、
+        // 先に集計すると同じ payload を二重計上してしまう。
         let samples_present = match &record {
             TelemetryRecord::Logs(req) => self.inner.aggregator.ingest_logs(req) > 0,
             TelemetryRecord::Traces(req) => self.inner.aggregator.ingest_traces(req) > 0,
@@ -153,12 +166,6 @@ impl Sink {
         } else {
             None
         };
-
-        if self.inner.file.is_some() {
-            self.write_jsonl(&record)
-                .await
-                .with_context(|| format!("persist {} batch to JSONL", record.kind()))?;
-        }
 
         if self.inner.stdout_enabled
             && let Err(e) = self.write_pretty(&record, summary_snapshot).await
@@ -306,6 +313,80 @@ fn is_rotated_log_filename(filename: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn kv_str(key: &str, value: &str) -> opentelemetry_proto::tonic::common::v1::KeyValue {
+        use opentelemetry_proto::tonic::common::v1::AnyValue;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as OtlpValue;
+
+        opentelemetry_proto::tonic::common::v1::KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(OtlpValue::StringValue(value.to_string())),
+            }),
+            key_strindex: 0,
+        }
+    }
+
+    fn claude_api_request_log() -> ExportLogsServiceRequest {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as OtlpValue;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", "claude-code")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope::default()),
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 0,
+                        observed_time_unix_nano: 0,
+                        severity_number: 0,
+                        severity_text: String::new(),
+                        body: Some(AnyValue {
+                            value: Some(OtlpValue::StringValue(
+                                "claude_code.api_request".to_string(),
+                            )),
+                        }),
+                        attributes: vec![
+                            kv_str("model", "claude-opus-4-7"),
+                            kv_str("effort", "max"),
+                            kv_str("input_tokens", "1"),
+                            kv_str("output_tokens", "2"),
+                            kv_str("cache_read_tokens", "3"),
+                            kv_str("cache_creation_tokens", "4"),
+                            kv_str("duration_ms", "5"),
+                            kv_str("cost_usd", "0.01"),
+                        ],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![],
+                        span_id: vec![],
+                        event_name: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn failing_jsonl_sink() -> Sink {
+        Sink {
+            inner: Arc::new(SinkInner {
+                stdout_enabled: false,
+                color: false,
+                summary_enabled: true,
+                file: Some(JsonlWriter::Fail),
+                stdout_lock: Mutex::new(()),
+                aggregator: Aggregator::new(),
+            }),
+        }
+    }
+
     fn touch_mtime(path: &Path, when: SystemTime) {
         // `File::set_times` + `FileTimes::set_modified` は cross-platform で安定している。
         let times = std::fs::FileTimes::new().set_modified(when);
@@ -382,5 +463,19 @@ mod tests {
             "JSON Lines に追記される"
         );
         assert!(body.ends_with('\n'), "各レコードは改行で終わる");
+    }
+
+    #[tokio::test]
+    async fn record_does_not_update_stats_when_jsonl_write_fails() {
+        let sink = failing_jsonl_sink();
+        let result = sink
+            .record(TelemetryRecord::Logs(Box::new(claude_api_request_log())))
+            .await;
+
+        assert!(result.is_err(), "JSONL 永続化失敗は呼び出し元へ返す");
+        assert!(
+            sink.aggregator().snapshot().agents.is_empty(),
+            "retry 対象の payload は永続化成功まで集計しない"
+        );
     }
 }

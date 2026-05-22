@@ -37,9 +37,10 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - OTLP/gRPC (4317) と OTLP/HTTP (4318) を同一プロセスで起動
 - HTTP は `application/x-protobuf` と `application/json` の両方を受信
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
-  - 受信した payload に ANSI escape や C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
+  - 受信した payload の動的ラベルや属性キーに ANSI escape / C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
 - JSON Lines は graceful shutdown 時に `fsync`
   - JSONL の永続化に失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)
+  - 累計使用量は JSONL 永続化に成功してから更新するため、retry された batch を二重計上しない
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
   - Codex で `effort=unknown` に積まれた pending token は `conversation.id` 単位で保留し、対応する `codex.conversation_starts` が後から届いた conversation の分だけを新 effort バケットへ振り替える (並行する別 conversation の token を巻き込まない)
 - SIGINT / SIGTERM 対応 (`docker stop` で末尾バッチが落ちない)
@@ -354,6 +355,8 @@ bucket key は `provider/model/effort` 形式です。Codex 側は ChatGPT / Ope
 ## 出力フォーマット
 
 ### stdout (pretty)
+
+service 名、span 名、metric 名、severity text、属性キーなど、payload 由来の動的フィールドは escape してから表示します。
 
 ```
 [trace]  2026-05-07T22:01:14.123Z service=claude-code scope=anthropic.claude_code span=tool.call dur=812ms status=OK trace=4d2... span_id=8ab...

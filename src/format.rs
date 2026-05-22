@@ -45,7 +45,7 @@ pub fn render_summary(snapshot: &UsageSnapshot, color: bool) -> String {
         let _ = writeln!(
             out,
             "{tag} requests={requests} input={input} output={output} cache_read={cr} cache_create={cc} reasoning={r} cost={cost} duration={dur} since={since}",
-            tag = p.paint(CYAN, &format!("[stats:{agent}]")),
+            tag = p.paint(CYAN, &format!("[stats:{}]", quote_for_pretty(agent))),
             requests = p.bold(&total.request_count.to_string()),
             input = total.input_tokens,
             output = total.output_tokens,
@@ -61,9 +61,9 @@ pub fn render_summary(snapshot: &UsageSnapshot, color: bool) -> String {
                 out,
                 "        {prefix} provider={provider} model={model} effort={effort}: requests={requests} input={input} output={output} cache_read={cr} cache_create={cc} reasoning={r} cost={cost}",
                 prefix = p.dim("breakdown"),
-                provider = p.bold(&bucket.provider),
-                model = p.bold(&bucket.model),
-                effort = p.bold(&bucket.effort),
+                provider = p.bold(&quote_for_pretty(&bucket.provider)),
+                model = p.bold(&quote_for_pretty(&bucket.model)),
+                effort = p.bold(&quote_for_pretty(&bucket.effort)),
                 requests = bucket.stats.request_count,
                 input = bucket.stats.input_tokens,
                 output = bucket.stats.output_tokens,
@@ -143,9 +143,9 @@ fn render_traces(
                     "{tag} {ts} service={service} scope={scope} span={name} dur={dur} status={status} trace={trace} span_id={span_id}",
                     tag = p.paint(MAGENTA, "[trace]"),
                     ts = p.dim(&format_unix_nanos(span.start_time_unix_nano)),
-                    service = p.bold(&service),
-                    scope = scope,
-                    name = p.bold(&span.name),
+                    service = p.bold(&quote_for_pretty(&service)),
+                    scope = quote_for_pretty(scope),
+                    name = p.bold(&quote_for_pretty(&span.name)),
                     dur = format_duration_ns(dur_ns),
                     status = status_painted,
                     trace = trace_id,
@@ -160,7 +160,7 @@ fn render_traces(
                         out,
                         "        {} {} {}",
                         p.dim(&format!("event @{}", format_unix_nanos(ev.time_unix_nano))),
-                        p.bold(&ev.name),
+                        p.bold(&quote_for_pretty(&ev.name)),
                         format_attrs(&ev.attributes),
                     );
                 }
@@ -186,7 +186,7 @@ fn render_metrics(
                 let unit = if metric.unit.is_empty() {
                     String::new()
                 } else {
-                    format!(" unit={}", metric.unit)
+                    format!(" unit={}", quote_for_pretty(&metric.unit))
                 };
                 let summary = match &metric.data {
                     Some(MetricData::Sum(sum)) => {
@@ -225,15 +225,15 @@ fn render_metrics(
                     out,
                     "{tag} service={service} scope={scope} name={name}{unit} {summary} {desc}",
                     tag = p.paint(CYAN, "[metric]"),
-                    service = p.bold(&service),
-                    scope = scope,
-                    name = p.bold(&metric.name),
+                    service = p.bold(&quote_for_pretty(&service)),
+                    scope = quote_for_pretty(scope),
+                    name = p.bold(&quote_for_pretty(&metric.name)),
                     unit = unit,
                     summary = summary,
                     desc = if metric.description.is_empty() {
                         String::new()
                     } else {
-                        p.dim(&format!("({})", metric.description))
+                        p.dim(&format!("({})", quote_for_pretty(&metric.description)))
                     },
                 );
             }
@@ -267,8 +267,8 @@ fn render_logs(
                     "{tag} {ts} service={service} scope={scope} severity={severity} body={body}",
                     tag = p.paint(YELLOW, "[log]"),
                     ts = p.dim(&format_unix_nanos(log.time_unix_nano)),
-                    service = p.bold(&service),
-                    scope = scope,
+                    service = p.bold(&quote_for_pretty(&service)),
+                    scope = quote_for_pretty(scope),
                     severity = severity_painted,
                     body = quote_for_pretty(&body),
                 );
@@ -282,13 +282,14 @@ fn render_logs(
 }
 
 fn paint_severity(p: &Painter, severity: &str) -> String {
+    let escaped = quote_for_pretty(severity);
     match severity {
-        "ERROR" | "FATAL" => p.paint(RED, severity),
-        "WARN" => p.paint(YELLOW, severity),
-        "INFO" => p.paint(GREEN, severity),
-        "DEBUG" => p.paint(BLUE, severity),
-        "TRACE" => p.paint(MAGENTA, severity),
-        _ => severity.to_string(),
+        "ERROR" | "FATAL" => p.paint(RED, &escaped),
+        "WARN" => p.paint(YELLOW, &escaped),
+        "INFO" => p.paint(GREEN, &escaped),
+        "DEBUG" => p.paint(BLUE, &escaped),
+        "TRACE" => p.paint(MAGENTA, &escaped),
+        _ => escaped,
     }
 }
 
@@ -363,7 +364,7 @@ fn format_attrs(attrs: &[KeyValue]) -> String {
                 .as_ref()
                 .map(any_value_to_string)
                 .unwrap_or_default();
-            format!("{}={}", kv.key, quote_for_pretty(&value))
+            format!("{}={}", quote_for_pretty(&kv.key), quote_for_pretty(&value))
         })
         .collect();
     format!("{{{}}}", parts.join(", "))
@@ -471,6 +472,16 @@ fn needs_escape(c: char) -> bool {
 mod tests {
     use super::*;
 
+    fn kv_str(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(OtlpValue::StringValue(value.to_string())),
+            }),
+            key_strindex: 0,
+        }
+    }
+
     #[test]
     fn quote_for_pretty_passes_through_plain_text() {
         assert_eq!(quote_for_pretty("plain-value"), "plain-value");
@@ -504,5 +515,58 @@ mod tests {
     fn quote_for_pretty_leaves_unicode_letters_alone() {
         // 通常の Unicode (制御文字以外) はそのまま出す。
         assert_eq!(quote_for_pretty("こんにちは"), "こんにちは");
+    }
+
+    #[test]
+    fn render_logs_escapes_untrusted_labels_and_attribute_keys() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", "svc\x1b[31m")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "scope\x1b]0;bad".to_string(),
+                        version: String::new(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 0,
+                        observed_time_unix_nano: 0,
+                        severity_number: 0,
+                        severity_text: "BAD\x1b[0m".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(OtlpValue::StringValue("body".to_string())),
+                        }),
+                        attributes: vec![kv_str("bad\x1bkey", "value")],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![],
+                        span_id: vec![],
+                        event_name: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let rendered = render(&TelemetryRecord::Logs(Box::new(req)), false);
+
+        assert!(
+            !rendered.contains('\x1b'),
+            "pretty 出力へ remote payload の escape sequence を残さない"
+        );
+        assert!(rendered.contains("service=\"svc\\u{001b}[31m\""));
+        assert!(rendered.contains("scope=\"scope\\u{001b}]0;bad\""));
+        assert!(rendered.contains("severity=\"BAD\\u{001b}[0M\""));
+        assert!(rendered.contains("\"bad\\u{001b}key\"=value"));
     }
 }
