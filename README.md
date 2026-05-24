@@ -121,6 +121,10 @@ otel-logger [OPTIONS]
 to point at a different file. Every key is optional; missing keys fall back
 to the built-in default.
 
+Leading `~` / `~/` is expanded to `$HOME` for `--config`, `otel-logger init
+--path`, `log-file`, and `log-dir`, including values supplied through
+environment variables or the config file.
+
 **Precedence** (highest wins): CLI flag > environment variable > config file > default.
 For the mutually exclusive log sinks, this precedence also applies across
 `log-file` and `log-dir`: specifying `--log-file` ignores a configured

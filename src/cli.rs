@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::path::expand_user_path;
 
 const DEFAULT_GRPC_ADDR: &str = "0.0.0.0:4317";
 const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:4318";
@@ -153,13 +154,17 @@ pub struct Settings {
 impl Settings {
     /// merge 優先順位: CLI flag > env (clap が処理) > config > default。
     pub fn merge(cli: Cli, config: Config) -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::merge_with_home(cli, config, home.as_deref())
+    }
+
+    fn merge_with_home(cli: Cli, config: Config, home: Option<&Path>) -> anyhow::Result<Self> {
         let keep_days = cli
             .log_keep_days
             .or(config.log_keep_days)
             .unwrap_or(DEFAULT_LOG_KEEP_DAYS);
 
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let expand = |p: PathBuf| expand_user_path(p, home.as_deref());
+        let expand = |p: PathBuf| expand_user_path(p, home);
 
         let log_sink = match (cli.log_file, cli.log_dir) {
             (Some(_), Some(_)) => {
@@ -201,27 +206,6 @@ impl Settings {
     }
 }
 
-/// Expand a leading `~` / `~/` to the user's `$HOME` directory.
-/// 先頭の `~` / `~/` を `$HOME` に展開する。CLI flag, env variable, config TOML
-/// のどの経路から来たパスも、shell が展開してくれるとは限らないので Settings::merge で
-/// 一度通す。`~user/...` 形式は未対応 (現状 sink で必要としていない)。`home=None`、
-/// 該当しないパス、`~name/...` 形式はそのまま返す。
-fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
-    let Some(home) = home else {
-        return path;
-    };
-    let Some(s) = path.to_str() else {
-        return path;
-    };
-    if s == "~" {
-        return home.to_path_buf();
-    }
-    if let Some(rest) = s.strip_prefix("~/") {
-        return home.join(rest);
-    }
-    path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +228,7 @@ mod tests {
 
     #[test]
     fn merge_defaults_when_nothing_specified() {
-        let settings = Settings::merge(empty_cli(), Config::default()).unwrap();
+        let settings = Settings::merge_with_home(empty_cli(), Config::default(), None).unwrap();
         assert_eq!(settings.grpc_addr.to_string(), "0.0.0.0:4317");
         assert_eq!(settings.http_addr.to_string(), "0.0.0.0:4318");
         assert!(settings.log_sink.is_none());
@@ -259,7 +243,7 @@ mod tests {
         let mut cli = empty_cli();
         cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
         cli.log_dir = Some(PathBuf::from("/tmp/dir"));
-        let err = Settings::merge(cli, Config::default()).unwrap_err();
+        let err = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
@@ -270,7 +254,7 @@ mod tests {
             log_dir: Some(PathBuf::from("/tmp/dir")),
             ..Config::default()
         };
-        let err = Settings::merge(empty_cli(), config).unwrap_err();
+        let err = Settings::merge_with_home(empty_cli(), config, None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
@@ -278,7 +262,7 @@ mod tests {
     fn merge_log_file_from_cli_uses_file_sink() {
         let mut cli = empty_cli();
         cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
-        let settings = Settings::merge(cli, Config::default()).unwrap();
+        let settings = Settings::merge_with_home(cli, Config::default(), None).unwrap();
         match settings.log_sink {
             Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/tmp/a.jsonl")),
             other => panic!("unexpected log_sink: {other:?}"),
@@ -293,7 +277,7 @@ mod tests {
             log_keep_days: Some(7),
             ..Config::default()
         };
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         match settings.log_sink {
             Some(LogSink::Directory { dir, keep_days }) => {
                 assert_eq!(dir, PathBuf::from("/var/log/otel"));
@@ -311,7 +295,7 @@ mod tests {
             ..Config::default()
         };
         // log_keep_days を未指定にすると DEFAULT_LOG_KEEP_DAYS が使われる。
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         match settings.log_sink {
             Some(LogSink::Directory { keep_days, .. }) => {
                 assert_eq!(keep_days, DEFAULT_LOG_KEEP_DAYS);
@@ -328,7 +312,7 @@ mod tests {
             log_file: Some(PathBuf::from("/config.jsonl")),
             ..Config::default()
         };
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         match settings.log_sink {
             Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
             other => panic!("unexpected log_sink: {other:?}"),
@@ -343,7 +327,7 @@ mod tests {
             log_dir: Some(PathBuf::from("/config-dir")),
             ..Config::default()
         };
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         match settings.log_sink {
             Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
             other => panic!("unexpected log_sink: {other:?}"),
@@ -358,7 +342,7 @@ mod tests {
             log_file: Some(PathBuf::from("/config.jsonl")),
             ..Config::default()
         };
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         match settings.log_sink {
             Some(LogSink::Directory { dir, .. }) => assert_eq!(dir, PathBuf::from("/cli-dir")),
             other => panic!("unexpected log_sink: {other:?}"),
@@ -374,47 +358,9 @@ mod tests {
             summary: Some(true),
             ..Config::default()
         };
-        let settings = Settings::merge(cli, config).unwrap();
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
         assert!(settings.no_stdout);
         assert!(settings.summary);
-    }
-
-    #[test]
-    fn expand_user_path_replaces_leading_tilde_with_home() {
-        let home = PathBuf::from("/Users/alice");
-        assert_eq!(
-            expand_user_path(PathBuf::from("~"), Some(&home)),
-            PathBuf::from("/Users/alice"),
-        );
-        assert_eq!(
-            expand_user_path(PathBuf::from("~/tmp"), Some(&home)),
-            PathBuf::from("/Users/alice/tmp"),
-        );
-        assert_eq!(
-            expand_user_path(PathBuf::from("~/a/b/c"), Some(&home)),
-            PathBuf::from("/Users/alice/a/b/c"),
-        );
-    }
-
-    #[test]
-    fn expand_user_path_leaves_non_tilde_paths_untouched() {
-        let home = PathBuf::from("/Users/alice");
-        // 絶対パス、相対パス、文字列の途中の `~`、`~user/...` 形式 (未対応) は展開しない。
-        for raw in ["/var/log/otel", "tmp/foo", "/opt/~/cache", "~bob/tmp"] {
-            assert_eq!(
-                expand_user_path(PathBuf::from(raw), Some(&home)),
-                PathBuf::from(raw),
-                "must not expand: {raw}",
-            );
-        }
-    }
-
-    #[test]
-    fn expand_user_path_returns_input_when_home_is_unset() {
-        assert_eq!(
-            expand_user_path(PathBuf::from("~/tmp"), None),
-            PathBuf::from("~/tmp"),
-        );
     }
 
     #[test]
@@ -425,14 +371,8 @@ mod tests {
             log_dir: Some(PathBuf::from("~/tmp")),
             ..Config::default()
         };
-        // SAFETY: 並列テストでも HOME 文字列は同じ意味で、衝突しても結果は変わらない。
-        let restore = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/Users/alice") };
-        let settings = Settings::merge(cli, config).unwrap();
-        match restore {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        let home = PathBuf::from("/Users/alice");
+        let settings = Settings::merge_with_home(cli, config, Some(&home)).unwrap();
         match settings.log_sink {
             Some(LogSink::Directory { dir, .. }) => {
                 assert_eq!(dir, PathBuf::from("/Users/alice/tmp"));
@@ -445,13 +385,8 @@ mod tests {
     fn merge_expands_tilde_in_cli_log_file() {
         let mut cli = empty_cli();
         cli.log_file = Some(PathBuf::from("~/logs/otel.jsonl"));
-        let restore = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/Users/alice") };
-        let settings = Settings::merge(cli, Config::default()).unwrap();
-        match restore {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        let home = PathBuf::from("/Users/alice");
+        let settings = Settings::merge_with_home(cli, Config::default(), Some(&home)).unwrap();
         match settings.log_sink {
             Some(LogSink::File(path)) => {
                 assert_eq!(path, PathBuf::from("/Users/alice/logs/otel.jsonl"));

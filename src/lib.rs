@@ -4,5 +4,6 @@ pub mod config;
 pub mod format;
 pub mod grpc;
 pub mod http;
+pub mod path;
 pub mod server;
 pub mod sink;

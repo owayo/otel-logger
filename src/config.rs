@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::ColorMode;
+use crate::path::expand_user_path;
 
 /// `otel-logger init` が出力する参照用設定。source tree なしで新しい設定を
 /// 生成できるよう、binary に直接埋め込む。
@@ -82,12 +83,18 @@ impl Config {
     /// 設定を読み込む。`explicit` が指定された場合、そのファイルは存在しなければならない。
     /// それ以外では XDG の既定パスを参照し、存在しない場合はエラーにせず空設定にする。
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::load_with_home(explicit, home.as_deref())
+    }
+
+    fn load_with_home(explicit: Option<&Path>, home: Option<&Path>) -> Result<Self> {
         match explicit {
             Some(path) => {
+                let path = expand_user_path(path.to_path_buf(), home);
                 if !path.exists() {
                     anyhow::bail!("configuration file does not exist: {}", path.display());
                 }
-                Self::load_from(path)
+                Self::load_from(&path)
             }
             None => match default_config_path() {
                 Some(path) if path.exists() => Self::load_from(&path),
@@ -209,6 +216,20 @@ color = "never"
         assert_eq!(config.no_stdout, Some(true));
         assert_eq!(config.summary, Some(true));
         assert_eq!(config.color, Some(crate::cli::ColorMode::Never));
+    }
+
+    #[test]
+    fn load_explicit_path_expands_leading_tilde() {
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "summary = true\n").unwrap();
+
+        let config =
+            Config::load_with_home(Some(Path::new("~/config/config.toml")), Some(dir.path()))
+                .unwrap();
+
+        assert_eq!(config.summary, Some(true));
     }
 
     #[test]

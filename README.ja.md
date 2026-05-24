@@ -112,6 +112,9 @@ otel-logger [OPTIONS]
 `~/.config/otel-logger/config.toml`) を自動で読みます。`--config <PATH>` で
 別ファイルを指定可能。すべてのキーは任意で、無いキーはデフォルト値を使います。
 
+`--config`、`otel-logger init --path`、`log-file`、`log-dir` では、先頭の
+`~` / `~/` を `$HOME` に展開します。環境変数や設定ファイル経由の値も同じ扱いです。
+
 **優先順位** (上が強い): CLI フラグ > 環境変数 > 設定ファイル > 既定値。
 相互排他のログ出力先にもこの優先順位が適用されます。`--log-file` を指定した場合は
 設定ファイル側の `log-dir` を無視し、`--log-dir` を指定した場合は設定ファイル側の

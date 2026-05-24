@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use otel_logger::cli::{Cli, Commands, Settings};
 use otel_logger::config::{self, Config, InitOutcome};
+use otel_logger::path::expand_current_user_path;
 use otel_logger::server;
 use otel_logger::sink::Sink;
 
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
 
 fn run_init(path: Option<&Path>, force: bool) -> Result<()> {
     let dest: PathBuf = match path {
-        Some(p) => p.to_path_buf(),
+        Some(p) => expand_current_user_path(p.to_path_buf()),
         None => config::default_config_path().context(
             "cannot determine default config path: set $XDG_CONFIG_HOME or $HOME, or pass --path",
         )?,
