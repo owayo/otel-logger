@@ -107,6 +107,7 @@ impl Sink {
             None => None,
             Some(LogSink::File(path)) => {
                 let path = path.clone();
+                tracing::info!(path = %path.display(), "JSONL sink: appending to file");
                 let writer = tokio::task::spawn_blocking(move || open_log_file_sync(&path))
                     .await
                     .context("join open_log_file task")??;
@@ -115,6 +116,11 @@ impl Sink {
             Some(LogSink::Directory { dir, keep_days }) => {
                 let dir = dir.clone();
                 let keep_days = *keep_days;
+                tracing::info!(
+                    dir = %dir.display(),
+                    keep_days,
+                    "JSONL sink: rotating daily in directory"
+                );
                 let roller =
                     tokio::task::spawn_blocking(move || open_rotated_sync(&dir, keep_days))
                         .await
