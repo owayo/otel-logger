@@ -933,6 +933,11 @@ fn sum_pending_for_model(g: &AggregatorInner, provider: &str, model: &str) -> Mo
 /// `codex.request.*` は OTel semantic convention ではなく Codex CLI 内部の
 /// telemetry なので、対象は `handle_responses` spans に限定し、`effort` だけを更新する
 /// (provider/model は `conversation_starts` または metric data point 側に任せる)。
+///
+/// span 側に `conversation.id` がある場合は、その conversation の既知 session の effort
+/// だけを更新する。`codex_last_session` を黙って上書きすると、並行する別 conversation の
+/// effort バケットへ値を寄せてしまう。`conversation.id` が無い古い span に限り、最後の
+/// session に対する fallback として作用させる。
 fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyValue]) -> bool {
     let Some(effort) = string_attr(attrs, "codex.request.reasoning_effort") else {
         return false;
@@ -940,19 +945,35 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
     if effort.is_empty() {
         return false;
     }
-    let session = match g.codex_last_session.clone() {
-        Some(mut session) => {
-            session.effort = effort.to_string();
-            session
+    let conversation_id = string_attr(attrs, "conversation.id").filter(|id| !id.is_empty());
+    let session = if let Some(cid) = conversation_id {
+        match g.codex_sessions.get(cid).cloned() {
+            Some(mut session) => {
+                session.effort = effort.to_string();
+                session
+            }
+            None => CodexSession {
+                conversation_id: cid.to_string(),
+                provider: PROVIDER_OPENAI.to_string(),
+                model: string_attr(attrs, "model")
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                effort: effort.to_string(),
+            },
         }
-        None => CodexSession {
-            conversation_id: string_attr(attrs, "conversation.id")
-                .map(str::to_string)
-                .unwrap_or_default(),
-            provider: PROVIDER_OPENAI.to_string(),
-            model: String::new(),
-            effort: effort.to_string(),
-        },
+    } else {
+        match g.codex_last_session.clone() {
+            Some(mut session) => {
+                session.effort = effort.to_string();
+                session
+            }
+            None => CodexSession {
+                conversation_id: String::new(),
+                provider: PROVIDER_OPENAI.to_string(),
+                model: String::new(),
+                effort: effort.to_string(),
+            },
+        }
     };
     update_codex_session(g, session);
     true
@@ -1105,7 +1126,13 @@ fn int_attr(attrs: &[KeyValue], key: &str) -> Option<i64> {
         .as_ref()?;
     match v {
         OtlpValue::IntValue(i) => Some(*i),
-        OtlpValue::DoubleValue(d) => Some(*d as i64),
+        // 信頼できない telemetry source からの NaN/Infinity / range 外の double が
+        // `i64::MAX` 等にサチって累計を破壊しないよう、有限かつ i64 範囲内の値のみ受け入れる。
+        OtlpValue::DoubleValue(d)
+            if d.is_finite() && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 =>
+        {
+            Some(*d as i64)
+        }
         OtlpValue::StringValue(s) => s.parse().ok(),
         _ => None,
     }
@@ -1120,9 +1147,11 @@ fn f64_attr(attrs: &[KeyValue], key: &str) -> Option<f64> {
         .value
         .as_ref()?;
     match v {
-        OtlpValue::DoubleValue(d) => Some(*d),
+        // 累計集計 (`ModelStats::cost_usd` など) に Infinity / NaN が紛れると以後の値が
+        // すべて壊れるため、有限な double のみ受け入れる。
+        OtlpValue::DoubleValue(d) if d.is_finite() => Some(*d),
         OtlpValue::IntValue(i) => Some(*i as f64),
-        OtlpValue::StringValue(s) => s.parse().ok(),
+        OtlpValue::StringValue(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
         _ => None,
     }
 }
@@ -1342,6 +1371,14 @@ mod tests {
     }
 
     fn handle_responses_span(effort: &str) -> opentelemetry_proto::tonic::trace::v1::Span {
+        handle_responses_span_with_attrs(vec![kv_str("codex.request.reasoning_effort", effort)])
+    }
+
+    /// span に追加 attribute を載せて handle_responses を組み立てるテスト用ヘルパー。
+    /// 並行 conversation の effort 振り分け regression test で使う。
+    fn handle_responses_span_with_attrs(
+        attrs: Vec<KeyValue>,
+    ) -> opentelemetry_proto::tonic::trace::v1::Span {
         opentelemetry_proto::tonic::trace::v1::Span {
             trace_id: vec![1; 16],
             span_id: vec![2; 8],
@@ -1352,7 +1389,7 @@ mod tests {
             kind: 0,
             start_time_unix_nano: 1,
             end_time_unix_nano: 2,
-            attributes: vec![kv_str("codex.request.reasoning_effort", effort)],
+            attributes: attrs,
             dropped_attributes_count: 0,
             events: vec![],
             dropped_events_count: 0,
@@ -2128,6 +2165,96 @@ mod tests {
         assert_eq!(unknown.stats.input_tokens, 50);
         // 全体合計は変わらないこと (二重計上・取りこぼしが無い)。
         assert_eq!(agent.total.input_tokens, 150);
+    }
+
+    /// `handle_responses` span の `conversation.id` を尊重して、対応する session 以外の
+    /// effort を破壊しないことを確認する regression test。
+    #[test]
+    fn codex_handle_responses_span_respects_conversation_id() {
+        let agg = Aggregator::new();
+        // 2 つの conversation が並行する。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-b"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+        // 最後の session は conv-b/medium。conv-a を狙った handle_responses span が xhigh を運ぶ。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("codex.request.reasoning_effort", "xhigh"),
+            ])],
+        ));
+        // conv-b の SSE が届いたとき、effort=medium のままになっているべき
+        // (conv-a の xhigh 上書きが conv-b へ波及してはならない)。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-b"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "30"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert!(
+            agent
+                .buckets
+                .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/medium"))
+                .is_some_and(|b| b.stats.input_tokens == 30),
+            "conv-b の token は medium バケットに残る (xhigh に巻き込まれない)"
+        );
+    }
+
+    /// `int_attr` / `f64_attr` が NaN / Infinity を受け取った時、累計を破壊しないことを確認する。
+    #[test]
+    fn claude_api_request_log_ignores_non_finite_double_values() {
+        let agg = Aggregator::new();
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-7"),
+                kv_str("effort", "max"),
+                // double で infinity / NaN が紛れても、累計が壊れないこと。
+                kv_double("input_tokens", f64::INFINITY),
+                kv_double("output_tokens", f64::NAN),
+                kv_double("duration_ms", f64::NEG_INFINITY),
+                kv_double("cost_usd", f64::INFINITY),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket = agent.buckets.get("anthropic/claude-opus-4-7/max").unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 0);
+        assert_eq!(bucket.stats.output_tokens, 0);
+        assert_eq!(bucket.stats.duration_ms, 0);
+        assert!(
+            bucket.stats.cost_usd.is_finite() && bucket.stats.cost_usd == 0.0,
+            "cost_usd は有限な 0 を保つ"
+        );
     }
 
     /// `conversation_id` 付きの SSE 完了ログを受けた後、別 conversation の session が

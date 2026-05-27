@@ -41,8 +41,11 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - JSON Lines は graceful shutdown 時に `fsync`
   - JSONL の永続化に失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)
   - 累計使用量は JSONL 永続化に成功してから更新するため、retry された batch を二重計上しない
+  - 各 batch は ACK 前に `BufWriter::flush` で kernel まで書き出すため、process crash で末尾の write がメモリバッファに取り残されることがない
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
   - Codex で `effort=unknown` に積まれた pending token は `conversation.id` 単位で保留し、対応する `codex.conversation_starts` が後から届いた conversation の分だけを新 effort バケットへ振り替える (並行する別 conversation の token を巻き込まない)
+  - `handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊さない
+  - token / duration / cost 属性に NaN / Infinity / 範囲外の double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの汚染を防ぐ)
 - SIGINT / SIGTERM 対応 (`docker stop` で末尾バッチが落ちない)
 - Stripped で約 7 MB の単一バイナリ。distroless コンテナイメージ同梱
 - Docker Compose / GitHub Actions / GitLab CI の利用例を同梱

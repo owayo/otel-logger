@@ -44,9 +44,12 @@ the agent emits during a CI job and surface it where developers already look.
 - JSON Lines persistence, `fsync`'d on graceful shutdown
   - Persistence failures surface as HTTP 5xx / gRPC `Status::internal` so OTLP exporters can retry instead of silently dropping payloads
   - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
+  - Each batch is `flush`'d to the kernel before ACK so an unexpected crash never leaves the last write trapped in `BufWriter`'s in-memory buffer
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
+  - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
+  - Non-finite numeric attributes (`NaN`, `±Infinity`) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` or `cost_usd=inf`
 - Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
 - Single static-ish binary (~7 MB stripped) and a distroless container image
 - Examples for Docker Compose, GitHub Actions, and GitLab CI

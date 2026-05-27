@@ -49,14 +49,21 @@ enum JsonlWriter {
 
 impl JsonlWriter {
     fn write_line(&self, line: &[u8]) -> Result<()> {
+        // 永続化失敗を上位で 5xx に変換する以上、ACK 時点で BufWriter の中身は最低限
+        // kernel に渡しておく必要がある。fsync まで毎 batch で待つと throughput が落ちるため
+        // ここでは flush のみ呼び、disk への確定は graceful shutdown 時の sync_all に任せる。
         match self {
             Self::File(m) => {
                 let mut g = m.lock().expect("jsonl file mutex poisoned");
-                g.write_all(line).context("append JSONL line")
+                g.write_all(line).context("append JSONL line")?;
+                g.flush().context("flush JSONL line")?;
+                Ok(())
             }
             Self::Roller(m) => {
                 let mut g = m.lock().expect("jsonl roller mutex poisoned");
-                g.write_all(line).context("append JSONL line (rotated)")
+                g.write_all(line).context("append JSONL line (rotated)")?;
+                g.flush().context("flush JSONL line (rotated)")?;
+                Ok(())
             }
             #[cfg(test)]
             Self::Fail => anyhow::bail!("forced JSONL failure"),
@@ -482,6 +489,32 @@ mod tests {
         assert!(
             sink.aggregator().snapshot().agents.is_empty(),
             "retry 対象の payload は永続化成功まで集計しない"
+        );
+    }
+
+    /// `record()` が `Ok` を返した時点で payload が disk 上の JSONL に到達していること。
+    /// 旧実装では `BufWriter` のメモリバッファに留まったまま ACK し、後続の `sink.flush()`
+    /// 失敗で batch が失われる余地があったため、その regression test を兼ねる。
+    #[tokio::test]
+    async fn record_flushes_buf_writer_before_returning_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log_path = dir.path().join("otel-logger.jsonl");
+        let sink = Sink::from_settings(&settings_with_log_file(log_path.clone()))
+            .await
+            .unwrap();
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![],
+        };
+        sink.record(TelemetryRecord::Logs(Box::new(req)))
+            .await
+            .expect("record で永続化に成功すること");
+        // ここでは sink.flush() を呼ばずに直接ファイルを読む。BufWriter のままなら 0 byte の
+        // 可能性があるが、新実装では batch 毎の flush で kernel に渡している。
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            body.contains("\"kind\":\"logs\""),
+            "ACK 前に kernel へ書き込まれている必要がある: actual={body:?}"
         );
     }
 }
