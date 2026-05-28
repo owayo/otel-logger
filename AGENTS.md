@@ -37,4 +37,4 @@ cargo build --release
 - `otel-logger init` の上書き拒否は `OpenOptions::create_new` で atomic に行い、`exists()` 後の TOCTOU race で `--force` 未指定の既存ファイルを壊さない。
 - pretty stdout 出力 (`format::quote_for_pretty`) では ANSI escape を含む C0/C1 制御文字を必ず escape する。body/属性値だけでなく service 名、scope 名、span 名、metric 名、severity text、属性キー、累計サマリー内の provider/model/effort も対象にする。OTLP は既定で `0.0.0.0` に bind するため、信頼できない telemetry source からの terminal escape injection を防ぐ。JSONL 出力は lossless のまま raw 値を保持する。
 - コメントは、外部に出る CLI help では英日併記、内部実装の説明では日本語を基本にする。
-- `int_attr` / `f64_attr` は `DoubleValue` を受け取る際に必ず有限性を検査する。OTLP は既定で `0.0.0.0` に bind され、信頼できない source から NaN / Infinity / range 外の double が届く可能性があるため、サチった `i64::MAX` や `cost_usd=inf` で累計が破壊されないよう、有限かつ範囲内の値だけを採用する。
+- `int_attr` / `f64_attr` / `number_value_as_u64` / `histogram_sum_as_u64` は `DoubleValue` / histogram `sum` を受け取る際に必ず有限性と範囲を検査する。OTLP は既定で `0.0.0.0` に bind され、信頼できない source から NaN / Infinity / range 外の double が届く可能性があるため、サチった `i64::MAX` / `u64::MAX` や `cost_usd=inf` で累計が破壊されないよう、有限かつ範囲内の値だけを採用する。

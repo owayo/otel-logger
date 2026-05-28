@@ -49,7 +49,7 @@ the agent emits during a CI job and surface it where developers already look.
   de-duplication between logs and metrics
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
   - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
-  - Non-finite numeric attributes (`NaN`, `±Infinity`) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` or `cost_usd=inf`
+  - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
 - Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
 - Single static-ish binary (~7 MB stripped) and a distroless container image
 - Examples for Docker Compose, GitHub Actions, and GitLab CI
@@ -161,8 +161,9 @@ color = "auto"  # "auto" | "always" | "never"
 # http-addr = "0.0.0.0:4318"
 ```
 
-Note: TOML paths are not shell-expanded — write absolute paths, or use the
-`OTEL_LOGGER_LOG_FILE` env var if you need `~` expansion.
+Note: TOML paths are not generally shell-expanded. A leading `~` / `~/` is
+expanded for the path settings listed above, but embedded environment variables
+such as `$HOME/logs` are not expanded; write absolute paths for those cases.
 
 Internal logs (the receiver's own diagnostics) go to **stderr** and respect
 `OTEL_LOGGER_LOG=debug` (`tracing-subscriber` env filter syntax).

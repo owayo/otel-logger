@@ -1066,7 +1066,7 @@ fn is_delta_temporality(temporality: i32, metric_name: &str) -> bool {
 fn number_value_as_u64(dp: &NumberDataPoint) -> u64 {
     match dp.value {
         Some(NumberValue::AsInt(i)) => i.max(0) as u64,
-        Some(NumberValue::AsDouble(d)) if d.is_finite() && d >= 0.0 => d as u64,
+        Some(NumberValue::AsDouble(d)) => finite_u64_from_f64(d),
         _ => 0,
     }
 }
@@ -1081,8 +1081,18 @@ fn number_value_as_f64(dp: &NumberDataPoint) -> f64 {
 
 fn histogram_sum_as_u64(dp: &HistogramDataPoint) -> u64 {
     match dp.sum {
-        Some(s) if s.is_finite() && s >= 0.0 => s as u64,
+        Some(s) => finite_u64_from_f64(s),
         _ => 0,
+    }
+}
+
+fn finite_u64_from_f64(value: f64) -> u64 {
+    // OTLP は外部から受けるため、巨大な finite double を `as u64` で飽和させると
+    // `u64::MAX` が累計に混入する。安全に収まる非負値だけを採用する。
+    if value.is_finite() && value >= 0.0 && value < u64::MAX as f64 {
+        value as u64
+    } else {
+        0
     }
 }
 
@@ -2255,6 +2265,25 @@ mod tests {
             bucket.stats.cost_usd.is_finite() && bucket.stats.cost_usd == 0.0,
             "cost_usd は有限な 0 を保つ"
         );
+    }
+
+    /// metric の double 値が `u64` 範囲外でも、飽和した巨大値を累計に混ぜないことを確認する。
+    #[test]
+    fn metric_double_values_outside_u64_range_are_ignored() {
+        let in_range = make_double_dp(vec![], 42.9);
+        assert_eq!(number_value_as_u64(&in_range), 42);
+
+        let too_large_number = make_double_dp(vec![], f64::MAX);
+        assert_eq!(number_value_as_u64(&too_large_number), 0);
+
+        let rounded_past_u64_max = make_double_dp(vec![], u64::MAX as f64);
+        assert_eq!(number_value_as_u64(&rounded_past_u64_max), 0);
+
+        let too_large_histogram = make_hist_dp(vec![], f64::MAX);
+        assert_eq!(histogram_sum_as_u64(&too_large_histogram), 0);
+
+        let rounded_histogram = make_hist_dp(vec![], u64::MAX as f64);
+        assert_eq!(histogram_sum_as_u64(&rounded_histogram), 0);
     }
 
     /// `conversation_id` 付きの SSE 完了ログを受けた後、別 conversation の session が
