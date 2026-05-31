@@ -41,14 +41,20 @@ pub struct ModelStats {
 
 impl ModelStats {
     fn add(&mut self, sample: &ModelStats) {
-        self.request_count += sample.request_count;
-        self.input_tokens += sample.input_tokens;
-        self.output_tokens += sample.output_tokens;
-        self.cache_read_tokens += sample.cache_read_tokens;
-        self.cache_creation_tokens += sample.cache_creation_tokens;
-        self.reasoning_output_tokens += sample.reasoning_output_tokens;
-        self.cost_usd += sample.cost_usd;
-        self.duration_ms += sample.duration_ms;
+        self.request_count = self.request_count.saturating_add(sample.request_count);
+        self.input_tokens = self.input_tokens.saturating_add(sample.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(sample.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(sample.cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(sample.cache_creation_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(sample.reasoning_output_tokens);
+        self.cost_usd = finite_saturating_add_f64(self.cost_usd, sample.cost_usd);
+        self.duration_ms = self.duration_ms.saturating_add(sample.duration_ms);
     }
 
     fn subtract(&mut self, sample: &ModelStats) {
@@ -1096,6 +1102,21 @@ fn finite_u64_from_f64(value: f64) -> u64 {
     }
 }
 
+fn finite_saturating_add_f64(lhs: f64, rhs: f64) -> f64 {
+    let lhs = if lhs.is_finite() && lhs > 0.0 {
+        lhs
+    } else {
+        0.0
+    };
+    let rhs = if rhs.is_finite() && rhs > 0.0 {
+        rhs
+    } else {
+        0.0
+    };
+    let sum = lhs + rhs;
+    if sum.is_finite() { sum } else { f64::MAX }
+}
+
 fn service_name(resource: Option<&Resource>) -> &str {
     let Some(r) = resource else {
         return "";
@@ -1183,6 +1204,41 @@ mod tests {
     use opentelemetry_proto::tonic::metrics::v1::{
         Histogram, HistogramDataPoint, Metric, NumberDataPoint, Sum, metric::Data as MetricData,
     };
+
+    #[test]
+    fn model_stats_add_saturates_untrusted_totals() {
+        let mut stats = ModelStats {
+            request_count: u64::MAX,
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_creation_tokens: u64::MAX,
+            reasoning_output_tokens: u64::MAX,
+            cost_usd: f64::MAX,
+            duration_ms: u64::MAX,
+        };
+
+        stats.add(&ModelStats {
+            request_count: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 1,
+            cache_creation_tokens: 1,
+            reasoning_output_tokens: 1,
+            cost_usd: f64::MAX,
+            duration_ms: 1,
+        });
+
+        assert_eq!(stats.request_count, u64::MAX);
+        assert_eq!(stats.input_tokens, u64::MAX);
+        assert_eq!(stats.output_tokens, u64::MAX);
+        assert_eq!(stats.cache_read_tokens, u64::MAX);
+        assert_eq!(stats.cache_creation_tokens, u64::MAX);
+        assert_eq!(stats.reasoning_output_tokens, u64::MAX);
+        assert_eq!(stats.duration_ms, u64::MAX);
+        assert!(stats.cost_usd.is_finite(), "cost_usd は Infinity にしない");
+        assert_eq!(stats.cost_usd, f64::MAX);
+    }
 
     fn kv(key: &str, value: AnyValue) -> KeyValue {
         KeyValue {
