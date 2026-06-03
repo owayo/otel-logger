@@ -9,10 +9,22 @@ use crate::grpc::OtlpService;
 use crate::http;
 use crate::sink::Sink;
 
+/// OTLP/gRPC・OTLP/HTTP が 1 リクエストあたりに decode を許す最大バイト数。
+///
+/// 受信した payload を欠落なく保存する方針上、tonic 既定の 4MiB / axum 既定の 2MiB では
+/// 大きな batch が `RESOURCE_EXHAUSTED` / `413 Payload Too Large` で恒久的に拒否され、
+/// exporter が retry しても同じサイズのため回復できず欠落する。実測の最大 batch (約 0.6MiB)
+/// に十分な余裕を取りつつ、`0.0.0.0` 公開 bind 時のメモリ枯渇を避けるため 32MiB を上限とする。
+pub const OTLP_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 /// `shutdown` が cancel されるまで、`addr` で OTLP/gRPC server を動かす。
 pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
     let (trace_srv, metrics_srv, logs_srv) = OtlpService::new(sink).into_servers();
-    tracing::info!(%addr, "OTLP/gRPC server listening");
+    // 既定 (4MiB) では大きな batch が decode 前に拒否されるため、上限を明示的に引き上げる。
+    let trace_srv = trace_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    let metrics_srv = metrics_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    let logs_srv = logs_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    tracing::info!(%addr, max_request_bytes = OTLP_MAX_REQUEST_BYTES, "OTLP/gRPC server listening");
     tonic::transport::Server::builder()
         .add_service(trace_srv)
         .add_service(metrics_srv)

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,6 +21,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::server::OTLP_MAX_REQUEST_BYTES;
 use crate::sink::{Sink, TelemetryRecord};
 
 const PROTOBUF_CT: &str = "application/x-protobuf";
@@ -177,6 +178,8 @@ pub fn router(sink: Sink) -> Router {
         .route("/healthz", get(health))
         .route("/stats", get(handle_stats))
         .with_state(sink)
+        // 既定 (2MiB) では大きな batch が抽出前に 413 で拒否されるため、上限を引き上げる。
+        .layer(DefaultBodyLimit::max(OTLP_MAX_REQUEST_BYTES))
 }
 
 pub async fn serve(
@@ -241,5 +244,47 @@ mod tests {
         let result: Result<ExportTraceServiceRequest, _> =
             decode_request(Encoding::Protobuf, &[0xFF]);
         assert!(result.is_err());
+    }
+
+    /// axum 既定の 2MiB body limit を超える batch でも 413 で拒否されず、
+    /// `OTLP_MAX_REQUEST_BYTES` まで受け付けることの回帰テスト。
+    /// 受信した payload を欠落なく保存する方針上、大きな batch を size で弾かないことが重要。
+    #[tokio::test]
+    async fn router_accepts_body_larger_than_axum_default_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        use crate::cli::{ColorMode, Settings};
+
+        let settings = Settings {
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            log_sink: None,
+            no_stdout: true,
+            summary: false,
+            color: ColorMode::Never,
+            dry_run: false,
+        };
+        let sink = Sink::from_settings(&settings).await.unwrap();
+        let app = router(sink);
+
+        // axum 既定の 2MiB を超えるが OTLP_MAX_REQUEST_BYTES (32MiB) には収まる body。
+        // 中身は不正な protobuf なので、size 制限を通過できれば decode 失敗で 400 になる。
+        // 制限が 2MiB のままなら body 抽出時点で 413 Payload Too Large になる。
+        let oversized = vec![0xFF_u8; 3 * 1024 * 1024];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .body(Body::from(oversized))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "2MiB 超の body が size 制限ではなく protobuf decode 失敗で弾かれること"
+        );
     }
 }

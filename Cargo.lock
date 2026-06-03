@@ -878,6 +878,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-prost",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

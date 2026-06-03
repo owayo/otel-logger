@@ -39,3 +39,4 @@ cargo build --release
 - コメントは、外部に出る CLI help では英日併記、内部実装の説明では日本語を基本にする。
 - `int_attr` / `f64_attr` / `number_value_as_u64` / `histogram_sum_as_u64` は `DoubleValue` / histogram `sum` を受け取る際に必ず有限性と範囲を検査する。OTLP は既定で `0.0.0.0` に bind され、信頼できない source から NaN / Infinity / range 外の double が届く可能性があるため、サチった `i64::MAX` / `u64::MAX` や `cost_usd=inf` で累計が破壊されないよう、有限かつ範囲内の値だけを採用する。
 - `ModelStats` の累計加算は必ず saturating にする。個々の値を検証しても、複数 batch の合算で `u64` overflow や `cost_usd=inf` が起こると `/stats` と summary が壊れるため、外部入力由来の counter は wrap / panic させない。
+- OTLP/gRPC・OTLP/HTTP の 1 リクエスト上限は `OTLP_MAX_REQUEST_BYTES` (32MiB) に引き上げる。tonic 既定 4MiB / axum 既定 2MiB のままだと大きな batch が `RESOURCE_EXHAUSTED` / `413 Payload Too Large` で恒久的に拒否され、exporter が retry しても同じ size のため回復できず「受信した payload を欠落なく保存」方針が崩れる。`serve_grpc` では生成した各 service server に `max_decoding_message_size`、`http::router` には `DefaultBodyLimit::max` を設定する。実測の最大 batch (約 0.6MiB) に十分な余裕を取りつつ、`0.0.0.0` 公開 bind 時のメモリ枯渇を避けるため 32MiB を上限とする。

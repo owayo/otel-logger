@@ -45,6 +45,7 @@ the agent emits during a CI job and surface it where developers already look.
   - Persistence failures surface as HTTP 5xx / gRPC `Status::internal` so OTLP exporters can retry instead of silently dropping payloads
   - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
   - Each batch is `flush`'d to the kernel before ACK so an unexpected crash never leaves the last write trapped in `BufWriter`'s in-memory buffer
+  - gRPC/HTTP raise their per-request decode limit to 32 MiB (above `tonic`'s 4 MiB / `axum`'s 2 MiB defaults) so large batches are persisted instead of being permanently rejected with `RESOURCE_EXHAUSTED` / `413` that exporter retries cannot recover from
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
@@ -458,6 +459,7 @@ make docker     # build the container image
 
 - `tonic` exposes the three OTLP gRPC services (`TraceService`, `MetricsService`, `LogsService`) on port 4317.
 - `axum` serves `/v1/traces`, `/v1/metrics`, `/v1/logs` on port 4318 and accepts both `application/x-protobuf` (decoded with `prost`) and `application/json` (decoded via `serde`).
+- Both transports raise their per-request decode limit to 32 MiB (`OTLP_MAX_REQUEST_BYTES`) so a large batch is never permanently rejected by the 4 MiB / 2 MiB transport defaults.
 - Both transports converge on a shared `Sink` that writes pretty stdout and lossless JSONL.
 - `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; gRPC/HTTP tasks are awaited before the final JSONL flush so the trailing batch never disappears.
 
