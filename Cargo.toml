@@ -49,7 +49,7 @@ axum = { version = "0.8.9", default-features = false, features = [
     "query",
 ] }
 bytes = "1.11.1"
-http = "1.4.0"
+http = "1.4.1"
 
 # 非同期 runtime
 tokio = { version = "1.52.3", features = [
