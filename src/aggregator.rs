@@ -1673,6 +1673,38 @@ mod tests {
     }
 
     #[test]
+    fn claude_api_request_log_counts_string_numeric_attrs_from_real_payload() {
+        let agg = Aggregator::new();
+        // CI の実ログでは token/duration が stringValue、cost だけが doubleValue で届く。
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-8"),
+                kv_str("effort", "max"),
+                kv_str("input_tokens", "3862"),
+                kv_str("output_tokens", "600"),
+                kv_str("cache_read_tokens", "16213"),
+                kv_str("cache_creation_tokens", "22701"),
+                kv_double("cost_usd", 0.18429775),
+                kv_str("duration_ms", "9545"),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket = agent.buckets.get("anthropic/claude-opus-4-8/max").unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 3862);
+        assert_eq!(bucket.stats.output_tokens, 600);
+        assert_eq!(bucket.stats.cache_read_tokens, 16213);
+        assert_eq!(bucket.stats.cache_creation_tokens, 22701);
+        assert_eq!(bucket.stats.duration_ms, 9545);
+        assert!((bucket.stats.cost_usd - 0.18429775).abs() < 1e-9);
+    }
+
+    #[test]
     fn claude_log_usage_prevents_later_metric_double_count() {
         let agg = Aggregator::new();
         let log_req = make_log_req(
@@ -1814,6 +1846,51 @@ mod tests {
         assert_eq!(bucket.stats.cache_read_tokens, 50);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
         assert_eq!(bucket.stats.request_count, 0);
+    }
+
+    #[test]
+    fn codex_conversation_start_event_name_only_registers_session() {
+        let agg = Aggregator::new();
+        // CI の実ログでは body が空で、`event.name` 属性だけが
+        // `codex.conversation_starts` を表す形が届く。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.conversation_starts"),
+                kv_str("conversation.id", "conv-real-shape"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-real-shape"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "85"),
+                kv_str("output_token_count", "5"),
+                kv_int("cached_token_count", 64),
+                kv_int("reasoning_token_count", 3),
+                kv_str("tool_token_count", "90"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .expect("event.name だけの conversation_starts から effort が補完される");
+        assert_eq!(bucket.stats.input_tokens, 85);
+        assert_eq!(bucket.stats.output_tokens, 5);
+        assert_eq!(bucket.stats.cache_read_tokens, 64);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 3);
     }
 
     #[test]
