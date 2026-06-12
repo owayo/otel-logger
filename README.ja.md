@@ -354,9 +354,9 @@ bucket key は `provider/model/effort` 形式です。Codex 側は ChatGPT / Ope
 `--summary` (または `OTEL_LOGGER_SUMMARY=1` / 設定ファイルの `summary = true`) を有効にすると、使用量の累計が更新されるバッチを受信するたびに `[stats:<agent>]` ブロックが追記されます。
 
 ```
-[stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=21.04m since=2026-05-08T...
-        breakdown provider=anthropic model=claude-opus-4-7[1m] effort=max: requests=74 input=1253 output=82097 cache_read=8924351 cache_create=671142 reasoning=0 cost=$10.7155
-        breakdown provider=anthropic model=claude-haiku-4-5-20251001 effort=unknown: requests=7 input=64256 output=3110 cache_read=0 cache_create=53040 reasoning=0 cost=$0.1561
+[stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=1262.400s since=2026-05-08T...
+        breakdown provider=anthropic model=claude-opus-4-7[1m] effort=max: requests=74 input=1253 output=82097 cache_read=8924351 cache_create=671142 reasoning=0 cost=$10.7155 duration=1234.560s
+        breakdown provider=anthropic model=claude-haiku-4-5-20251001 effort=unknown: requests=7 input=64256 output=3110 cache_read=0 cache_create=53040 reasoning=0 cost=$0.1561 duration=27.840s
 ```
 
 カウンタはプロセス生存中の累計です。otel-logger を再起動するとリセットされます。

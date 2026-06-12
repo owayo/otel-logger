@@ -59,7 +59,7 @@ pub fn render_summary(snapshot: &UsageSnapshot, color: bool) -> String {
         for bucket in stats.buckets.values() {
             let _ = writeln!(
                 out,
-                "        {prefix} provider={provider} model={model} effort={effort}: requests={requests} input={input} output={output} cache_read={cr} cache_create={cc} reasoning={r} cost={cost}",
+                "        {prefix} provider={provider} model={model} effort={effort}: requests={requests} input={input} output={output} cache_read={cr} cache_create={cc} reasoning={r} cost={cost} duration={dur}",
                 prefix = p.dim("breakdown"),
                 provider = p.bold(&quote_for_pretty(&bucket.provider)),
                 model = p.bold(&quote_for_pretty(&bucket.model)),
@@ -71,6 +71,9 @@ pub fn render_summary(snapshot: &UsageSnapshot, color: bool) -> String {
                 cc = bucket.stats.cache_creation_tokens,
                 r = bucket.stats.reasoning_output_tokens,
                 cost = format_cost(bucket.stats.cost_usd),
+                // 内訳行でも model ごとの所要時間を出す。total 行と項目を揃え、
+                // バケットに集計済みの duration_ms (ms→ns 換算) を可視化する。
+                dur = format_duration_ns(bucket.stats.duration_ms.saturating_mul(1_000_000)),
             );
         }
     }

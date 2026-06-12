@@ -13,6 +13,13 @@ pub(crate) fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path;
     };
+    // `HOME=""` (空文字) は未設定と同等に扱う。空 home のまま `~/x` を join すると
+    // `x` (プロセス CWD 相対) に化け、`~` 単独では空パスになって open に失敗する。
+    // `default_config_path` 側が `filter(|v| !v.is_empty())` で空 HOME を弾くのと挙動を揃える。
+    // 空文字 HOME は cron / systemd unit / コンテナ等で実際に発生しうる正当な POSIX 状態。
+    if home.as_os_str().is_empty() {
+        return path;
+    }
     let Some(s) = path.to_str() else {
         return path;
     };
@@ -63,6 +70,22 @@ mod tests {
         assert_eq!(
             expand_user_path(PathBuf::from("~/tmp"), None),
             PathBuf::from("~/tmp"),
+        );
+    }
+
+    #[test]
+    fn expand_user_path_treats_empty_home_as_unset() {
+        // `HOME=""` は未設定と同等に扱い、`~/x` を CWD 相対パスへ化けさせない。
+        // 呼び出し元 (`expand_current_user_path` / config / cli) は空チェック無しで
+        // `Some(PathBuf::from(""))` を渡しうるため、関数側で防ぐ。
+        let empty = PathBuf::new();
+        assert_eq!(
+            expand_user_path(PathBuf::from("~/tmp"), Some(&empty)),
+            PathBuf::from("~/tmp"),
+        );
+        assert_eq!(
+            expand_user_path(PathBuf::from("~"), Some(&empty)),
+            PathBuf::from("~"),
         );
     }
 }

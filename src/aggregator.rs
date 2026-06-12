@@ -1159,8 +1159,11 @@ fn int_attr(attrs: &[KeyValue], key: &str) -> Option<i64> {
         OtlpValue::IntValue(i) => Some(*i),
         // 信頼できない telemetry source からの NaN/Infinity / range 外の double が
         // `i64::MAX` 等にサチって累計を破壊しないよう、有限かつ i64 範囲内の値のみ受け入れる。
+        // `i64::MAX`(2^63-1) は f64 で正確に表現できず `i64::MAX as f64` は 2^63 に丸め上がる。
+        // そのため上限は strict `<` にして、ちょうど 2^63 の double が `as i64` で
+        // `i64::MAX` にサチる経路を塞ぐ (姉妹関数 `finite_u64_from_f64` と同じ判定)。
         OtlpValue::DoubleValue(d)
-            if d.is_finite() && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 =>
+            if d.is_finite() && *d >= i64::MIN as f64 && *d < i64::MAX as f64 =>
         {
             Some(*d as i64)
         }
@@ -2460,5 +2463,133 @@ mod tests {
             .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
             .unwrap();
         assert_eq!(unknown.stats.input_tokens, 100);
+    }
+
+    /// `i64::MAX`(2^63-1) は f64 で表現できず `i64::MAX as f64` は 2^63 に丸め上がる。
+    /// この境界の double を受け入れると `as i64` で `i64::MAX` にサチり、untrusted source が
+    /// 累計へ巨大値を注入できてしまう。上限は strict `<` で弾くことを固定する。
+    #[test]
+    fn int_attr_rejects_double_saturating_to_i64_max() {
+        let saturating = vec![kv_double("duration_ms", i64::MAX as f64)];
+        assert_eq!(int_attr(&saturating, "duration_ms"), None);
+        assert_eq!(u64_attr(&saturating, "duration_ms"), 0);
+
+        // 範囲内の double は over-reject せずそのまま採用する。
+        let in_range = vec![kv_double("duration_ms", 1_000_000_000_000.0)];
+        assert_eq!(int_attr(&in_range, "duration_ms"), Some(1_000_000_000_000));
+
+        // api_request 経路でも、サチる duration が累計へ混入しないこと。
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-8"),
+                kv_str("effort", "max"),
+                kv_double("duration_ms", i64::MAX as f64),
+            ],
+        ));
+        let snap = agg.snapshot();
+        let bucket = snap.agents[AGENT_CLAUDE]
+            .buckets
+            .get("anthropic/claude-opus-4-8/max")
+            .unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.duration_ms, 0, "サチる duration は 0 に倒す");
+    }
+
+    /// 実ログでは `handle_responses` span が `gen_ai.usage.*` を持ち、その値は
+    /// `codex.turn.token_usage` metric と完全一致する (同一 usage の別表現)。
+    /// span 経路は effort 補完専用であり、ここから token を計上すると三重計上になる。
+    #[test]
+    fn codex_handle_responses_span_usage_does_not_double_count_metric() {
+        let agg = Aggregator::new();
+        // turn metric が usage を計上する。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.5", "input", 100.0),
+                codex_token_metric("gpt-5.5", "output", 20.0),
+            ],
+        ));
+        // 同一 usage を gen_ai.usage.* で持つ span が届いても、effort 補完だけ行い
+        // token は二重計上しない。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("codex.request.reasoning_effort", "high"),
+                kv_int("gen_ai.usage.input_tokens", 100),
+                kv_int("gen_ai.usage.cache_read.input_tokens", 64),
+                kv_int("gen_ai.usage.output_tokens", 20),
+                kv_int("codex.usage.reasoning_output_tokens", 5),
+                kv_int("codex.usage.total_tokens", 120),
+            ])],
+        ));
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(
+            agent.total.input_tokens, 100,
+            "span 由来で input を二重計上しない"
+        );
+        assert_eq!(
+            agent.total.output_tokens, 20,
+            "span 由来で output を二重計上しない"
+        );
+        assert_eq!(
+            agent.total.cache_read_tokens, 0,
+            "metric は cached_input を持たないため、span の cache を勝手に足さない"
+        );
+    }
+
+    /// 実 CI ログでは同一ジョブ内で複数 conversation が high / xhigh の別 effort で並走する。
+    /// `conversation.id` 単位で effort を引き当て、それぞれ別バケットへ正しく計上できること。
+    #[test]
+    fn codex_concurrent_high_and_xhigh_conversations_are_bucketed_separately() {
+        let agg = Aggregator::new();
+        for (cid, effort) in [("conv-high", "high"), ("conv-xhigh", "xhigh")] {
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_EXEC,
+                "",
+                vec![
+                    kv_str("event.name", "codex.conversation_starts"),
+                    kv_str("conversation.id", cid),
+                    kv_str("provider_name", PROVIDER_OPENAI),
+                    kv_str("model", "gpt-5.5"),
+                    kv_str("reasoning_effort", effort),
+                ],
+            ));
+        }
+        for (cid, input, output) in [("conv-high", 100, 10), ("conv-xhigh", 200, 20)] {
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_EXEC,
+                "",
+                vec![
+                    kv_str("event.name", "codex.sse_event"),
+                    kv_str("event.kind", "response.completed"),
+                    kv_str("conversation.id", cid),
+                    kv_str("model", "gpt-5.5"),
+                    kv_int("input_token_count", input),
+                    kv_int("output_token_count", output),
+                ],
+            ));
+        }
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let high = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .expect("high バケット");
+        assert_eq!(high.stats.input_tokens, 100);
+        assert_eq!(high.stats.output_tokens, 10);
+        let xhigh = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("xhigh バケット");
+        assert_eq!(xhigh.stats.input_tokens, 200);
+        assert_eq!(xhigh.stats.output_tokens, 20);
+        // 別 conversation を unknown へ取りこぼさず、合算は両者の和になる。
+        assert_eq!(agent.total.input_tokens, 300);
+        assert_eq!(agent.total.output_tokens, 30);
     }
 }

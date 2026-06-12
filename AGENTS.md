@@ -32,7 +32,7 @@ cargo build --release
 - `update_codex_effort_from_request_attrs` (`handle_responses` span 経由の effort 補完) も `conversation.id` 単位で動かす。span に `conversation.id` がある場合は対応する `codex_sessions` の effort だけを更新し、別 conversation の `codex_last_session` を巻き込まない。`conversation.id` が無い古い span のみ、最後の session に対する fallback として動作させる。
 - `merge_codex_unknown_effort` は `conversation.id` 単位で pending 分だけを移動する。並行する別 conversation の token を巻き込まないよう、`codex_unknown_effort_sse` に conversation 別の累計を保留しておき、対応する session が届いた conversation の分だけ unknown バケットから新 effort バケットへ振り替える。conversation.id が無い古い telemetry に限り、unknown バケット全体を移す旧挙動を残す (ただし他 conversation の pending 合計は差し引いて取り違えを防ぐ)。
 - `log-file` / `log-dir` の相互排他は優先順位 (CLI/環境変数 > 設定ファイル > 既定値) を守る。上位で片方を指定した場合、下位のもう片方は衝突扱いにしない。
-- `--config`、`otel-logger init --path`、`log-file`、`log-dir` は先頭の `~` / `~/` を `$HOME` に展開する。shell が展開しない環境変数・設定ファイル由来の値も同じ扱いにする。
+- `--config`、`otel-logger init --path`、`log-file`、`log-dir` は先頭の `~` / `~/` を `$HOME` に展開する。shell が展開しない環境変数・設定ファイル由来の値も同じ扱いにする。`HOME` が空文字 (`HOME=""`、cron / systemd / コンテナで実在する) の場合は未設定と同等に扱い、`~/x` を CWD 相対パスへ化けさせない (`default_config_path` の空 `HOME` 弾きと挙動を揃える)。
 - `log-dir` cleanup は `otel-logger.YYYY-MM-DD` 形式の日次ローテーションファイルだけを削除する。`otel-logger.pid`、`otel-logger.stderr.log`、単体の `otel-logger.jsonl` など、同じ prefix の別用途ファイルは削除しない。
 - `otel-logger init` の上書き拒否は `OpenOptions::create_new` で atomic に行い、`exists()` 後の TOCTOU race で `--force` 未指定の既存ファイルを壊さない。
 - pretty stdout 出力 (`format::quote_for_pretty`) では ANSI escape を含む C0/C1 制御文字を必ず escape する。body/属性値だけでなく service 名、scope 名、span 名、metric 名、severity text、属性キー、累計サマリー内の provider/model/effort も対象にする。OTLP は既定で `0.0.0.0` に bind するため、信頼できない telemetry source からの terminal escape injection を防ぐ。JSONL 出力は lossless のまま raw 値を保持する。
