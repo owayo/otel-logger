@@ -2592,4 +2592,96 @@ mod tests {
         assert_eq!(agent.total.input_tokens, 300);
         assert_eq!(agent.total.output_tokens, 30);
     }
+
+    /// 実ログ形状: `codex.turn.token_usage` は 1 つの metric の中に input / output /
+    /// cached_input / reasoning_output / total の data point をまとめて載せる
+    /// (CI 実ログの形)。`total` は他種別と重複するため無視し、残りを同じ bucket へ
+    /// 集計することを検証する。token_type ごとに metric を分ける既存テストとは別に、
+    /// 1 metric 複数 data point の実形状を押さえる。
+    #[test]
+    fn codex_turn_token_usage_single_metric_multi_points_skips_total() {
+        let agg = Aggregator::new();
+        let metric = Metric {
+            name: "codex.turn.token_usage".into(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![],
+            data: Some(delta_hist(vec![
+                make_hist_dp(
+                    vec![kv_str("model", "gpt-5.5"), kv_str("token_type", "input")],
+                    2_709_567.0,
+                ),
+                make_hist_dp(
+                    vec![kv_str("model", "gpt-5.5"), kv_str("token_type", "output")],
+                    11_905.0,
+                ),
+                make_hist_dp(
+                    vec![
+                        kv_str("model", "gpt-5.5"),
+                        kv_str("token_type", "cached_input"),
+                    ],
+                    2_568_064.0,
+                ),
+                make_hist_dp(
+                    vec![
+                        kv_str("model", "gpt-5.5"),
+                        kv_str("token_type", "reasoning_output"),
+                    ],
+                    5_775.0,
+                ),
+                make_hist_dp(
+                    vec![kv_str("model", "gpt-5.5"), kv_str("token_type", "total")],
+                    2_721_472.0,
+                ),
+            ])),
+        };
+        agg.ingest_metrics(&make_metric_req(SERVICE_CODEX_EXEC, vec![metric]));
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 2_709_567);
+        assert_eq!(bucket.stats.output_tokens, 11_905);
+        assert_eq!(bucket.stats.cache_read_tokens, 2_568_064);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 5_775);
+        // total(2_721_472) は input 等と重複するため加算されない。
+        assert_eq!(agent.total.input_tokens, 2_709_567);
+    }
+
+    /// 実ログ形状: `claude_code.api_request` は `cost_usd` を DoubleValue で送り、
+    /// 併せて `cost_usd_micros` など otel-logger が集計に使わない付随属性も持つ。
+    /// DoubleValue から cost を読み取り、未対応属性は無視して 1 リクエストとして
+    /// 計上することを検証する (新モデル名 `claude-opus-4-8` / `effort=max` の形)。
+    #[test]
+    fn claude_api_request_log_reads_double_cost_and_ignores_extra_attrs() {
+        let agg = Aggregator::new();
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-8"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 3874),
+                kv_int("output_tokens", 552),
+                kv_int("cache_read_tokens", 16216),
+                kv_int("cache_creation_tokens", 25277),
+                kv_double("cost_usd", 0.294048),
+                kv_int("cost_usd_micros", 294048),
+                kv_int("duration_ms", 6084),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket = agent.buckets.get("anthropic/claude-opus-4-8/max").unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.input_tokens, 3874);
+        assert_eq!(bucket.stats.output_tokens, 552);
+        assert_eq!(bucket.stats.cache_read_tokens, 16216);
+        assert_eq!(bucket.stats.cache_creation_tokens, 25277);
+        assert_eq!(bucket.stats.duration_ms, 6084);
+        assert!((bucket.stats.cost_usd - 0.294048).abs() < 1e-9);
+    }
 }
