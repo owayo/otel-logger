@@ -64,10 +64,15 @@ fn detect_encoding(headers: &HeaderMap) -> Result<Encoding, HttpError> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or(PROTOBUF_CT);
     let primary = ct.split(';').next().unwrap_or(ct).trim();
-    match primary {
-        PROTOBUF_CT => Ok(Encoding::Protobuf),
-        JSON_CT => Ok(Encoding::Json),
-        other => Err(HttpError::UnsupportedContentType(other.to_string())),
+    // HTTP の media type (type/subtype) は大小文字を区別しない (RFC 9110)。
+    // `Application/X-Protobuf` のような表記でも正当な OTLP/HTTP request として受け付け、
+    // decode 前に 415 で拒否しない。
+    if primary.eq_ignore_ascii_case(PROTOBUF_CT) {
+        Ok(Encoding::Protobuf)
+    } else if primary.eq_ignore_ascii_case(JSON_CT) {
+        Ok(Encoding::Json)
+    } else {
+        Err(HttpError::UnsupportedContentType(primary.to_string()))
     }
 }
 
@@ -236,6 +241,16 @@ mod tests {
             HttpError::UnsupportedContentType(ct) => assert_eq!(ct, "text/plain"),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_encoding_treats_media_type_case_insensitively() {
+        // HTTP の media type (type/subtype) は大小文字非区別 (RFC 9110)。
+        // 大文字混じりの Content-Type でも正当な OTLP/HTTP request として受け付ける。
+        let h = headers_with_ct("Application/X-Protobuf; charset=utf-8");
+        assert_eq!(detect_encoding(&h).unwrap(), Encoding::Protobuf);
+        let h = headers_with_ct("APPLICATION/JSON");
+        assert_eq!(detect_encoding(&h).unwrap(), Encoding::Json);
     }
 
     #[test]

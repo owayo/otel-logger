@@ -835,6 +835,18 @@ fn claude_usage_source_key(model: &str, effort: &str) -> String {
 }
 
 fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
+    update_codex_session_with_last(g, session, true);
+}
+
+/// `update_last=false` のときは `codex_last_session` を更新しない。
+/// `conversation.id` 付きの effort 補完が別 conversation の last session を上書きするのを防ぐ
+/// ためのフック。conversation.id を持たない後続 metric の effort バケットが、無関係な
+/// conversation の span に引きずられないようにする (AGENTS.md の方針)。
+fn update_codex_session_with_last(
+    g: &mut AggregatorInner,
+    session: CodexSession,
+    update_last: bool,
+) {
     let provider = session.provider.clone();
     let model = session.model.clone();
     let effort = session.effort.clone();
@@ -843,7 +855,9 @@ fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
         g.codex_sessions
             .insert(conversation_id.clone(), session.clone());
     }
-    g.codex_last_session = Some(session);
+    if update_last {
+        g.codex_last_session = Some(session);
+    }
     merge_codex_unknown_effort(g, &provider, &model, &conversation_id, &effort);
 }
 
@@ -981,7 +995,15 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
             },
         }
     };
-    update_codex_session(g, session);
+    // conversation.id がある span は、その conversation の session の effort だけを更新する。
+    // 別 conversation の last session を上書きすると、conversation.id を持たない後続 metric の
+    // effort バケットが無関係な conversation に引きずられる (AGENTS.md の方針)。conversation.id
+    // が無い古い span、または last session が同じ conversation のときだけ last を更新する。
+    let update_last = conversation_id.is_none()
+        || g.codex_last_session
+            .as_ref()
+            .is_some_and(|last| last.conversation_id == session.conversation_id);
+    update_codex_session_with_last(g, session, update_last);
     true
 }
 
@@ -2683,5 +2705,78 @@ mod tests {
         assert_eq!(bucket.stats.cache_creation_tokens, 25277);
         assert_eq!(bucket.stats.duration_ms, 6084);
         assert!((bucket.stats.cost_usd - 0.294048).abs() < 1e-9);
+    }
+
+    /// バグ回帰: `conversation.id` 付きの `handle_responses` span が effort を補完する際、
+    /// 別 conversation の `codex_last_session` を上書きしてはならない。上書きすると、
+    /// conversation.id を持たない後続 metric (turn count / duration) の effort バケットが
+    /// 無関係な conversation の span に引きずられる。
+    #[test]
+    fn codex_handle_responses_span_with_conversation_id_keeps_last_session() {
+        let agg = Aggregator::new();
+        // conv-a/high を登録。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+        // conv-b/medium を登録。last session は conv-b/medium になる。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-b"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+        // conv-a を狙った handle_responses span が xhigh を運ぶ (conversation.id=conv-a)。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("codex.request.reasoning_effort", "xhigh"),
+            ])],
+        ));
+        // conversation.id を持たない turn count metric が届く。last session は依然
+        // conv-b/medium のはずなので medium バケットに入る (conv-a の xhigh に汚染されない)。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_turn_count("gpt-5.5", 1)],
+        ));
+        // conv-a 自身の SSE が来れば、span で更新された xhigh で計上される
+        // (codex_sessions[conv-a] は xhigh に更新されている)。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-a"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "10"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let medium = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/medium"))
+            .expect("conversation.id 無し metric は last session(conv-b/medium)の effort を使う");
+        assert_eq!(medium.stats.request_count, 1);
+        // medium バケットに conv-a の token が混ざっていないこと。
+        assert_eq!(medium.stats.input_tokens, 0);
+        let xhigh = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("conv-a の SSE は span で更新された xhigh バケットへ入る");
+        assert_eq!(xhigh.stats.input_tokens, 10);
     }
 }
