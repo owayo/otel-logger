@@ -44,6 +44,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
   - 各 batch は ACK 前に `BufWriter::flush` で kernel まで書き出すため、process crash で末尾の write がメモリバッファに取り残されることがない
   - gRPC / HTTP の 1 リクエスト上限を 32 MiB (`tonic` 既定 4 MiB / `axum` 既定 2 MiB より引き上げ) にし、大きな batch を `RESOURCE_EXHAUSTED` / `413` で恒久拒否せず保存する (exporter の retry でも回復できない欠落を防ぐ)
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
+  - Codex は SSE の `response.completed` ログを token source として優先する。usage を持たない WebSocket `response.completed` や、`session_task.turn` などの trace span 上に出る同一 usage の別表現は、別 usage として加算しない
   - Codex で `effort=unknown` に積まれた pending token は `conversation.id` 単位で保留し、対応する `codex.conversation_starts` が後から届いた conversation の分だけを新 effort バケットへ振り替える (並行する別 conversation の token を巻き込まない)
   - `handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊さない
   - token / duration / cost の属性値や metric 値に NaN / Infinity / 範囲外の巨大な double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの `i64::MAX` / `u64::MAX` 飽和値や `cost_usd=inf` の混入を防ぐ)

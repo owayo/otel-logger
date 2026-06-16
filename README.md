@@ -48,6 +48,7 @@ the agent emits during a CI job and surface it where developers already look.
   - gRPC/HTTP raise their per-request decode limit to 32 MiB (above `tonic`'s 4 MiB / `axum`'s 2 MiB defaults) so large batches are persisted instead of being permanently rejected with `RESOURCE_EXHAUSTED` / `413` that exporter retries cannot recover from
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
+  - For Codex, SSE `response.completed` logs are the preferred token source when present; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` are not counted as separate usage
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's
   - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
   - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`

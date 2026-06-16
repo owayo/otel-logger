@@ -1873,6 +1873,45 @@ mod tests {
         assert_eq!(bucket.stats.request_count, 0);
     }
 
+    /// Codex 0.140.0 の実ログでは WebSocket 側にも `response.completed` が出るが、
+    /// token usage は `codex.sse_event` / `codex.turn.token_usage` 側にだけ載る。
+    /// usage を持たない completion で token source を Logs に切り替えると、後続 metrics を
+    /// 捨ててしまうため、集計対象にしない。
+    #[test]
+    fn codex_websocket_response_completed_without_usage_does_not_replace_metrics() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "input", 100.0)],
+        ));
+
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.websocket_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("success", "true"),
+                kv_str("duration_ms", "243"),
+            ],
+        ));
+
+        assert_eq!(count, 0);
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "cached_input", 50.0)],
+        ));
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+    }
+
     #[test]
     fn codex_conversation_start_event_name_only_registers_session() {
         let agg = Aggregator::new();
@@ -2561,6 +2600,61 @@ mod tests {
             agent.total.cache_read_tokens, 0,
             "metric は cached_input を持たないため、span の cache を勝手に足さない"
         );
+    }
+
+    /// 実ログの `session_task.turn` span には `codex.turn.token_usage.*` が載るが、
+    /// 同じ値は `codex.turn.token_usage` metric と `codex.sse_event` 完了ログにも現れる。
+    /// trace span は source of truth にせず、metric/log 経路だけを計上する。
+    #[test]
+    fn codex_session_task_turn_span_usage_does_not_double_count_metric() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.5", "input", 100.0),
+                codex_token_metric("gpt-5.5", "output", 20.0),
+                codex_token_metric("gpt-5.5", "cached_input", 64.0),
+                codex_token_metric("gpt-5.5", "reasoning_output", 5.0),
+            ],
+        ));
+
+        let count = agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![opentelemetry_proto::tonic::trace::v1::Span {
+                trace_id: vec![1; 16],
+                span_id: vec![2; 8],
+                trace_state: String::new(),
+                parent_span_id: vec![],
+                flags: 0,
+                name: "session_task.turn".into(),
+                kind: 0,
+                start_time_unix_nano: 1,
+                end_time_unix_nano: 2,
+                attributes: vec![
+                    kv_str("model", "gpt-5.5"),
+                    kv_str("codex.turn.reasoning_effort", "xhigh"),
+                    kv_int("codex.turn.token_usage.input_tokens", 100),
+                    kv_int("codex.turn.token_usage.output_tokens", 20),
+                    kv_int("codex.turn.token_usage.cached_input_tokens", 64),
+                    kv_int("codex.turn.token_usage.reasoning_output_tokens", 5),
+                    kv_int("codex.turn.token_usage.total_tokens", 120),
+                ],
+                dropped_attributes_count: 0,
+                events: vec![],
+                dropped_events_count: 0,
+                links: vec![],
+                dropped_links_count: 0,
+                status: None,
+            }],
+        ));
+
+        assert_eq!(count, 0);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 100);
+        assert_eq!(agent.total.output_tokens, 20);
+        assert_eq!(agent.total.cache_read_tokens, 64);
+        assert_eq!(agent.total.reasoning_output_tokens, 5);
     }
 
     /// 実 CI ログでは同一ジョブ内で複数 conversation が high / xhigh の別 effort で並走する。
