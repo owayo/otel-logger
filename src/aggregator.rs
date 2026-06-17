@@ -21,9 +21,23 @@ const AGENT_CODEX: &str = "codex";
 const SERVICE_CLAUDE: &str = "claude-code";
 const SERVICE_CODEX_TUI: &str = "codex_cli_rs";
 const SERVICE_CODEX_EXEC: &str = "codex_exec";
+/// Codex 0.140.0 以降の Apps Server (`codex_apps` 経由の `codex_app_server` 実行
+/// バイナリ) が送る OTLP の `service.name`。TUI / Exec と同じ
+/// `codex.conversation_starts` / `codex.sse_event` を発行するため、Codex 系の
+/// 集計対象に含める。
+const SERVICE_CODEX_APP_SERVER: &str = "codex-app-server";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_OPENAI: &str = "OpenAI";
 const UNKNOWN: &str = "unknown";
+
+/// OTLP の `service.name` が Codex 系 (TUI / Exec / Apps Server) かを判定する。
+/// 新しい Codex バイナリが増えた場合はここに追加する。
+fn is_codex_service(service: &str) -> bool {
+    matches!(
+        service,
+        SERVICE_CODEX_TUI | SERVICE_CODEX_EXEC | SERVICE_CODEX_APP_SERVER
+    )
+}
 
 /// バケットごとの累計値。エージェントが持たない語彙のフィールドは 0 のままにする
 /// (例: Codex の `cost_usd`、Claude の `reasoning_output_tokens`)。
@@ -280,12 +294,12 @@ impl Aggregator {
                         count += 1;
                         continue;
                     }
-                    if (service == SERVICE_CODEX_TUI || service == SERVICE_CODEX_EXEC)
+                    if is_codex_service(service)
                         && let Some(session) = extract_codex_conversation_starts(log)
                     {
                         update_codex_session(&mut g, session);
                     }
-                    if (service == SERVICE_CODEX_TUI || service == SERVICE_CODEX_EXEC)
+                    if is_codex_service(service)
                         && let Some(parsed) = extract_codex_sse_response_completed(&g, log)
                     {
                         let CodexSseExtraction {
@@ -331,7 +345,7 @@ impl Aggregator {
         let mut session_updates = 0;
         for resource_spans in &req.resource_spans {
             let service = service_name(resource_spans.resource.as_ref());
-            if service != SERVICE_CODEX_TUI && service != SERVICE_CODEX_EXEC {
+            if !is_codex_service(service) {
                 continue;
             }
             for scope_spans in &resource_spans.scope_spans {
@@ -367,27 +381,25 @@ impl Aggregator {
         let mut g = self.inner.write().expect("aggregator lock poisoned");
         for resource_metrics in &req.resource_metrics {
             let service = service_name(resource_metrics.resource.as_ref()).to_string();
+            let service_str = service.as_str();
             for scope_metrics in &resource_metrics.scope_metrics {
                 for metric in &scope_metrics.metrics {
-                    count += match (service.as_str(), metric.name.as_str()) {
-                        (SERVICE_CLAUDE, "claude_code.token.usage") => {
-                            ingest_claude_token(&mut g, metric)
-                        }
-                        (SERVICE_CLAUDE, "claude_code.cost.usage") => {
-                            ingest_claude_cost(&mut g, metric)
-                        }
-                        (SERVICE_CODEX_TUI | SERVICE_CODEX_EXEC, "codex.turn.token_usage") => {
-                            ingest_codex_token(&mut g, metric)
-                        }
-                        (
-                            SERVICE_CODEX_TUI | SERVICE_CODEX_EXEC,
-                            "codex.conversation.turn.count",
-                        ) => ingest_codex_turn_count(&mut g, metric),
-                        (SERVICE_CODEX_TUI | SERVICE_CODEX_EXEC, "codex.turn.e2e_duration_ms") => {
-                            ingest_codex_duration(&mut g, metric)
-                        }
-                        _ => 0,
-                    };
+                    if service_str == SERVICE_CLAUDE {
+                        count += match metric.name.as_str() {
+                            "claude_code.token.usage" => ingest_claude_token(&mut g, metric),
+                            "claude_code.cost.usage" => ingest_claude_cost(&mut g, metric),
+                            _ => 0,
+                        };
+                    } else if is_codex_service(service_str) {
+                        count += match metric.name.as_str() {
+                            "codex.turn.token_usage" => ingest_codex_token(&mut g, metric),
+                            "codex.conversation.turn.count" => {
+                                ingest_codex_turn_count(&mut g, metric)
+                            }
+                            "codex.turn.e2e_duration_ms" => ingest_codex_duration(&mut g, metric),
+                            _ => 0,
+                        };
+                    }
                 }
             }
         }
@@ -2872,5 +2884,151 @@ mod tests {
             .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
             .expect("conv-a の SSE は span で更新された xhigh バケットへ入る");
         assert_eq!(xhigh.stats.input_tokens, 10);
+    }
+
+    /// バグ回帰: Codex 0.140.0+ の Apps Server (`service.name=codex-app-server`)
+    /// から届く `codex.conversation_starts` + `codex.sse_event` を取りこぼさず、
+    /// Codex 系の集計対象として扱う。
+    #[test]
+    fn codex_app_server_logs_are_aggregated() {
+        let agg = Aggregator::new();
+        // session を Apps Server サービスから登録。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_APP_SERVER,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-app-server"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+
+        // SSE 完了ログにも Apps Server サービスがセットされる。
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_APP_SERVER,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-app-server"),
+                kv_str("model", "gpt-5.5"),
+                kv_int("input_token_count", 1000),
+                kv_int("output_token_count", 200),
+                kv_int("cached_token_count", 50),
+                kv_int("reasoning_token_count", 30),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).expect("codex agent");
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("xhigh バケット");
+        assert_eq!(bucket.stats.input_tokens, 1000);
+        assert_eq!(bucket.stats.output_tokens, 200);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 30);
+    }
+
+    /// `codex-app-server` サービスでも tool-only な SSE completion は token usage に
+    /// 加算しない (`input_token_count == tool_token_count` で他が 0 の挙動を維持)。
+    #[test]
+    fn codex_app_server_sse_tool_only_completion_is_ignored() {
+        let agg = Aggregator::new();
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_APP_SERVER,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "23067"),
+                kv_str("output_token_count", "0"),
+                kv_int("cached_token_count", 0),
+                kv_int("reasoning_token_count", 0),
+                kv_str("tool_token_count", "23067"),
+            ],
+        ));
+
+        assert_eq!(count, 0);
+        assert!(!agg.snapshot().agents.contains_key(AGENT_CODEX));
+    }
+
+    /// `codex-app-server` サービスからの `handle_responses` span による
+    /// effort 補完も Codex 系として扱う (現状 metrics は来ないが、将来追加されても
+    /// 集計経路を統一しておく)。
+    #[test]
+    fn codex_app_server_handle_responses_span_is_aggregated() {
+        let agg = Aggregator::new();
+        let updates = agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_APP_SERVER,
+            vec![handle_responses_span_with_attrs(vec![kv_str(
+                "codex.request.reasoning_effort",
+                "xhigh",
+            )])],
+        ));
+        // span だけでは sessions が未登録のため、新しく seed されて 1 件として数えられる。
+        assert_eq!(updates, 1);
+    }
+
+    /// `is_codex_service` は TUI / Exec / Apps Server を Codex として扱い、
+    /// 既存の Claude や未知の service.name は false で弾く。
+    #[test]
+    fn is_codex_service_recognizes_all_codex_binaries() {
+        assert!(is_codex_service(SERVICE_CODEX_TUI));
+        assert!(is_codex_service(SERVICE_CODEX_EXEC));
+        assert!(is_codex_service(SERVICE_CODEX_APP_SERVER));
+        assert!(!is_codex_service(SERVICE_CLAUDE));
+        assert!(!is_codex_service(""));
+        assert!(!is_codex_service("codex-unknown"));
+        // 大小文字違いは別 service として扱う (OTLP exporter 側で正規化される前提)。
+        assert!(!is_codex_service("Codex_Exec"));
+    }
+
+    /// 実ログ形状 (codex-app-server から届く `codex.sse_event`) の最小再現:
+    /// `input_token_count` が `stringValue` で送られても u64 として読み取り、
+    /// xhigh セッションのバケットへ取りこぼさず集計する。
+    #[test]
+    fn codex_app_server_sse_string_input_tokens_are_parsed() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_APP_SERVER,
+            "",
+            vec![
+                kv_str("event.name", "codex.conversation_starts"),
+                kv_str("conversation.id", "conv-string"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        // 実ログ通り stringValue で input/output が送られるケース。
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_APP_SERVER,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-string"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "1234"),
+                kv_str("output_token_count", "56"),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let bucket = snap
+            .agents
+            .get(AGENT_CODEX)
+            .unwrap()
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect("xhigh バケット");
+        assert_eq!(bucket.stats.input_tokens, 1234);
+        assert_eq!(bucket.stats.output_tokens, 56);
     }
 }
