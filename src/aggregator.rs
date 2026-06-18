@@ -1011,7 +1011,11 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
     // 別 conversation の last session を上書きすると、conversation.id を持たない後続 metric の
     // effort バケットが無関係な conversation に引きずられる (AGENTS.md の方針)。conversation.id
     // が無い古い span、または last session が同じ conversation のときだけ last を更新する。
+    // ただし `codex_last_session` が None の初回 seed は上書きにあたらず、ここで設定しないと
+    // conversation.id を持たない後続 metric が effort=unknown に落ちてしまうため、id 付き span
+    // でも last を seed する (上書き対象の別 conversation が存在しないので方針には反しない)。
     let update_last = conversation_id.is_none()
+        || g.codex_last_session.is_none()
         || g.codex_last_session
             .as_ref()
             .is_some_and(|last| last.conversation_id == session.conversation_id);
@@ -3030,5 +3034,47 @@ mod tests {
             .expect("xhigh バケット");
         assert_eq!(bucket.stats.input_tokens, 1234);
         assert_eq!(bucket.stats.output_tokens, 56);
+    }
+
+    /// バグ回帰: `codex_last_session` が None の初回 seed では、`conversation.id` 付きの
+    /// `handle_responses` span でも last session を更新する。これを怠ると、後続の
+    /// conversation.id を持たない metric が `codex_last_session=None` のせいで
+    /// `effort=unknown` バケットへ落ち、span から拾えた effort 情報が失われる。
+    /// 別 conversation の上書きを防ぐ既存方針 (codex_handle_responses_span_with_conversation_id_keeps_last_session)
+    /// は、last session が None でない場合のみ適用するのが正しい。
+    #[test]
+    fn codex_handle_responses_span_with_conversation_id_seeds_empty_last_session() {
+        let agg = Aggregator::new();
+        // 初回の handle_responses span が conversation.id=conv-a/effort=xhigh を運ぶ。
+        // conversation_starts は未着、codex_last_session も None の状態。
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("conversation.id", "conv-a"),
+                kv_str("codex.request.reasoning_effort", "xhigh"),
+            ])],
+        ));
+        // 続けて conversation.id を持たない metric が届く。last session を初回 seed
+        // できていれば xhigh バケットへ入り、できていなければ unknown バケットへ落ちる。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-5.5", "input", 42.0)],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let xhigh = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+            .expect(
+                "conversation.id 付き初回 span が last session を seed して xhigh で計上される",
+            );
+        assert_eq!(xhigh.stats.input_tokens, 42);
+        // unknown バケットに漏れていないこと (last session 未 seed のとき発生する旧バグ)。
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/unknown"))
+        );
     }
 }
