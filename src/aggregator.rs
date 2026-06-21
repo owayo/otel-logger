@@ -896,15 +896,30 @@ fn merge_codex_unknown_effort(
         return;
     }
     if !conversation_id.is_empty() {
-        let key = UnknownEffortKey {
-            provider: from.provider.clone(),
-            model: from.model.clone(),
-            conversation_id: conversation_id.to_string(),
-        };
-        let Some(pending) = g.codex_unknown_effort_sse.remove(&key) else {
+        // SSE が session 未着のまま届いた場合、pending エントリは
+        // `codex_provider_from_session(None)` のデフォルト (OpenAI) で keyed され
+        // ている。後で conversation_starts が別 provider (例: azure /
+        // openai-compatible custom endpoint) で到着すると、`provider=session の
+        // provider` だけで lookup すると miss して pending が残り続け、
+        // SSE 時に積んだ `OpenAI/model/unknown` バケットの値も移動できない。
+        // そこで `(model, conversation_id)` でマッチするすべての pending を
+        // 取得し、各 from バケット (pending エントリが指す provider) から
+        // to バケット (session の provider + 正しい effort) へ個別に移す。
+        let matching: Vec<(UnknownEffortKey, ModelStats)> = g
+            .codex_unknown_effort_sse
+            .iter()
+            .filter(|(k, _)| k.model == from.model && k.conversation_id == conversation_id)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if matching.is_empty() {
             return;
-        };
-        move_codex_bucket_stats(g, &from, &to, &pending);
+        }
+        for (key, pending) in matching {
+            let actual_from =
+                Bucket::from_parts(key.provider.clone(), key.model.clone(), UNKNOWN.to_string());
+            g.codex_unknown_effort_sse.remove(&key);
+            move_codex_bucket_stats(g, &actual_from, &to, &pending);
+        }
         return;
     }
     // conversation_id が空: 古い telemetry 互換。unknown バケットの残り全体を新 effort へ移す。
@@ -3075,6 +3090,60 @@ mod tests {
             !agent
                 .buckets
                 .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/unknown"))
+        );
+    }
+
+    /// バグ回帰: SSE 完了ログが session 未着のまま到着すると、pending エントリは
+    /// `codex_provider_from_session(None)` のデフォルト (OpenAI) で keyed される。
+    /// 後で conversation_starts が非デフォルト provider (Azure / openai-compatible
+    /// custom endpoint) で届いた場合、旧実装は `provider=session の provider` だけで
+    /// pending を引いていたため lookup が miss し、unknown バケットの値が永久に残った。
+    /// 修正後は `(model, conversation_id)` でマッチする pending すべてを取得し、
+    /// 各 from バケットから to バケットへ移動する。
+    #[test]
+    fn codex_late_session_with_nondefault_provider_moves_pending() {
+        let agg = Aggregator::new();
+        // 先に SSE 完了ログを受ける。session は未着なので、pending は
+        // OpenAI/gpt-5.5/unknown バケットへ計上され、key は
+        // UnknownEffortKey{provider=OpenAI, model=gpt-5.5, conversation_id=conv-x}。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-x"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+        // 後から conversation_starts が provider_name=azure で届く。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-x"),
+                kv_str("provider_name", "azure"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        // pending が move されて azure/gpt-5.5/high バケットに移っているはず。
+        let bucket = agent
+            .buckets
+            .get("azure/gpt-5.5/high")
+            .expect("azure/gpt-5.5/high バケットへ移動しているはず");
+        assert_eq!(bucket.stats.input_tokens, 100);
+        // SSE 時に計上された OpenAI/gpt-5.5/unknown バケットは空になり、
+        // 0 値で残らないこと (move_codex_bucket_stats が空になったら削除する)。
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}")),
+            "SSE 時の OpenAI/gpt-5.5/unknown バケットは pending の移動後に空になり削除されるべき"
         );
     }
 }

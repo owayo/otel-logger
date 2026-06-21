@@ -74,7 +74,7 @@ toml = "1.1.2"
 # その他
 anyhow = "1.0.102"
 thiserror = "2.0.18"
-time = { version = "0.3.47", features = ["formatting", "macros"] }
+time = { version = "0.3.49", features = ["formatting", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 is-terminal = "0.4.17"
