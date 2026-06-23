@@ -113,7 +113,7 @@ otel-logger [OPTIONS]
 | `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP bind address (OTLP/HTTP, both protobuf and JSON)    |
 | `--log-file`   |       | (none)           | `OTEL_LOGGER_LOG_FILE`    | Append received telemetry as JSON Lines (mutually exclusive with `--log-dir`) |
 | `--log-dir`    |       | (none)           | `OTEL_LOGGER_LOG_DIR`     | Write daily-rotated JSONL into this directory: `otel-logger.YYYY-MM-DD` (local time) |
-| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of rotated JSONL to keep when `--log-dir` is used   |
+| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of rotated JSONL to keep when `--log-dir` is used (`0` is clamped to a 1-day minimum) |
 | `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | Suppress the human-readable stdout stream                |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary when usage totals change |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |

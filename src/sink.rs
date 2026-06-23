@@ -265,13 +265,17 @@ fn open_log_file_sync(path: &Path) -> Result<StdBufWriter<std::fs::File>> {
 fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<LogRoller> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create log directory {}", dir.display()))?;
-    cleanup_old_rotated_logs(dir, keep_days)
+    // cleanup と log roller の保持数を同じ最小 1 日に揃える。
+    // `--log-keep-days 0` が来た時に cutoff = now() となり全 rotated file が
+    // 削除されてしまうのを防ぐ。log roller 側も `max_keep_files(0)` だと
+    // 直後の rotation で新規ファイル自身を削除しに行くため最低 1 を要求する。
+    let max_keep = keep_days.max(1);
+    cleanup_old_rotated_logs(dir, max_keep)
         .with_context(|| format!("cleanup old log files in {}", dir.display()))?;
-    let max_keep = keep_days.max(1) as u64;
     let appender = LogRollerBuilder::new(dir, Path::new(ROTATION_PREFIX))
         .rotation(Rotation::AgeBased(RotationAge::Daily))
         .time_zone(TimeZone::Local)
-        .max_keep_files(max_keep)
+        .max_keep_files(u64::from(max_keep))
         .build()
         .map_err(|e| anyhow::anyhow!("build log roller: {e}"))?;
     Ok(appender)
@@ -405,6 +409,26 @@ mod tests {
         let times = std::fs::FileTimes::new().set_modified(when);
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_times(times).unwrap();
+    }
+
+    /// 回帰テスト: `--log-keep-days 0` で起動した場合に rotated JSONL を全削除しないこと。
+    /// `open_rotated_sync` が cleanup と log roller の両方で `max(1)` を適用するため、
+    /// cleanup 側も最低 1 日は保持して新規 file が即削除されない挙動を担保する。
+    #[test]
+    fn open_rotated_sync_with_zero_keep_days_retains_recent_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let recent = dir.path().join("otel-logger.2099-01-01");
+        std::fs::write(&recent, "recent").unwrap();
+        // mtime をほぼ現在にしておけば、`keep_days.max(1)` 経由で残るはず。
+        touch_mtime(&recent, SystemTime::now() - Duration::from_secs(60));
+
+        let roller = open_rotated_sync(dir.path(), 0).expect("roller を構築できる");
+        drop(roller);
+
+        assert!(
+            recent.exists(),
+            "keep_days=0 でも mtime が新しい rotated file は残る"
+        );
     }
 
     #[test]
