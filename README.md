@@ -49,7 +49,7 @@ the agent emits during a CI job and surface it where developers already look.
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - Recognises every Codex binary via `service.name` (TUI `codex_cli_rs`, Exec `codex_exec`, Apps Server `codex-app-server` from Codex 0.140.0+) so Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
-  - For Codex, SSE `response.completed` logs are the preferred token source when present; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` are not counted as separate usage
+  - For Codex, SSE `response.completed` logs are the preferred token source when present; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
   - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's. If the late `codex.conversation_starts` arrives with a non-default `provider_name` (Azure or other openai-compatible endpoints), pending entries keyed under the SSE-time default provider are still located by `(model, conversation_id)` and moved from their original provider bucket to the session's provider bucket
   - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
   - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
@@ -344,6 +344,9 @@ Real logs also include tool-only `response.completed` events where
 `input_token_count == tool_token_count` and output/cache/reasoning are all
 zero; Codex excludes those from turn metrics and `handle_responses` span
 usage, so `otel-logger` does not count them as token usage.
+`session_task.turn` / `session_task.review` spans can also carry
+`codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
+spans are not used as token sources.
 If Codex token logs arrive before `conversation_starts`, the temporary
 `effort=unknown` bucket is folded into the later provider/model/effort bucket
 when the session metadata arrives.

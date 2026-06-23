@@ -2688,6 +2688,60 @@ mod tests {
         assert_eq!(agent.total.reasoning_output_tokens, 5);
     }
 
+    /// 実ログでは `session_task.review` span にも `codex.turn.token_usage.*` が載る。
+    /// `session_task.turn` と同じく trace span は source of truth にしない。
+    #[test]
+    fn codex_session_task_review_span_usage_does_not_double_count_metric() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.5", "input", 100.0),
+                codex_token_metric("gpt-5.5", "output", 20.0),
+                codex_token_metric("gpt-5.5", "cached_input", 64.0),
+                codex_token_metric("gpt-5.5", "reasoning_output", 5.0),
+            ],
+        ));
+
+        let count = agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![opentelemetry_proto::tonic::trace::v1::Span {
+                trace_id: vec![1; 16],
+                span_id: vec![2; 8],
+                trace_state: String::new(),
+                parent_span_id: vec![],
+                flags: 0,
+                name: "session_task.review".into(),
+                kind: 0,
+                start_time_unix_nano: 1,
+                end_time_unix_nano: 2,
+                attributes: vec![
+                    kv_str("model", "gpt-5.5"),
+                    kv_str("codex.turn.reasoning_effort", "xhigh"),
+                    kv_int("codex.turn.token_usage.input_tokens", 100),
+                    kv_int("codex.turn.token_usage.output_tokens", 20),
+                    kv_int("codex.turn.token_usage.cached_input_tokens", 64),
+                    kv_int("codex.turn.token_usage.reasoning_output_tokens", 5),
+                    kv_int("codex.turn.token_usage.total_tokens", 120),
+                ],
+                dropped_attributes_count: 0,
+                events: vec![],
+                dropped_events_count: 0,
+                links: vec![],
+                dropped_links_count: 0,
+                status: None,
+            }],
+        ));
+
+        assert_eq!(count, 0);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 100);
+        assert_eq!(agent.total.output_tokens, 20);
+        assert_eq!(agent.total.cache_read_tokens, 64);
+        assert_eq!(agent.total.reasoning_output_tokens, 5);
+    }
+
     /// 実 CI ログでは同一ジョブ内で複数 conversation が high / xhigh の別 effort で並走する。
     /// `conversation.id` 単位で effort を引き当て、それぞれ別バケットへ正しく計上できること。
     #[test]
