@@ -48,7 +48,7 @@ axum = { version = "0.8.9", default-features = false, features = [
     "original-uri",
     "query",
 ] }
-bytes = "1.11.1"
+bytes = "1.12.0"
 http = "1.4.2"
 
 # 非同期 runtime
