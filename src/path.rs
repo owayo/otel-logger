@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// 先頭の `~` / `~/` を現在ユーザーの `$HOME` に展開する。
@@ -20,13 +21,14 @@ pub(crate) fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
     if home.as_os_str().is_empty() {
         return path;
     }
-    let Some(s) = path.to_str() else {
-        return path;
-    };
-    if s == "~" {
+    // `path.to_str()` に頼ると、非 UTF-8 バイトを含むパス (Unix の `OsStr`) では
+    // `to_str()` が `None` を返して `~` 展開が無音で抜け、ドキュメントの契約に反して
+    // CWD 直下へ `~` ディレクトリを作ってしまう。`OsStr` のまま component 単位で判定し、
+    // 非 UTF-8 パスでも先頭 `~` / `~/` を展開する。
+    if path.as_os_str() == OsStr::new("~") {
         return home.to_path_buf();
     }
-    if let Some(rest) = s.strip_prefix("~/") {
+    if let Ok(rest) = path.strip_prefix("~/") {
         return home.join(rest);
     }
     path
@@ -71,6 +73,18 @@ mod tests {
             expand_user_path(PathBuf::from("~/tmp"), None),
             PathBuf::from("~/tmp"),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_user_path_expands_non_utf8_paths() {
+        // 非 UTF-8 バイト (0xFF) を含む `~/...` でも展開する。`to_str()` ベースの実装では
+        // ここで展開が抜け、CWD 直下に `~` を作ってしまっていた (回帰防止)。
+        use std::os::unix::ffi::OsStrExt;
+        let home = PathBuf::from("/Users/alice");
+        let raw = PathBuf::from(OsStr::from_bytes(&[b'~', b'/', b'x', 0xFF]));
+        let expected = home.join(OsStr::from_bytes(&[b'x', 0xFF]));
+        assert_eq!(expand_user_path(raw, Some(&home)), expected);
     }
 
     #[test]
