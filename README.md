@@ -271,7 +271,7 @@ jobs:
           - 4317:4317
           - 4318:4318
         options: >-
-          --health-cmd "/usr/local/bin/otel-logger --dry-run"
+          --health-cmd "/usr/local/bin/otel-logger --dry-run --grpc-addr 127.0.0.1:0 --http-addr 127.0.0.1:0 --no-stdout"
           --health-interval 10s
           --health-timeout 3s
           --health-retries 3
@@ -404,9 +404,10 @@ $ curl -s http://localhost:4318/stats | jq
 }
 ```
 
-Bucket keys are formatted as `provider/model/effort`. Codex's `cost_usd` is
-always `0` because the OpenAI/ChatGPT side does not emit cost. This endpoint
-is always available — no flag required.
+Bucket keys are formatted as `provider/model/effort`; `/` and `%` inside each
+component are percent-encoded as `%2F` and `%25` so arbitrary telemetry labels
+cannot collide. Codex's `cost_usd` is always `0` because the OpenAI/ChatGPT
+side does not emit cost. This endpoint is always available — no flag required.
 
 ### `--summary` (stdout, opt-in)
 

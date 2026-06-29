@@ -247,7 +247,7 @@ jobs:
           - 4317:4317
           - 4318:4318
         options: >-
-          --health-cmd "/usr/local/bin/otel-logger --dry-run"
+          --health-cmd "/usr/local/bin/otel-logger --dry-run --grpc-addr 127.0.0.1:0 --http-addr 127.0.0.1:0 --no-stdout"
           --health-interval 10s
           --health-timeout 3s
           --health-retries 3
@@ -349,7 +349,7 @@ $ curl -s http://localhost:4318/stats | jq
 }
 ```
 
-bucket key は `provider/model/effort` 形式です。Codex 側は ChatGPT / OpenAI が cost を出さないため `cost_usd` は常に `0` です。フラグ無しで常に取得できます。
+bucket key は `provider/model/effort` 形式です。各 component 内の `/` と `%` は、それぞれ `%2F` / `%25` に percent-encode されるため、任意の telemetry label が別 bucket と衝突しません。Codex 側は ChatGPT / OpenAI が cost を出さないため `cost_usd` は常に `0` です。フラグ無しで常に取得できます。
 
 ### `--summary` (stdout、opt-in)
 

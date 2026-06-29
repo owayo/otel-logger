@@ -138,8 +138,27 @@ impl Bucket {
 
     /// シリアライズ出力で使う安定したキー: `provider/model/effort`。
     fn key(&self) -> String {
-        format!("{}/{}/{}", self.provider, self.model, self.effort)
+        format!(
+            "{}/{}/{}",
+            escape_bucket_component(&self.provider),
+            escape_bucket_component(&self.model),
+            escape_bucket_component(&self.effort)
+        )
     }
+}
+
+fn escape_bucket_component(component: &str) -> String {
+    // provider/model/effort は外部 telemetry 由来なので `/` を含みうる。
+    // 区切り文字と衝突しないよう、`%` も含めて最小限の percent-encode を行う。
+    let mut escaped = String::with_capacity(component.len());
+    for c in component.chars() {
+        match c {
+            '%' => escaped.push_str("%25"),
+            '/' => escaped.push_str("%2F"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn non_empty(s: String) -> String {
@@ -1294,6 +1313,16 @@ mod tests {
         assert_eq!(stats.duration_ms, u64::MAX);
         assert!(stats.cost_usd.is_finite(), "cost_usd は Infinity にしない");
         assert_eq!(stats.cost_usd, f64::MAX);
+    }
+
+    #[test]
+    fn bucket_key_escapes_separator_components() {
+        let bucket = Bucket::from_parts("Open/AI", "gpt%5/mini", "x/high");
+        assert_eq!(bucket.key(), "Open%2FAI/gpt%255%2Fmini/x%2Fhigh");
+
+        let model_with_slash = Bucket::from_parts("OpenAI", "a/b", "c");
+        let provider_with_slash = Bucket::from_parts("OpenAI/a", "b", "c");
+        assert_ne!(model_with_slash.key(), provider_with_slash.key());
     }
 
     fn kv(key: &str, value: AnyValue) -> KeyValue {

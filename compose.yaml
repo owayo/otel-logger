@@ -36,7 +36,19 @@ services:
       - --color
       - never
     healthcheck:
-      test: ["CMD", "/usr/local/bin/otel-logger", "--dry-run"]
+      # メインプロセスが 4317/4318 を bind 済みなので、healthcheck の dry-run は
+      # ephemeral port で起動検証する。既定 port のままだと正常稼働中ほど bind に失敗する。
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/otel-logger",
+          "--dry-run",
+          "--grpc-addr",
+          "127.0.0.1:0",
+          "--http-addr",
+          "127.0.0.1:0",
+          "--no-stdout",
+        ]
       interval: 10s
       timeout: 3s
       retries: 3
