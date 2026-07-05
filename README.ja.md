@@ -28,7 +28,7 @@
 OTLP/gRPC を `:4317`、OTLP/HTTP を `:4318` で受け、Traces / Metrics / Logs をデコードして 2 つの経路に出力します。
 
 - **stdout**: 1 件ずつ整形した可読ログ (CI ログでそのまま読める)
-- **JSON Lines** (`--log-file`): 元の OTLP 構造を欠落させない永続化先
+- **JSON Lines** (`--log-file` / `--log-dir`): 元の OTLP 構造を欠落させない永続化先。単一の追記ファイルまたは日次ローテーションファイルとして保存
 
 Jaeger や Honeycomb への転送は行いません。CI 実行中にエージェントが吐くテレメトリを、開発者がいつも見ている場所 (CI ログ / アーティファクト) に出すことだけを目的にしています。
 
@@ -38,7 +38,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - HTTP は `application/x-protobuf` と `application/json` の両方を受信
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
   - 受信した payload の動的ラベルや属性キーに ANSI escape / C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
-- JSON Lines は graceful shutdown 時に `fsync`
+- JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存し、graceful shutdown 時に `fsync`
   - JSONL の永続化に失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)
   - 累計使用量は JSONL 永続化に成功してから更新するため、retry された batch を二重計上しない
   - 各 batch は ACK 前に `BufWriter::flush` で kernel まで書き出すため、process crash で末尾の write がメモリバッファに取り残されることがない

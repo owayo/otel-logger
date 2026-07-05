@@ -24,7 +24,7 @@ cargo build --release
 ## 実装上の注意
 
 - 受信した OTLP payload は JSON Lines で欠落なく保存する方針を守る。JSONL 書き込みに失敗した場合は HTTP 5xx / gRPC `Status::internal` を返し、OTLP exporter 側に retry させる (`sink::Sink::record` の戻り値経由)。累計使用量は JSONL 永続化に成功した batch だけを集計し、retry 対象を二重計上しない。stdout への pretty 出力はベストエフォートで、失敗してもログだけ残して継続する。
-- JSONL `write_line` は batch ごとに `BufWriter::flush` を呼び、ACK 時点で kernel に書き渡しておく。`sync_all` まで毎回呼ぶと throughput が落ちるため、disk 確定は graceful shutdown 時の `flush()` (= file の場合 `sync_all`) に委ねる。これで小さい batch がメモリバッファに留まったまま process crash で消える事故を防ぐ。
+- JSONL `write_line` は batch ごとに `BufWriter::flush` / `LogRoller::flush` を呼び、ACK 時点で kernel に書き渡しておく。`sync_all` まで毎回呼ぶと throughput が落ちるため、disk 確定は graceful shutdown 時の `flush()` (= file の場合 `sync_all`) に委ねる。これで小さい batch がメモリバッファに留まったまま process crash で消える事故を防ぐ。writer の構造を変える場合は、単体ファイル経路だけでなく `record_persists_payload_to_rotated_directory_sink` で `log-dir` 経路も必ず確認する。
 - Claude の API request ログには token/cost が含まれ、metrics より新しい分まで即時に届くことがある。累計統計では同じ model/effort のログが見えたらログ側を token/cost source として採用し、先に計上した metrics 分は取り消して二重計上を避ける。
 - Claude / Codex の累計統計は二重計上を避ける。特に Codex は SSE 完了ログと turn metrics の両方に token usage が出るため、model ごとに片方だけを token source として採用する。
 - Codex の SSE 完了ログで `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only event は、turn metrics / `handle_responses` span usage と合わせるため token usage に加算しない。

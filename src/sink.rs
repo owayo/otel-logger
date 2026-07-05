@@ -42,7 +42,7 @@ impl TelemetryRecord {
 /// どちらも内部は同期的な `std::io::Write` なので、書き込みは `spawn_blocking` 上で行う。
 enum JsonlWriter {
     File(StdMutex<StdBufWriter<std::fs::File>>),
-    Roller(StdMutex<LogRoller>),
+    Roller(Box<StdMutex<LogRoller>>),
     #[cfg(test)]
     Fail,
 }
@@ -132,7 +132,7 @@ impl Sink {
                     tokio::task::spawn_blocking(move || open_rotated_sync(&dir, keep_days))
                         .await
                         .context("join open_rotated task")??;
-                Some(JsonlWriter::Roller(StdMutex::new(roller)))
+                Some(JsonlWriter::Roller(Box::new(StdMutex::new(roller))))
             }
         };
 
@@ -477,6 +477,19 @@ mod tests {
         }
     }
 
+    fn settings_with_log_dir(dir: std::path::PathBuf) -> crate::cli::Settings {
+        use crate::cli::{ColorMode, LogSink};
+        crate::cli::Settings {
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            log_sink: Some(LogSink::Directory { dir, keep_days: 1 }),
+            no_stdout: true,
+            summary: false,
+            color: ColorMode::Never,
+            dry_run: false,
+        }
+    }
+
     /// 正常系: JSONL writer が成功すれば `record` は Ok を返し、ファイルに 1 行追記される。
     #[tokio::test]
     async fn record_persists_payload_and_returns_ok() {
@@ -498,6 +511,45 @@ mod tests {
         assert!(
             body.contains("\"kind\":\"logs\""),
             "JSON Lines に追記される"
+        );
+        assert!(body.ends_with('\n'), "各レコードは改行で終わる");
+    }
+
+    /// 日次ローテーション出力でも `JsonlWriter::Roller` 経由で payload を欠落なく保存できること。
+    /// `LogRoller` はサイズが大きいため enum 内では間接化しているが、書き込み動作は同じ。
+    #[tokio::test]
+    async fn record_persists_payload_to_rotated_directory_sink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink = Sink::from_settings(&settings_with_log_dir(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![],
+        };
+        sink.record(TelemetryRecord::Logs(Box::new(req)))
+            .await
+            .expect("directory sink でも record で永続化に成功すること");
+        sink.flush().await.unwrap();
+
+        let rotated_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_rotated_log_filename)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rotated_files.len(),
+            1,
+            "日次ローテーションファイルが 1 つ作成される"
+        );
+        let body = std::fs::read_to_string(&rotated_files[0]).unwrap();
+        assert!(
+            body.contains("\"kind\":\"logs\""),
+            "rotated JSON Lines に追記される"
         );
         assert!(body.ends_with('\n'), "各レコードは改行で終わる");
     }

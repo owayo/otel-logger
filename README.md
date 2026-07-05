@@ -30,7 +30,7 @@ containers. It accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`, decodes
 traces, metrics, and logs, and writes them in two ways:
 
 - **stdout**: human-readable, color-coded one-liner per record (great for CI logs).
-- **JSON Lines** (`--log-file`): lossless, schema-preserving for offline analysis.
+- **JSON Lines** (`--log-file` / `--log-dir`): lossless, schema-preserving for offline analysis, either as one append-only file or daily-rotated files.
 
 It does **not** forward to Jaeger/Honeycomb/etc. — the goal is to capture what
 the agent emits during a CI job and surface it where developers already look.
@@ -41,7 +41,7 @@ the agent emits during a CI job and surface it where developers already look.
 - Accepts both `application/x-protobuf` and `application/json` on HTTP
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
   - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
-- JSON Lines persistence, `fsync`'d on graceful shutdown
+- JSON Lines persistence to one append-only file or daily-rotated files, `fsync`'d on graceful shutdown
   - Persistence failures surface as HTTP 5xx / gRPC `Status::internal` so OTLP exporters can retry instead of silently dropping payloads
   - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
   - Each batch is `flush`'d to the kernel before ACK so an unexpected crash never leaves the last write trapped in `BufWriter`'s in-memory buffer
