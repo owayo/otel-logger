@@ -36,6 +36,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 
 - OTLP/gRPC (4317) と OTLP/HTTP (4318) を同一プロセスで起動
 - HTTP は `application/x-protobuf` と `application/json` の両方を受信
+  - media type は大文字小文字を区別せず parameter 付きも受理する。非 UTF-8 の不正な `Content-Type` は protobuf へ暗黙フォールバックせず `415 Unsupported Media Type` を返す
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
   - 受信した payload の動的ラベルや属性キーに ANSI escape / C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
 - JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存し、graceful shutdown 時に `fsync`
@@ -45,8 +46,9 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
   - gRPC / HTTP の 1 リクエスト上限を 32 MiB (`tonic` 既定 4 MiB / `axum` 既定 2 MiB より引き上げ) にし、大きな batch を `RESOURCE_EXHAUSTED` / `413` で恒久拒否せず保存する (exporter の retry でも回復できない欠落を防ぐ)
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
   - `service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) すべてを Codex として認識。Apps Server は `codex.turn.*` などの metrics を送らず logs / traces だけを送ってくるため、ここを取りこぼすと Apps Server 経由の token usage が累計から欠落する
+  - provider/model/effort を固定 allowlist で制限せず動的に保持するため、`gpt-5.6-terra` や Fable のような新しい識別子も lossless に記録する
   - Codex は SSE の `response.completed` ログを token source として優先する。usage を持たない WebSocket `response.completed` や、`session_task.turn` / `session_task.review` などの trace span 上に出る同一 usage の別表現は、別 usage として加算しない
-  - Codex で `effort=unknown` に積まれた pending token は `conversation.id` 単位で保留し、対応する `codex.conversation_starts` が後から届いた conversation の分だけを新 effort バケットへ振り替える (並行する別 conversation の token を巻き込まない)。遅れて届いた `codex.conversation_starts` が非デフォルト `provider_name` (Azure や openai-compatible custom endpoint) で来た場合も、SSE 時の既定 provider で keyed された pending を `(model, conversation_id)` で再発見し、元の provider バケットから session の provider バケットへ移す
+  - Codex 0.144.1+ の SSE completion に含まれる `model_reasoning_effort` を直接採用し、session 到着前でも実測した `gpt-5.6-terra` の high/xhigh を保持する。pending usage は provider/model/effort/conversation 単位で保留し、遅れて `codex.conversation_starts` が届いた時は、当該 conversation だけを暫定バケットから確定 effort と非デフォルト provider (Azure や OpenAI-compatible endpoint) へ移す
   - `handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊さない
   - token / duration / cost の属性値や metric 値に NaN / Infinity / 範囲外の巨大な double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの `i64::MAX` / `u64::MAX` 飽和値や `cost_usd=inf` の混入を防ぐ)
   - 累計 counter は saturating arithmetic で加算し、極端な batch が繰り返されても token 合計の wrap や `cost_usd=inf` を起こさない
@@ -56,7 +58,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 
 ## 動作環境
 
-- **OS**: Linux、macOS
+- **OS**: Linux、macOS、Windows
 - **Rust**: 1.88 以上 (ソースからビルドする場合のみ。`tonic 0.14` の MSRV に合わせており、edition 2024 を使用)。同梱の Dockerfile は余裕を持たせて `rust:1.90` を使用
 
 ## インストール

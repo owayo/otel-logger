@@ -59,10 +59,12 @@ impl IntoResponse for HttpError {
 }
 
 fn detect_encoding(headers: &HeaderMap) -> Result<Encoding, HttpError> {
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(PROTOBUF_CT);
+    let ct = match headers.get(header::CONTENT_TYPE) {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| HttpError::UnsupportedContentType("<invalid header value>".to_string()))?,
+        None => PROTOBUF_CT,
+    };
     let primary = ct.split(';').next().unwrap_or(ct).trim();
     // HTTP の media type (type/subtype) は大小文字を区別しない (RFC 9110)。
     // `Application/X-Protobuf` のような表記でも正当な OTLP/HTTP request として受け付け、
@@ -239,6 +241,23 @@ mod tests {
         let err = detect_encoding(&h).unwrap_err();
         match err {
             HttpError::UnsupportedContentType(ct) => assert_eq!(ct, "text/plain"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_encoding_rejects_non_utf8_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_bytes(&[0xFF]).unwrap(),
+        );
+
+        let err = detect_encoding(&headers).unwrap_err();
+        match err {
+            HttpError::UnsupportedContentType(value) => {
+                assert_eq!(value, "<invalid header value>")
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

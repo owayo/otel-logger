@@ -39,6 +39,7 @@ the agent emits during a CI job and surface it where developers already look.
 
 - OTLP/gRPC (4317) and OTLP/HTTP (4318) on the same process
 - Accepts both `application/x-protobuf` and `application/json` on HTTP
+  - Media types are matched case-insensitively with parameters allowed; malformed non-UTF-8 `Content-Type` values return `415 Unsupported Media Type` instead of silently falling back to protobuf
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
   - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
 - JSON Lines persistence to one append-only file or daily-rotated files, `fsync`'d on graceful shutdown
@@ -49,8 +50,9 @@ the agent emits during a CI job and surface it where developers already look.
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - Recognises every Codex binary via `service.name` (TUI `codex_cli_rs`, Exec `codex_exec`, Apps Server `codex-app-server` from Codex 0.140.0+) so Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
+  - Keeps provider/model/effort values dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly
   - For Codex, SSE `response.completed` logs are the preferred token source when present; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
-  - For Codex, pending tokens recorded under `effort=unknown` are tracked per `conversation.id` so a delayed `codex.conversation_starts` only moves the matching conversation's tokens — never another concurrent conversation's. If the late `codex.conversation_starts` arrives with a non-default `provider_name` (Azure or other openai-compatible endpoints), pending entries keyed under the SSE-time default provider are still located by `(model, conversation_id)` and moved from their original provider bucket to the session's provider bucket
+  - Codex 0.144.1+ `model_reasoning_effort` on SSE completions is used directly, preserving observed `gpt-5.6-terra` high/xhigh usage even before its session arrives. Pending usage is tracked by provider/model/effort/conversation, so a delayed `codex.conversation_starts` moves only that conversation from its provisional bucket to the confirmed effort and non-default provider (Azure or another OpenAI-compatible endpoint)
   - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
   - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
   - Cumulative counters use saturating arithmetic, so repeated extreme batches cannot wrap token totals or turn cost into `Infinity`
@@ -60,7 +62,7 @@ the agent emits during a CI job and surface it where developers already look.
 
 ## Requirements
 
-- **Runtime OS**: Linux, macOS
+- **Runtime OS**: Linux, macOS, Windows
 - **Rust**: 1.88+ (only when building from source — `tonic 0.14` requires it; uses edition 2024). The bundled Dockerfile uses `rust:1.90` to stay ahead of the floor.
 
 ## Installation
