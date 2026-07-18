@@ -530,7 +530,6 @@ mod tests {
         sink.record(TelemetryRecord::Logs(Box::new(req)))
             .await
             .expect("directory sink でも record で永続化に成功すること");
-        sink.flush().await.unwrap();
 
         let rotated_files = std::fs::read_dir(dir.path())
             .unwrap()
@@ -552,6 +551,9 @@ mod tests {
             "rotated JSON Lines に追記される"
         );
         assert!(body.ends_with('\n'), "各レコードは改行で終わる");
+
+        // ACK 時点の batch flush とは別に、graceful shutdown の最終 flush も成功すること。
+        sink.flush().await.unwrap();
     }
 
     #[tokio::test]

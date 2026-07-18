@@ -74,13 +74,13 @@ toml = "1.1.2"
 # その他
 anyhow = "1.0.103"
 thiserror = "2.0.18"
-time = { version = "0.3.51", features = ["formatting", "macros"] }
+time = { version = "0.3.53", features = ["formatting", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 is-terminal = "0.4.17"
 
 # JSONL 出力の日次ローテーション (claw-hooks と揃える)。
-logroller = "0.1.11"
+logroller = "0.1.12"
 
 [dev-dependencies]
 tempfile = "3.27.0"

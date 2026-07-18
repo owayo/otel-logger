@@ -220,11 +220,11 @@ struct AggregatorInner {
     /// Claude は API request ログと metrics の両方に token/cost を持つ。
     /// ログは request_id 単位で即時に届き、metrics より新しい分まで含むため、
     /// ログが見えた model/effort ではログを token source として採用する。
-    claude_usage_sources: HashMap<String, ClaudeUsageSource>,
+    claude_usage_sources: HashMap<ClaudeUsageKey, ClaudeUsageSource>,
 
     /// metrics を先に計上した後で同じ model/effort の API request ログが届いた場合に、
     /// 二重計上を避けるため取り消す metrics 側の累計 usage。
-    claude_metric_usage: HashMap<String, ModelStats>,
+    claude_metric_usage: HashMap<ClaudeUsageKey, ModelStats>,
 
     /// `codex.conversation_starts` の log/event から最後に観測した Codex セッション情報。
     /// Codex metrics には `reasoning_effort` が載らないため、直近のセッション値に
@@ -269,6 +269,12 @@ struct CodexSession {
 enum CodexTokenSource {
     Logs,
     Metrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClaudeUsageKey {
+    model: String,
+    effort: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,13 +863,12 @@ fn codex_token_source_key(model: &str) -> String {
     non_empty(model.to_string())
 }
 
-fn claude_usage_source_key(model: &str, effort: &str) -> String {
+fn claude_usage_source_key(model: &str, effort: &str) -> ClaudeUsageKey {
     let bare_model = model.split_once('[').map(|(bare, _)| bare).unwrap_or(model);
-    format!(
-        "{}/{}",
-        non_empty(bare_model.to_string()),
-        non_empty(effort.to_string())
-    )
+    ClaudeUsageKey {
+        model: non_empty(bare_model.to_string()),
+        effort: non_empty(effort.to_string()),
+    }
 }
 
 fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
@@ -936,9 +941,18 @@ fn merge_codex_pending_sse(
         for (key, pending) in matching {
             let actual_from =
                 Bucket::from_parts(key.provider.clone(), key.model.clone(), key.effort.clone());
+            // response に最も近い SSE 自身の effort を優先し、SSE が unknown の場合だけ
+            // 遅着した session の effort で補完する。
+            let resolved_effort = if key.effort == UNKNOWN {
+                effort.to_string()
+            } else {
+                key.effort.clone()
+            };
+            let actual_to =
+                Bucket::from_parts(provider.to_string(), key.model.clone(), resolved_effort);
             g.codex_pending_sse.remove(&key);
-            if actual_from != to {
-                move_codex_bucket_stats(g, &actual_from, &to, &pending);
+            if actual_from != actual_to {
+                move_codex_bucket_stats(g, &actual_from, &actual_to, &pending);
             }
         }
         return;
@@ -1096,27 +1110,25 @@ fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
 fn merge_bare_into_full(agent_stats: &mut AgentStats, bare: &str, full: &str) {
     let bare_keys: Vec<String> = agent_stats
         .buckets
-        .keys()
-        .filter(|k| {
-            let parts: Vec<&str> = k.splitn(3, '/').collect();
-            parts.len() == 3 && parts[1] == bare
-        })
-        .cloned()
+        .iter()
+        .filter(|(_, bucket)| bucket.model == bare)
+        .map(|(key, _)| key.clone())
         .collect();
     for bare_key in bare_keys {
         let Some(bare_stats) = agent_stats.buckets.remove(&bare_key) else {
             continue;
         };
-        let full_key = bare_key.replacen(&format!("/{bare}/"), &format!("/{full}/"), 1);
+        // bucket key は外部入力の `/` と `%` を percent-encode しているため、文字列を
+        // 分解・置換せず、保持している構造化 metadata から完全名の key を再生成する。
+        let full_bucket = Bucket::from_parts(
+            bare_stats.provider.clone(),
+            full.to_string(),
+            bare_stats.effort.clone(),
+        );
         let entry = agent_stats
             .buckets
-            .entry(full_key)
-            .or_insert_with(|| BucketStats {
-                provider: bare_stats.provider.clone(),
-                model: full.to_string(),
-                effort: bare_stats.effort.clone(),
-                stats: ModelStats::default(),
-            });
+            .entry(full_bucket.key())
+            .or_insert_with(|| BucketStats::from_bucket(&full_bucket));
         entry.stats.add(&bare_stats.stats);
     }
 }
@@ -1328,6 +1340,14 @@ mod tests {
         let model_with_slash = Bucket::from_parts("OpenAI", "a/b", "c");
         let provider_with_slash = Bucket::from_parts("OpenAI/a", "b", "c");
         assert_ne!(model_with_slash.key(), provider_with_slash.key());
+    }
+
+    #[test]
+    fn claude_usage_source_key_keeps_model_and_effort_separate() {
+        let model_with_slash = claude_usage_source_key("vendor/model", "max");
+        let effort_with_slash = claude_usage_source_key("vendor", "model/max");
+
+        assert_ne!(model_with_slash, effort_with_slash);
     }
 
     fn kv(key: &str, value: AnyValue) -> KeyValue {
@@ -1727,6 +1747,38 @@ mod tests {
             .buckets
             .get("anthropic/claude-opus-4-7[1m]/max")
             .unwrap();
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.duration_ms, 1000);
+        assert_eq!(bucket.stats.input_tokens, 7);
+    }
+
+    #[test]
+    fn claude_log_then_metric_folds_separator_model_into_full() {
+        let agg = Aggregator::new();
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "vendor/model"),
+                kv_str("effort", "max"),
+                kv_int("duration_ms", 1000),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+
+        let metric_req = make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric("vendor/model[1m]", "max", "input", 7)],
+        );
+        agg.ingest_metrics(&metric_req);
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bare = Bucket::from_parts(PROVIDER_ANTHROPIC, "vendor/model", "max");
+        let full = Bucket::from_parts(PROVIDER_ANTHROPIC, "vendor/model[1m]", "max");
+
+        assert!(!agent.buckets.contains_key(&bare.key()));
+        let bucket = agent.buckets.get(&full.key()).unwrap();
         assert_eq!(bucket.stats.request_count, 1);
         assert_eq!(bucket.stats.duration_ms, 1000);
         assert_eq!(bucket.stats.input_tokens, 7);
@@ -3226,7 +3278,8 @@ mod tests {
                 kv_str("conversation.id", "conv-x"),
                 kv_str("provider_name", "azure"),
                 kv_str("model", "gpt-5.6-terra"),
-                kv_str("reasoning_effort", "high"),
+                // session より response に近い SSE の high を優先する。
+                kv_str("reasoning_effort", "xhigh"),
             ],
         ));
 
@@ -3238,6 +3291,10 @@ mod tests {
             .get("azure/gpt-5.6-terra/high")
             .expect("azure/gpt-5.6-terra/high バケットへ移動しているはず");
         assert_eq!(bucket.stats.input_tokens, 100);
+        assert!(
+            !agent.buckets.contains_key("azure/gpt-5.6-terra/xhigh"),
+            "session の xhigh で SSE の high を上書きしない"
+        );
         // SSE 時に暫定計上された OpenAI/gpt-5.6-terra/high バケットは空になり、
         // 0 値で残らないこと (move_codex_bucket_stats が空になったら削除する)。
         assert!(
