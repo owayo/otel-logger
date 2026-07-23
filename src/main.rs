@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use otel_logger::cli::{Cli, Commands, Settings};
 use otel_logger::config::{self, Config, InitOutcome};
+use otel_logger::forward;
 use otel_logger::path::expand_current_user_path;
 use otel_logger::server;
 use otel_logger::sink::Sink;
+use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -24,7 +26,23 @@ fn main() -> Result<()> {
         .build()?;
 
     runtime.block_on(async move {
-        let sink = Sink::from_settings(&settings).await?;
+        // proxy 転送が設定されていれば router + worker を先に起動し、Sink に装着する。
+        // shutdown token は server と共有し、Ctrl-C で worker も止める。
+        let proxy_shutdown = CancellationToken::new();
+        let proxy_handle = if let Some(proxy_cfg) = settings.proxy.as_ref() {
+            match forward::spawn_router(proxy_cfg, proxy_shutdown.clone()).await {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to start OTLP proxy workers");
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        let router = proxy_handle.as_ref().map(|h| h.router());
+        let sink = Sink::from_settings_with_proxy(&settings, router).await?;
 
         if settings.dry_run {
             let (grpc, http) = server::probe_binds(settings.grpc_addr, settings.http_addr).await?;
@@ -35,10 +53,21 @@ fn main() -> Result<()> {
                 "dry run: probed both listeners successfully, exiting"
             );
             sink.flush().await?;
+            // dry run でも worker は shutdown を通知して join。
+            proxy_shutdown.cancel();
+            if let Some(handle) = proxy_handle {
+                handle.join().await;
+            }
             return Ok(());
         }
 
-        server::run(settings, sink).await
+        let run_result = server::run(settings, sink).await;
+        // server が終了したので proxy worker にも shutdown を通知して join する。
+        proxy_shutdown.cancel();
+        if let Some(handle) = proxy_handle {
+            handle.join().await;
+        }
+        run_result
     })
 }
 

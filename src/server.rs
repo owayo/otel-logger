@@ -67,8 +67,15 @@ pub async fn shutdown_signal() {
 }
 
 /// cancellation を考慮しながら gRPC + HTTP listener をまとめて動かす。
+///
+/// `sink` は既に proxy router を装着済みでも未装着でも受け付ける。ここでは受信 endpoint
+/// と proxy worker の shutdown を同じ `CancellationToken` で束ねる。
 pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     let shutdown = CancellationToken::new();
+
+    // proxy worker が spawn 済みなら (Sink が router を持っていれば) 、shutdown 時に
+    // join できるように handle を持っておく。ここでは proxy handle は main が持っており、
+    // sink 側は router 参照のみ。worker join は main で行う。
 
     let mut grpc_handle = {
         let sink = sink.clone();

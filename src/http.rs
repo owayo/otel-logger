@@ -173,8 +173,25 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn handle_stats(State(sink): State<Sink>) -> Json<crate::aggregator::UsageSnapshot> {
-    Json(sink.aggregator().snapshot())
+async fn handle_stats(State(sink): State<Sink>) -> Json<StatsResponse> {
+    let usage = sink.aggregator().snapshot();
+    // proxy が設定されていれば route ごとの累計を含めて返す。
+    let proxy = sink.proxy().map(|router| {
+        router
+            .snapshot()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
+    Json(StatsResponse { usage, proxy })
+}
+
+#[derive(serde::Serialize)]
+struct StatsResponse {
+    #[serde(flatten)]
+    usage: crate::aggregator::UsageSnapshot,
+    /// route 名 → 送信累計。未設定なら省略される。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy: Option<std::collections::BTreeMap<String, crate::forward::RouteMetricsSnapshot>>,
 }
 
 pub fn router(sink: Sink) -> Router {
@@ -299,6 +316,7 @@ mod tests {
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
+            proxy: None,
         };
         let sink = Sink::from_settings(&settings).await.unwrap();
         let app = router(sink);

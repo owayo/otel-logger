@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use crate::aggregator::{Aggregator, UsageSnapshot};
 use crate::cli::{LogSink, Settings};
 use crate::format;
+use crate::forward::ProxyRouter;
 
 const ROTATION_PREFIX: &str = "otel-logger";
 
@@ -103,10 +104,22 @@ struct SinkInner {
     /// 別 writer と interleave すると人が読める stream として壊れる。
     stdout_lock: Mutex<()>,
     aggregator: Aggregator,
+    /// OTLP proxy 転送ルーター (未設定なら `None`)。JSONL 永続化が成功した後で
+    /// service.name で振り分けて `try_send` する。
+    proxy: Option<ProxyRouter>,
 }
 
 impl Sink {
     pub async fn from_settings(settings: &Settings) -> Result<Self> {
+        Self::from_settings_with_proxy(settings, None).await
+    }
+
+    /// Sink を作りつつ、既に spawn 済みの proxy router を装着する。
+    /// server::run が worker を spawn した後、その router を渡す。
+    pub async fn from_settings_with_proxy(
+        settings: &Settings,
+        proxy: Option<ProxyRouter>,
+    ) -> Result<Self> {
         let stdout_enabled = !settings.no_stdout;
         let color = settings.color.enabled_for_stdout() && stdout_enabled;
 
@@ -144,8 +157,14 @@ impl Sink {
                 file,
                 stdout_lock: Mutex::new(()),
                 aggregator: Aggregator::new(),
+                proxy,
             }),
         })
+    }
+
+    /// proxy 転送用 Router への参照。`/stats` 出力に metrics を含めるために使う。
+    pub fn proxy(&self) -> Option<&ProxyRouter> {
+        self.inner.proxy.as_ref()
     }
 
     /// 実行中の累計使用量 aggregator を借用する。
@@ -184,6 +203,13 @@ impl Sink {
             && let Err(e) = self.write_pretty(&record, summary_snapshot).await
         {
             tracing::error!(error = %e, kind = record.kind(), "failed to write stdout");
+        }
+
+        // JSONL 永続化と集計が成功した batch だけを proxy に流す。
+        // ここでは fire-and-forget (bounded channel の try_send)。
+        // 転送失敗は route worker 側で retry する。
+        if let Some(router) = self.inner.proxy.as_ref() {
+            router.notify(&record);
         }
         Ok(())
     }
@@ -400,6 +426,7 @@ mod tests {
                 file: Some(JsonlWriter::Fail),
                 stdout_lock: Mutex::new(()),
                 aggregator: Aggregator::new(),
+                proxy: None,
             }),
         }
     }
@@ -474,6 +501,7 @@ mod tests {
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
+            proxy: None,
         }
     }
 
@@ -487,6 +515,7 @@ mod tests {
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
+            proxy: None,
         }
     }
 

@@ -120,6 +120,13 @@ otel-logger [OPTIONS]
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary when usage totals change |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |
 | `--dry-run`    | `-n`  | `false`          |                           | Validate startup, including simultaneous listener bind, then exit |
+| `--proxy-anthropic-endpoint` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | Forward `service.name=claude-code` payloads to this upstream OTLP endpoint (see [OTLP proxy forwarding](#otlp-proxy-forwarding)) |
+| `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` or `http-protobuf`                                 |
+| `--proxy-anthropic-header` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` header (`env:VAR_NAME` resolves from env); repeatable |
+| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server`) payloads |
+| `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | Same as above                                             |
+| `--proxy-openai-header` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | Same as above                                             |
+| `--proxy-checkpoint-dir` | | (next to JSONL) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | Directory for forward checkpoints (reserved for Phase B)  |
 | `--help`       | `-h`  |                  |                           | Show help                                                |
 | `--version`    | `-V`  |                  |                           | Show version                                             |
 
@@ -313,6 +320,89 @@ ai-job:
     - npm install -g @anthropic-ai/claude-code
     - claude --print "your prompt here"
 ```
+
+## OTLP proxy forwarding
+
+`otel-logger` can persist received OTLP payloads to JSONL **and** forward them to
+one or more upstream OTLP collectors at the same time. Anthropic (Claude Code)
+and OpenAI (Codex) traffic are split by `service.name` and can target separate
+endpoints.
+
+- **Requirement**: proxy forwarding requires a JSONL sink (`--log-file` or
+  `--log-dir`) so that no payload is lost while the upstream is unreachable.
+- **Routing defaults**: `claude-code` → the Anthropic route,
+  `codex_cli_rs` / `codex_exec` / `codex-app-server` → the OpenAI route.
+  Override with `service_names` in the config to add or replace.
+- **Failure semantics**: JSONL is persisted first, then the payload is
+  `try_send`'d to the per-route worker. Workers retry with exponential backoff
+  (default 8 attempts, 200ms → 30s cap). The receive path is never blocked by
+  the upstream.
+- **Auth**: header values may be written as `env:VAR_NAME` to resolve from an
+  environment variable, so secrets never appear in `ps` output or config files.
+
+### CLI example
+
+```bash
+export ANTHROPIC_PROXY_TOKEN=xxxx
+export OPENAI_PROXY_TOKEN=yyyy
+
+otel-logger \
+  --log-file ./otel.jsonl \
+  --proxy-anthropic-endpoint https://collector.example.com:4317 \
+  --proxy-anthropic-header 'Authorization=env:ANTHROPIC_PROXY_TOKEN' \
+  --proxy-openai-endpoint https://openai-collector.example.com \
+  --proxy-openai-transport http-protobuf \
+  --proxy-openai-header 'Authorization=env:OPENAI_PROXY_TOKEN'
+```
+
+### TOML example
+
+```toml
+log-file = "/var/log/otel-logger/otel-logger.jsonl"
+
+[proxy]
+queue-capacity = 1024
+timeout-ms = 5000
+retry-max = 8
+
+[[proxy.routes]]
+name = "anthropic"
+transport = "grpc"
+endpoint = "https://collector.example.com:4317"
+[proxy.routes.headers]
+Authorization = "env:ANTHROPIC_PROXY_TOKEN"
+
+[[proxy.routes]]
+name = "openai"
+transport = "http-protobuf"
+endpoint = "https://openai-collector.example.com"
+[proxy.routes.headers]
+Authorization = "env:OPENAI_PROXY_TOKEN"
+```
+
+Add more `[[proxy.routes]]` blocks for internal collectors, staging clones, etc.
+A `service.name` claimed by more than one route is rejected at startup to
+prevent duplicate delivery.
+
+Per-route counters are exposed at `GET /stats`:
+
+```json
+{
+  "agents": { ... },
+  "proxy": {
+    "anthropic": { "sent": 42, "failed": 0, "dropped": 0, "queue_depth": 0 },
+    "openai":    { "sent": 17, "failed": 1, "dropped": 0, "queue_depth": 0 }
+  }
+}
+```
+
+### Phase B — crash-safe outbox (planned)
+
+The current implementation (Phase A) keeps every payload in JSONL, but a crash
+mid-forward can leave in-flight batches un-forwarded. Phase B will track the
+JSONL byte offset per route and catch up on restart, so that no payload is
+lost even across restarts. `--proxy-checkpoint-dir` is reserved for that
+follow-up work.
 
 ## Cumulative usage stats
 

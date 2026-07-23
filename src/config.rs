@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,43 @@ color = "auto"
 # bind address。既定値は 0.0.0.0:4317 (OTLP/gRPC) と 0.0.0.0:4318 (OTLP/HTTP) です。
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+
+# ------------------------------------------------------------
+# OTLP proxy 転送 (受信 → JSONL 保存 → 上流 collector へ forward)
+# ------------------------------------------------------------
+#
+# proxy 転送を有効にすると、受信 payload を JSONL に保存しつつ、`service.name` で
+# 振り分けた上流 collector にも転送します。JSONL 保存が最優先で、転送失敗は
+# 個別の route worker が指数バックオフで retry します。JSONL 出力 (`log-file` or
+# `log-dir`) が必須です (両方未設定なら proxy 起動時にエラーになります)。
+#
+# 組み込み既定 route:
+#   - name = "anthropic" → service_names = ["claude-code"]
+#   - name = "openai"    → service_names = ["codex_cli_rs", "codex_exec", "codex-app-server"]
+#
+# CLI 短縮フラグ (`--proxy-anthropic-endpoint` / `--proxy-openai-endpoint`) を使うと
+# ここで endpoint を書かずに済みます。config で明示すると CLI/env より低優先です。
+#
+# [proxy]
+# queue-capacity = 1024   # per-route の bounded channel 容量
+# timeout-ms = 5000       # 1 request の I/O timeout
+# retry-max = 8           # 指数バックオフの最大試行回数
+# checkpoint-dir = "/var/lib/otel-logger/.otel-logger-proxy"  # 未指定なら JSONL 隣接
+#
+# [[proxy.routes]]
+# name = "anthropic"
+# # service_names を省略すると組み込み既定を継承します。
+# transport = "grpc"                    # "grpc" | "http-protobuf"
+# endpoint = "https://collector.example.com:4317"
+# [proxy.routes.headers]
+# Authorization = "env:ANTHROPIC_PROXY_TOKEN"  # env: 参照で環境変数から解決
+#
+# [[proxy.routes]]
+# name = "openai"
+# transport = "http-protobuf"
+# endpoint = "https://collector.example.com"
+# [proxy.routes.headers]
+# Authorization = "env:OPENAI_PROXY_TOKEN"
 "#;
 
 /// `~/.config/otel-logger/config.toml` から読む永続設定。
@@ -77,6 +115,83 @@ pub struct Config {
     pub summary: Option<bool>,
     /// 人が読める stdout 出力の色設定。
     pub color: Option<ColorMode>,
+    /// OTLP proxy 転送設定。ここで route を定義すると、受信 payload を JSONL に
+    /// 保存しつつ、`service.name` で振り分けた上流 collector にも forward する。
+    pub proxy: Option<ProxyConfig>,
+}
+
+/// `[proxy]` セクションで指定される proxy 転送全体の設定。個別の route は
+/// `[[proxy.routes]]` (or CLI 短縮フラグ) で定義する。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ProxyConfig {
+    /// 受信 → JSONL 書込み後に配送 worker へ渡す notify channel の bounded 容量。
+    /// overflow しても worker は checkpoint から JSONL を走査して catch-up するため
+    /// data loss は起きない。小さめの値でよい (既定 1024)。
+    pub queue_capacity: Option<usize>,
+    /// 1 リクエスト分の I/O timeout (milliseconds)。既定 5000ms。
+    pub timeout_ms: Option<u64>,
+    /// 送信失敗時の指数バックオフ最大リトライ回数。**回数を使い切っても
+    /// checkpoint は進めない** ので、次の worker tick で JSONL から再スキャンする。
+    /// 「一時的な endpoint 不調で無限ループしない」ためのローカル上限。既定 8。
+    pub retry_max: Option<u32>,
+    /// checkpoint ファイルを置くディレクトリ。未指定時は JSONL 出力先
+    /// (`log-file` の親 or `log-dir`) の直下に `.otel-logger-proxy` を作る。
+    pub checkpoint_dir: Option<PathBuf>,
+    /// 明示的な route 定義。未指定時は組み込み既定 (anthropic + openai) を使う。
+    /// name が同じ route が組み込み既定と config 側に両方あった場合は config が優先する。
+    #[serde(default)]
+    pub routes: Vec<ProxyRouteConfig>,
+}
+
+/// 単一 route (= 送信先 endpoint 1 つ + マッチ条件) の設定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ProxyRouteConfig {
+    /// route の識別子。同一 config 内で unique。checkpoint ファイル名にも使う。
+    pub name: String,
+    /// この route にマッチさせる `service.name` の集合。組み込み既定
+    /// (anthropic → claude-code、openai → codex 系) がある name はこの field を
+    /// 省略すれば既定値を継承する。
+    #[serde(default)]
+    pub service_names: Vec<String>,
+    /// この route で送信する signal 種別 (logs / traces / metrics)。省略時は全種別。
+    #[serde(default)]
+    pub signal_types: Vec<ProxySignal>,
+    /// 転送 protocol。`grpc` (OTLP/gRPC) か `http-protobuf` (OTLP/HTTP protobuf)。
+    /// 既定は `grpc`。
+    #[serde(default)]
+    pub transport: Option<ProxyTransport>,
+    /// 送信先の base URL (gRPC は "https://host:4317"、HTTP は "https://host" 相当)。
+    pub endpoint: String,
+    /// 追加 HTTP header (gRPC でも metadata として送る)。
+    /// value に `env:VAR_NAME` を書くと起動時に環境変数を解決する。
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// 転送プロトコル。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyTransport {
+    /// OTLP/gRPC (tonic client 経由、port 4317 慣例)。
+    #[default]
+    Grpc,
+    /// OTLP/HTTP protobuf (reqwest 経由、port 4318 慣例)。JSON は使わない。
+    HttpProtobuf,
+}
+
+/// route で扱う OTLP signal 種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxySignal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl ProxySignal {
+    pub const ALL: &'static [ProxySignal] = &[Self::Logs, Self::Traces, Self::Metrics];
 }
 
 impl Config {
@@ -264,5 +379,84 @@ color = "never"
         write_default(&path, false).unwrap();
         // 生成したテンプレートが Config として往復解析可能であることを確認する。
         Config::load(Some(&path)).unwrap();
+    }
+
+    #[test]
+    fn load_parses_proxy_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+log-file = "/tmp/otel.jsonl"
+
+[proxy]
+queue-capacity = 512
+timeout-ms = 3000
+retry-max = 5
+
+[[proxy.routes]]
+name = "anthropic"
+transport = "grpc"
+endpoint = "https://collector.example:4317"
+[proxy.routes.headers]
+Authorization = "env:MY_TOKEN"
+
+[[proxy.routes]]
+name = "openai"
+service-names = ["codex_cli_rs", "codex_exec"]
+signal-types = ["logs", "traces"]
+transport = "http-protobuf"
+endpoint = "https://collector.example"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&path)).unwrap();
+        let proxy = config.proxy.expect("proxy section parsed");
+        assert_eq!(proxy.queue_capacity, Some(512));
+        assert_eq!(proxy.timeout_ms, Some(3000));
+        assert_eq!(proxy.retry_max, Some(5));
+        assert_eq!(proxy.routes.len(), 2);
+
+        let anthropic = &proxy.routes[0];
+        assert_eq!(anthropic.name, "anthropic");
+        assert!(anthropic.service_names.is_empty());
+        assert_eq!(anthropic.transport, Some(ProxyTransport::Grpc));
+        assert_eq!(anthropic.endpoint, "https://collector.example:4317");
+        assert_eq!(
+            anthropic.headers.get("Authorization"),
+            Some(&"env:MY_TOKEN".to_string())
+        );
+
+        let openai = &proxy.routes[1];
+        assert_eq!(openai.name, "openai");
+        assert_eq!(
+            openai.service_names,
+            vec!["codex_cli_rs".to_string(), "codex_exec".to_string()]
+        );
+        assert_eq!(
+            openai.signal_types,
+            vec![ProxySignal::Logs, ProxySignal::Traces]
+        );
+        assert_eq!(openai.transport, Some(ProxyTransport::HttpProtobuf));
+    }
+
+    #[test]
+    fn load_rejects_unknown_field_in_proxy_route() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[proxy.routes]]
+name = "x"
+endpoint = "https://x"
+mystery-key = 1
+"#,
+        )
+        .unwrap();
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("parse TOML"));
     }
 }

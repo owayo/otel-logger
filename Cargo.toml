@@ -28,12 +28,16 @@ opentelemetry-proto = { version = "0.32.0", default-features = false, features =
     "with-serde",
 ] }
 
-# gRPC 関連
+# gRPC 関連。`channel` を明示的に含めて OTLP proxy 転送 (client 側) にも使う。
+# TLS は webpki-roots を採用し、追加のシステム依存を抱えないビルドにする。
 tonic = { version = "0.14.6", default-features = false, features = [
     "server",
     "router",
     "transport",
+    "channel",
     "codegen",
+    "tls-ring",
+    "tls-webpki-roots",
 ] }
 tonic-prost = "0.14.6"
 prost = "0.14.4"
@@ -50,6 +54,13 @@ axum = { version = "0.8.9", default-features = false, features = [
 ] }
 bytes = "1.12.0"
 http = "1.4.2"
+# OTLP/HTTP protobuf での proxy 転送で使う HTTP client。
+# rustls-tls + webpki-roots + http2 に絞って余計な依存を抱えない。
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "http2",
+    "gzip",
+] }
 
 # 非同期 runtime
 tokio = { version = "1.52.3", features = [

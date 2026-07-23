@@ -116,6 +116,7 @@ mod tests {
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
+            proxy: None,
         }
     }
 

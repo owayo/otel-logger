@@ -2,6 +2,7 @@ pub mod aggregator;
 pub mod cli;
 pub mod config;
 pub mod format;
+pub mod forward;
 pub mod grpc;
 pub mod http;
 pub mod path;
