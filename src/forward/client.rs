@@ -1,4 +1,4 @@
-//! Forwarder client abstraction and concrete gRPC / HTTP protobuf implementations.
+//! 転送クライアントの抽象化と gRPC / HTTP protobuf 実装。
 //!
 //! 各 client は 1 route に対応し、`ExportRequest` を上流 collector へ送る。
 //! 認証 header や TLS 設定は route の構築時に一度だけ組み立てる。

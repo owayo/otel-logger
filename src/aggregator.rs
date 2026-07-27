@@ -615,6 +615,7 @@ fn extract_codex_sse_response_completed(
     let input_tokens = u64_attr(attrs, "input_token_count");
     let output_tokens = u64_attr(attrs, "output_token_count");
     let cache_read_tokens = u64_attr(attrs, "cached_token_count");
+    let cache_write_tokens = u64_attr(attrs, "cache_write_token_count");
     let reasoning_output_tokens = u64_attr(attrs, "reasoning_token_count");
     let tool_tokens = u64_attr(attrs, "tool_token_count");
     // 実ログでは tool context だけの完了イベントが先に届く。turn metrics と
@@ -630,6 +631,7 @@ fn extract_codex_sse_response_completed(
     if input_tokens == 0
         && output_tokens == 0
         && cache_read_tokens == 0
+        && cache_write_tokens == 0
         && reasoning_output_tokens == 0
     {
         return None;
@@ -655,6 +657,7 @@ fn extract_codex_sse_response_completed(
         input_tokens,
         output_tokens,
         cache_read_tokens,
+        cache_creation_tokens: cache_write_tokens,
         reasoning_output_tokens,
         ..Default::default()
     };
@@ -767,6 +770,7 @@ fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
             "input" => stats.input_tokens = value,
             "output" => stats.output_tokens = value,
             "cached_input" => stats.cache_read_tokens = value,
+            "cache_write_input" => stats.cache_creation_tokens = value,
             "reasoning_output" => stats.reasoning_output_tokens = value,
             // `total` は他の token 種別と重複するため無視する。
             _ => continue,
@@ -1934,6 +1938,7 @@ mod tests {
                 codex_token_metric("gpt-5.5", "input", 100.0),
                 codex_token_metric("gpt-5.5", "output", 20.0),
                 codex_token_metric("gpt-5.5", "cached_input", 50.0),
+                codex_token_metric("gpt-5.5", "cache_write_input", 7.0),
                 codex_token_metric("gpt-5.5", "reasoning_output", 30.0),
                 codex_token_metric("gpt-5.5", "total", 9999.0), // 重複するため無視される
             ],
@@ -1946,6 +1951,7 @@ mod tests {
         assert_eq!(bucket.stats.input_tokens, 100);
         assert_eq!(bucket.stats.output_tokens, 20);
         assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.cache_creation_tokens, 7);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
     }
 
@@ -1971,6 +1977,7 @@ mod tests {
                 kv_str("input_token_count", "100"),
                 kv_str("output_token_count", "20"),
                 kv_int("cached_token_count", 50),
+                kv_int("cache_write_token_count", 7),
                 kv_int("reasoning_token_count", 30),
                 kv_str("tool_token_count", "120"),
             ],
@@ -1986,6 +1993,7 @@ mod tests {
         assert_eq!(bucket.stats.input_tokens, 100);
         assert_eq!(bucket.stats.output_tokens, 20);
         assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.cache_creation_tokens, 7);
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
         assert_eq!(bucket.stats.request_count, 0);
     }

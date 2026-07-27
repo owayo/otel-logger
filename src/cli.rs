@@ -138,8 +138,8 @@ pub struct Cli {
     )]
     pub proxy_openai_headers: Vec<String>,
 
-    /// Directory to store per-route proxy checkpoints (offset within JSONL outbox).
-    /// proxy 転送の checkpoint (JSONL 内 offset) を保存するディレクトリ。
+    /// Directory reserved for Phase B per-route proxy checkpoints.
+    /// Phase B で proxy 転送の checkpoint (JSONL 内 offset) を保存する予約ディレクトリ。
     /// 未指定時は JSONL 出力先の親配下 `.otel-logger-proxy/` を使う。
     #[arg(long, env = "OTEL_LOGGER_PROXY_CHECKPOINT_DIR", value_name = "DIR")]
     pub proxy_checkpoint_dir: Option<PathBuf>,
@@ -219,13 +219,13 @@ pub enum LogSink {
     },
 }
 
-/// notify channel の bounded 容量デフォルト。overflow しても JSONL 走査で catch-up するため
-/// data loss は起きない。
+/// notify channel の bounded 容量デフォルト。Phase A では overflow を drop counter に記録し、
+/// JSONL からの catch-up は Phase B で実装する。
 pub const DEFAULT_PROXY_QUEUE_CAPACITY: usize = 1024;
 /// 1 回の proxy 送信の I/O timeout デフォルト (ミリ秒)。
 pub const DEFAULT_PROXY_TIMEOUT_MS: u64 = 5000;
-/// 送信失敗時の指数バックオフ試行回数デフォルト。使い切ったら checkpoint は進めず
-/// 次の worker tick で再スキャンする (欠測させない前提)。
+/// 送信失敗時の指数バックオフ試行回数デフォルト。Phase A では使い切った request を
+/// 自動再送せず、JSONL からの再走査は Phase B で実装する。
 pub const DEFAULT_PROXY_RETRY_MAX: u32 = 8;
 
 /// 組み込みの vendor 既定マッピング。CLI 短縮フラグ / 明示的な
@@ -258,6 +258,7 @@ pub struct ProxySettings {
     pub queue_capacity: usize,
     pub timeout_ms: u64,
     pub retry_max: u32,
+    /// Phase B 用に先行予約している。Phase A の worker はまだ参照しない。
     pub checkpoint_dir: PathBuf,
     pub routes: Vec<ProxyRoute>,
 }
@@ -435,7 +436,7 @@ fn resolve_proxy_settings(
     if log_sink.is_none() {
         anyhow::bail!(
             "proxy forwarding requires a JSONL outbox (set --log-file or --log-dir); \
-             checkpoint-based reliable delivery cannot start without it"
+             Phase A persists every accepted batch before forwarding, but does not replay it"
         );
     }
     let log_sink = log_sink.expect("checked non-empty above");
@@ -460,7 +461,7 @@ fn resolve_proxy_settings(
     }))
 }
 
-/// JSONL 出力先の隣に `.otel-logger-proxy/` を作って checkpoint 置き場にする。
+/// Phase B の checkpoint 予約先を JSONL 出力先の隣へ解決する。
 /// 単一ファイル出力なら親ディレクトリ、ディレクトリ出力ならそのディレクトリを起点にする。
 fn default_checkpoint_dir(log_sink: &LogSink) -> PathBuf {
     let base = match log_sink {

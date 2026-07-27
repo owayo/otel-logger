@@ -329,14 +329,16 @@ and OpenAI (Codex) traffic are split by `service.name` and can target separate
 endpoints.
 
 - **Requirement**: proxy forwarding requires a JSONL sink (`--log-file` or
-  `--log-dir`) so that no payload is lost while the upstream is unreachable.
+  `--log-dir`) so every accepted payload remains durable even when forwarding
+  fails. Automatic replay to the upstream is planned for Phase B.
 - **Routing defaults**: `claude-code` → the Anthropic route,
   `codex_cli_rs` / `codex_exec` / `codex-app-server` → the OpenAI route.
   Override with `service_names` in the config to add or replace.
 - **Failure semantics**: JSONL is persisted first, then the payload is
   `try_send`'d to the per-route worker. Workers retry with exponential backoff
   (default 8 attempts, 200ms → 30s cap). The receive path is never blocked by
-  the upstream.
+  the upstream, and shutdown cancels both an in-flight request and backoff
+  immediately instead of waiting for the configured request timeout.
 - **Auth**: header values may be written as `env:VAR_NAME` to resolve from an
   environment variable, so secrets never appear in `ps` output or config files.
 
@@ -409,8 +411,8 @@ follow-up work.
 `otel-logger` aggregates token / cost / duration usage from both agents and
 exposes the running totals two ways. Claude usage is metrics-first for
 tokens/cost and log-assisted for request count/duration. Codex token usage is
-deduplicated across the two shapes Codex emits: observed Codex 0.129/0.130
-local and CI logs provide the most complete token counters on
+deduplicated across the two shapes Codex emits: current local and CI logs
+provide the most complete token counters on
 `codex.sse_event` / `response.completed`, and `codex.turn.token_usage`
 metrics remain the fallback when they are the first or only token source
 observed.
@@ -432,6 +434,8 @@ usage. `otel-logger` accepts the first token source observed for each model
 and ignores the other source for that model's token counters to avoid
 double-counting.
 `tool_token_count` is not added because it overlaps the other token classes.
+`cache_write_token_count` in SSE logs and the metric token type
+`cache_write_input` both contribute to `cache_creation_tokens`.
 Real logs also include tool-only `response.completed` events where
 `input_token_count == tool_token_count` and output/cache/reasoning are all
 zero; Codex excludes those from turn metrics and `handle_responses` span

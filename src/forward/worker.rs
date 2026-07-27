@@ -81,7 +81,14 @@ async fn send_with_retry(
         if shutdown.is_cancelled() {
             anyhow::bail!("cancelled during retry (route={route_name})");
         }
-        match client.export(request.clone()).await {
+        let export_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                anyhow::bail!("cancelled during send (route={route_name})");
+            }
+            result = client.export(request.clone()) => result,
+        };
+        match export_result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::debug!(
@@ -109,4 +116,64 @@ async fn send_with_retry(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unknown send error")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{Router, extract::State, routing::post};
+    use tokio::{net::TcpListener, sync::Notify};
+
+    use super::*;
+    use crate::cli::ProxyRoute;
+    use crate::config::{ProxySignal, ProxyTransport};
+
+    async fn stalled_upstream(State(started): State<Arc<Notify>>) {
+        started.notify_one();
+        std::future::pending::<()>().await;
+    }
+
+    /// 上流が応答しない送信中でも、shutdown を受けたら timeout を待たずに中断する。
+    #[tokio::test]
+    async fn send_with_retry_cancels_in_flight_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let started = Arc::new(Notify::new());
+        let app = Router::new()
+            .route("/v1/logs", post(stalled_upstream))
+            .with_state(Arc::clone(&started));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let route = ProxyRoute {
+            name: "test".to_string(),
+            service_names: vec!["test-service".to_string()],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 30_000).unwrap();
+        let shutdown = CancellationToken::new();
+        let request = ExportRequest::Logs(Box::default());
+
+        let send_shutdown = shutdown.clone();
+        let send = tokio::spawn(async move {
+            send_with_retry("test", &client, &request, 3, &send_shutdown).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("上流が 1 秒以内に送信を開始する");
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), send)
+            .await
+            .expect("shutdown 後は 1 秒以内に送信を中断する")
+            .expect("送信タスクは panic しない");
+        assert!(result.is_err(), "shutdown は送信をエラー終了させる");
+
+        server.abort();
+    }
 }

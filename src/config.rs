@@ -70,7 +70,7 @@ color = "auto"
 # queue-capacity = 1024   # per-route の bounded channel 容量
 # timeout-ms = 5000       # 1 request の I/O timeout
 # retry-max = 8           # 指数バックオフの最大試行回数
-# checkpoint-dir = "/var/lib/otel-logger/.otel-logger-proxy"  # 未指定なら JSONL 隣接
+# checkpoint-dir = "/var/lib/otel-logger/.otel-logger-proxy"  # Phase B 用の予約設定
 #
 # [[proxy.routes]]
 # name = "anthropic"
@@ -126,17 +126,16 @@ pub struct Config {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProxyConfig {
     /// 受信 → JSONL 書込み後に配送 worker へ渡す notify channel の bounded 容量。
-    /// overflow しても worker は checkpoint から JSONL を走査して catch-up するため
-    /// data loss は起きない。小さめの値でよい (既定 1024)。
+    /// Phase A では overflow を drop counter に記録する。JSONL からの catch-up は
+    /// Phase B で実装するため、通常の burst を吸収できる容量を指定する (既定 1024)。
     pub queue_capacity: Option<usize>,
     /// 1 リクエスト分の I/O timeout (milliseconds)。既定 5000ms。
     pub timeout_ms: Option<u64>,
-    /// 送信失敗時の指数バックオフ最大リトライ回数。**回数を使い切っても
-    /// checkpoint は進めない** ので、次の worker tick で JSONL から再スキャンする。
-    /// 「一時的な endpoint 不調で無限ループしない」ためのローカル上限。既定 8。
+    /// 送信失敗時の指数バックオフ最大リトライ回数。Phase A では使い切った request を
+    /// 自動再送しない。JSONL からの再走査は Phase B で実装する。既定 8。
     pub retry_max: Option<u32>,
-    /// checkpoint ファイルを置くディレクトリ。未指定時は JSONL 出力先
-    /// (`log-file` の親 or `log-dir`) の直下に `.otel-logger-proxy` を作る。
+    /// Phase B で checkpoint ファイルを置く予約ディレクトリ。未指定時は JSONL 出力先
+    /// (`log-file` の親 or `log-dir`) の直下に `.otel-logger-proxy` を解決する。
     pub checkpoint_dir: Option<PathBuf>,
     /// 明示的な route 定義。未指定時は組み込み既定 (anthropic + openai) を使う。
     /// name が同じ route が組み込み既定と config 側に両方あった場合は config が優先する。
@@ -148,7 +147,7 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProxyRouteConfig {
-    /// route の識別子。同一 config 内で unique。checkpoint ファイル名にも使う。
+    /// route の識別子。同一 config 内で unique。Phase B の checkpoint ファイル名にも使う。
     pub name: String,
     /// この route にマッチさせる `service.name` の集合。組み込み既定
     /// (anthropic → claude-code、openai → codex 系) がある name はこの field を

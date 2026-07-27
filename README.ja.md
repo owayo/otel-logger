@@ -304,13 +304,14 @@ proxy モードがあります。Claude Code (Anthropic 系) と Codex (OpenAI �
 `service.name` で振り分け、それぞれ別の endpoint に送れます。
 
 - **前提**: proxy を有効化するときは `--log-file` か `--log-dir` のどちらかを必ず指定する
-  (JSONL を「欠測しない」ための最終保存先として扱うため)
+  (転送に失敗しても受理済み payload を JSONL に残すため。上流への自動再送は Phase B で実装予定)
 - **振り分け**: 組み込み既定で `claude-code` → Anthropic route、
   `codex_cli_rs` / `codex_exec` / `codex-app-server` → OpenAI route。
   config で `service_names` を明示すれば上書き可能
 - **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。
   route worker が指数バックオフで retry する (既定 8 回、200ms → 30s cap)。
-  受信 endpoint は proxy の遅延に影響されない
+  受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく
+  送信中の request も即座に中断し、設定した request timeout を待たない
 - **認証**: header 値に `env:VAR_NAME` を書くと環境変数から解決する。secret を
   プロセス一覧や config ファイルに平文で残さないためこちらを推奨
 
@@ -382,7 +383,7 @@ checkpoint として保持し、起動時に catch-up 走査して欠測ゼロ�
 
 `otel-logger` は両エージェントのトークン / コスト / duration を集計し、2 つの方法で公開します。
 Claude は token/cost を metrics 主軸、request count/duration を log 補完で扱います。
-Codex の token usage は Codex が出す 2 つの形を重複排除して集計します。実際の Codex 0.129/0.130 のローカルログと CI artifact では `codex.sse_event` / `response.completed` log が最も完全な token counter を持つため、これが最初の token source ならそれを採用し、`codex.turn.token_usage` metrics は最初または唯一の token source として観測された場合の fallback として使います。
+Codex の token usage は Codex が出す 2 つの形を重複排除して集計します。現在のローカルログと CI artifact では `codex.sse_event` / `response.completed` log が最も完全な token counter を持つため、これが最初の token source ならそれを採用し、`codex.turn.token_usage` metrics は最初または唯一の token source として観測された場合の fallback として使います。
 
 | エージェント | tokens & cost                                              | request_count                       | duration                              | メタデータ                                                       |
 |--------------|------------------------------------------------------------|-------------------------------------|---------------------------------------|------------------------------------------------------------------|
@@ -391,7 +392,7 @@ Codex の token usage は Codex が出す 2 つの形を重複排除して集計
 
 Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
 
-Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。実ログでは `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
+Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。SSE ログの `cache_write_token_count` と metric の token type `cache_write_input` は、どちらも `cache_creation_tokens` に集計します。実ログでは `input_token_count == tool_token_count` かつ output/cache/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
 
 ### `GET /stats` (常時有効)
 

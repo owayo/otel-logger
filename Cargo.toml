@@ -52,12 +52,12 @@ axum = { version = "0.8.9", default-features = false, features = [
     "original-uri",
     "query",
 ] }
-bytes = "1.12.0"
+bytes = "1.12.1"
 http = "1.4.2"
 # OTLP/HTTP protobuf での proxy 転送で使う HTTP client。
-# rustls-tls + webpki-roots + http2 に絞って余計な依存を抱えない。
-reqwest = { version = "0.12.28", default-features = false, features = [
-    "rustls-tls-webpki-roots",
+# rustls + プラットフォームの証明書検証 + http2 に絞って余計な依存を抱えない。
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
     "http2",
     "gzip",
 ] }
