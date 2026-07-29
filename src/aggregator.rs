@@ -624,6 +624,7 @@ fn extract_codex_sse_response_completed(
         && input_tokens == tool_tokens
         && output_tokens == 0
         && cache_read_tokens == 0
+        && cache_write_tokens == 0
         && reasoning_output_tokens == 0
     {
         return None;
@@ -2162,6 +2163,36 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(!agg.snapshot().agents.contains_key(AGENT_CODEX));
+    }
+
+    #[test]
+    fn codex_sse_tool_only_shape_with_cache_write_is_counted() {
+        let agg = Aggregator::new();
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "13145"),
+                kv_str("output_token_count", "0"),
+                kv_str("cached_token_count", "0"),
+                kv_str("cache_write_token_count", "23"),
+                kv_str("reasoning_token_count", "0"),
+                kv_str("tool_token_count", "13145"),
+            ],
+        ));
+
+        assert_eq!(count, 1);
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/{UNKNOWN}"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 13145);
+        assert_eq!(bucket.stats.cache_creation_tokens, 23);
     }
 
     #[test]

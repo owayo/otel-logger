@@ -437,9 +437,11 @@ double-counting.
 `cache_write_token_count` in SSE logs and the metric token type
 `cache_write_input` both contribute to `cache_creation_tokens`.
 Real logs also include tool-only `response.completed` events where
-`input_token_count == tool_token_count` and output/cache/reasoning are all
-zero; Codex excludes those from turn metrics and `handle_responses` span
-usage, so `otel-logger` does not count them as token usage.
+`input_token_count == tool_token_count` and output/cache-read/cache-write/
+reasoning are all zero; Codex excludes those from turn metrics and
+`handle_responses` span usage, so `otel-logger` does not count them as token
+usage. An otherwise tool-only-shaped completion with positive cache-write
+usage remains counted.
 `session_task.turn` / `session_task.review` spans can also carry
 `codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
 spans are not used as token sources.

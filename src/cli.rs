@@ -692,6 +692,26 @@ fn validate_header_value(key: &str, value: &str, route_name: &str) -> anyhow::Re
 mod tests {
     use super::*;
 
+    fn run_test_in_child_with_env(test_name: &str, key: &str, value: &str) -> bool {
+        const CHILD_TEST_ENV: &str = "OTEL_LOGGER_CHILD_TEST";
+
+        if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(test_name) {
+            return true;
+        }
+
+        // 並列テスト中の process-wide な環境変数変更を避け、子プロセスだけに値を渡す。
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("現在のテスト実行ファイルを取得できること"),
+        )
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST_ENV, test_name)
+        .env(key, value)
+        .status()
+        .expect("環境変数を隔離した子テストを起動できること");
+        assert!(status.success(), "子テスト {test_name} が失敗しました");
+        false
+    }
+
     fn empty_cli() -> Cli {
         Cli {
             command: None,
@@ -886,12 +906,12 @@ mod tests {
 
     #[test]
     fn color_mode_auto_disables_when_no_color_env_is_set() {
-        // SAFETY: テスト中の単純な env 操作で、process scope は隔離されていない点に注意。
-        // 並列実行されうるため、固有の env 名にして他テストと衝突しないようにすべきだが、
-        // ここでは NO_COLOR の存在判定ロジックそのものを検証する。
-        unsafe { std::env::set_var("NO_COLOR", "1") };
+        let test_name = "cli::tests::color_mode_auto_disables_when_no_color_env_is_set";
+        if !run_test_in_child_with_env(test_name, "NO_COLOR", "1") {
+            return;
+        }
+
         assert!(!ColorMode::Auto.enabled_for_stdout());
-        unsafe { std::env::remove_var("NO_COLOR") };
     }
 
     #[test]
@@ -965,8 +985,11 @@ mod tests {
     #[test]
     fn merge_proxy_headers_resolve_env_prefix() {
         let key = "OTEL_LOGGER_TEST_TOKEN";
-        // SAFETY: process 内でしか使わない test 用 env。
-        unsafe { std::env::set_var(key, "s3cret-value") };
+        let test_name = "cli::tests::merge_proxy_headers_resolve_env_prefix";
+        if !run_test_in_child_with_env(test_name, key, "s3cret-value") {
+            return;
+        }
+
         let mut cli = cli_with_log_file();
         cli.proxy_anthropic_endpoint = Some("https://collector.example:4317".to_string());
         cli.proxy_anthropic_headers = vec![
@@ -982,7 +1005,6 @@ mod tests {
             Some(&"s3cret-value".to_string())
         );
         assert_eq!(headers.get("X-Tenant"), Some(&"corp".to_string()));
-        unsafe { std::env::remove_var(key) };
     }
 
     #[test]
