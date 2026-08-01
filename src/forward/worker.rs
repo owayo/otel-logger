@@ -40,7 +40,6 @@ async fn run(mut cfg: WorkerConfig) {
                     tracing::info!(route = %cfg.route_name, "proxy worker: channel closed");
                     break;
                 };
-                cfg.metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 if request.is_empty() {
                     continue;
                 }

@@ -63,7 +63,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 
 # 非同期 runtime
-tokio = { version = "1.52.3", features = [
+tokio = { version = "1.53.0", features = [
     "rt-multi-thread",
     "macros",
     "signal",
@@ -75,7 +75,7 @@ tokio = { version = "1.52.3", features = [
 tokio-util = "0.7.18"
 
 # CLI
-clap = { version = "4.6.1", features = ["derive", "env"] }
+clap = { version = "4.6.2", features = ["derive", "env"] }
 
 # シリアライズ / 出力
 serde = { version = "1.0.228", features = ["derive"] }

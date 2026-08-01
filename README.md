@@ -398,6 +398,11 @@ Per-route counters are exposed at `GET /stats`:
 }
 ```
 
+`queue_depth` is the route's actual bounded-channel occupancy at snapshot time.
+It is derived directly from Tokio channel capacity, so concurrent receive
+operations cannot make the counter wrap or report a stale manually maintained
+value.
+
 ### Phase B — crash-safe outbox (planned)
 
 The current implementation (Phase A) keeps every payload in JSONL, but a crash
@@ -445,6 +450,12 @@ usage remains counted.
 `session_task.turn` / `session_task.review` spans can also carry
 `codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
 spans are not used as token sources.
+Depending on the tracing exporter, a span event may use its source location as
+the event name and carry the logical `codex.conversation_starts` name in the
+`event.name` attribute. Both that current shape and the legacy direct event
+name are accepted for provider/effort metadata. For log records, the logical
+name may be in the body, the `event.name` attribute, or the top-level
+`LogRecord.event_name`; all three forms are accepted.
 If Codex token logs arrive before `conversation_starts`, the temporary
 `effort=unknown` bucket is folded into the later provider/model/effort bucket
 when the session metadata arrives.

@@ -374,7 +374,7 @@ impl Aggregator {
             for scope_spans in &resource_spans.scope_spans {
                 for span in &scope_spans.spans {
                     for ev in &span.events {
-                        if ev.name == "codex.conversation_starts"
+                        if otel_event_matches(&ev.name, &ev.attributes, "codex.conversation_starts")
                             && let Some(session) = extract_session_from_attrs(&ev.attributes)
                         {
                             update_codex_session(&mut g, session);
@@ -546,26 +546,29 @@ fn extract_claude_api_request_meta(
 
 fn extract_codex_conversation_starts(log: &LogRecord) -> Option<CodexSession> {
     // Codex はこれを top-level log event または span event として送る。
-    // ここでは log record 形式だけを扱い、body と event.name のどちらに目印が
-    // 入っていても拾えるようにする。
+    // ここでは log record 形式だけを扱い、body、top-level event_name、event.name 属性の
+    // いずれに目印が入っていても拾えるようにする。
     let body_matches = log
         .body
         .as_ref()
         .and_then(|b| b.value.as_ref())
         .map(|v| matches!(v, OtlpValue::StringValue(s) if s == "codex.conversation_starts"))
         .unwrap_or(false);
-    let event_name_matches = log
-        .attributes
-        .iter()
-        .find(|kv| kv.key == "event.name")
-        .and_then(|kv| kv.value.as_ref())
-        .and_then(|v| v.value.as_ref())
-        .map(|v| matches!(v, OtlpValue::StringValue(s) if s == "codex.conversation_starts"))
-        .unwrap_or(false);
+    let event_name_matches = otel_event_matches(
+        &log.event_name,
+        &log.attributes,
+        "codex.conversation_starts",
+    );
     if !body_matches && !event_name_matches {
         return None;
     }
     extract_session_from_attrs(&log.attributes)
+}
+
+/// tracing の event 名は exporter によって論理名そのもの、または Rust のソース位置になる。
+/// 後者では論理名が `event.name` 属性へ入るため、両方の表現を同じ event として扱う。
+fn otel_event_matches(name: &str, attrs: &[KeyValue], expected: &str) -> bool {
+    name == expected || string_attr(attrs, "event.name") == Some(expected)
 }
 
 fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
@@ -1597,7 +1600,9 @@ mod tests {
             dropped_attributes_count: 0,
             events: vec![opentelemetry_proto::tonic::trace::v1::span::Event {
                 time_unix_nano: 0,
-                name: "codex.conversation_starts".into(),
+                // Codex 0.146.0 の実ログでは event の論理名は属性側にあり、
+                // name には tracing が生成した Rust のソース位置が入る。
+                name: "event otel/src/events/session_telemetry.rs:485".into(),
                 attributes: attrs,
                 dropped_attributes_count: 0,
             }],
@@ -2084,6 +2089,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_conversation_start_top_level_event_name_registers_session() {
+        let agg = Aggregator::new();
+        let mut request = make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("conversation.id", "conv-top-level-event-name"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.5"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        );
+        request.resource_logs[0].scope_logs[0].log_records[0].event_name =
+            "codex.conversation_starts".into();
+        agg.ingest_logs(&request);
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-top-level-event-name"),
+                kv_str("model", "gpt-5.5"),
+                kv_str("input_token_count", "85"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let bucket = snap.agents[AGENT_CODEX]
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
+            .expect("top-level event_name から effort が補完される");
+        assert_eq!(bucket.stats.input_tokens, 85);
+    }
+
+    #[test]
     fn codex_sse_uses_matching_conversation_effort_when_sessions_interleave() {
         let agg = Aggregator::new();
         // 実ログでは複数 conversation の SSE が混在するため、最後に見た session ではなく
@@ -2290,6 +2332,7 @@ mod tests {
             vec![
                 kv_str("event.name", "codex.sse_event"),
                 kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-trace-event"),
                 kv_str("model", "gpt-5.5"),
                 kv_str("input_token_count", "100"),
             ],
@@ -2298,6 +2341,7 @@ mod tests {
             SERVICE_CODEX_EXEC,
             vec![conversation_starts_span(vec![
                 kv_str("event.name", "codex.conversation_starts"),
+                kv_str("conversation.id", "conv-trace-event"),
                 kv_str("provider_name", PROVIDER_OPENAI),
                 kv_str("model", "gpt-5.5"),
                 kv_str("reasoning_effort", "high"),
@@ -2316,6 +2360,20 @@ mod tests {
             .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/high"))
             .unwrap();
         assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    #[test]
+    fn codex_conversation_start_event_accepts_legacy_name_and_attribute_name() {
+        assert!(otel_event_matches(
+            "codex.conversation_starts",
+            &[],
+            "codex.conversation_starts"
+        ));
+        assert!(otel_event_matches(
+            "event otel/src/events/session_telemetry.rs:485",
+            &[kv_str("event.name", "codex.conversation_starts")],
+            "codex.conversation_starts"
+        ));
     }
 
     #[test]

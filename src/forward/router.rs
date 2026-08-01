@@ -60,7 +60,17 @@ impl ProxyRouter {
         self.inner
             .lanes
             .iter()
-            .map(|lane| (lane.name.clone(), lane.metrics.snapshot()))
+            .map(|lane| {
+                // 手動の Atomic カウンタは、送信成功後の加算より先に worker が受信して
+                // 減算すると underflow する。channel 自身の空き容量から、snapshot 時点で
+                // 実際に queue に残っている件数を算出する。
+                let depth = lane
+                    .sender
+                    .max_capacity()
+                    .saturating_sub(lane.sender.capacity());
+                let depth = u64::try_from(depth).unwrap_or(u64::MAX);
+                (lane.name.clone(), lane.metrics.snapshot(depth))
+            })
             .collect()
     }
 
@@ -68,7 +78,7 @@ impl ProxyRouter {
     ///
     /// - service.name にマッチしない resource は skip
     /// - matched resource が 0 の route は send しない
-    /// - channel overflow (bounded queue full) は drop-newest + counter 加算 + warn
+    /// - channel overflow (bounded queue full) / closed は drop + counter 加算
     pub fn notify(&self, record: &TelemetryRecord) {
         for lane in &self.inner.lanes {
             if !lane.route.accepts_signal(record.signal()) {
@@ -83,9 +93,7 @@ impl ProxyRouter {
                 continue;
             };
             match lane.sender.try_send(request) {
-                Ok(()) => {
-                    lane.metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                }
+                Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     let dropped = lane.metrics.dropped_total.fetch_add(1, Ordering::Relaxed) + 1;
                     // 大量ログの洪水を避けるため 2^n ごとに warn。
@@ -98,8 +106,13 @@ impl ProxyRouter {
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // shutdown 済みの route。以降の notify も抑制する意味は薄いのでスキップ。
-                    tracing::debug!(route = %lane.name, "proxy queue closed; dropping notify");
+                    let dropped = lane.metrics.dropped_total.fetch_add(1, Ordering::Relaxed) + 1;
+                    // shutdown 済みの route への payload も、実際に転送されないため drop として数える。
+                    tracing::debug!(
+                        route = %lane.name,
+                        dropped_total = dropped,
+                        "proxy queue closed; dropping notify"
+                    );
                 }
             }
         }
@@ -305,8 +318,9 @@ mod tests {
         };
         router.notify(&TelemetryRecord::Logs(Box::new(req)));
 
-        assert_eq!(anthropic.metrics.queue_depth.load(Ordering::Relaxed), 1);
-        assert_eq!(openai.metrics.queue_depth.load(Ordering::Relaxed), 1);
+        let snapshot = router.snapshot().into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(snapshot["anthropic"].queue_depth, 1);
+        assert_eq!(snapshot["openai"].queue_depth, 1);
         // unknown-service は skip されるので dropped は上がらない
         assert_eq!(anthropic.metrics.dropped_total.load(Ordering::Relaxed), 0);
         assert_eq!(openai.metrics.dropped_total.load(Ordering::Relaxed), 0);
@@ -332,7 +346,7 @@ mod tests {
         };
         router.notify(&TelemetryRecord::Metrics(Box::new(req)));
 
-        assert_eq!(anthropic.metrics.queue_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(router.snapshot()[0].1.queue_depth, 0);
     }
 
     #[test]
@@ -364,7 +378,38 @@ mod tests {
         router.notify(&make_req()); // dropped=1
         router.notify(&make_req()); // dropped=2
 
-        assert_eq!(lane.metrics.queue_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(router.snapshot()[0].1.queue_depth, 1);
         assert_eq!(lane.metrics.dropped_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn queue_depth_uses_channel_state_after_receive() {
+        let (lane, mut rx) = make_lane("anthropic", vec!["claude-code"]);
+        let router = ProxyRouter::new(vec![lane]);
+        let request = TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![resource_logs_for("claude-code")],
+        }));
+
+        router.notify(&request);
+        assert_eq!(router.snapshot()[0].1.queue_depth, 1);
+
+        rx.try_recv().expect("queue から request を受信できること");
+        assert_eq!(router.snapshot()[0].1.queue_depth, 0);
+    }
+
+    #[test]
+    fn drops_when_channel_is_closed() {
+        let (lane, rx) = make_lane("anthropic", vec!["claude-code"]);
+        let router = ProxyRouter::new(vec![lane]);
+        drop(rx);
+
+        let request = TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![resource_logs_for("claude-code")],
+        }));
+        router.notify(&request);
+
+        let snapshot = router.snapshot();
+        assert_eq!(snapshot[0].1.queue_depth, 0);
+        assert_eq!(snapshot[0].1.dropped, 1);
     }
 }

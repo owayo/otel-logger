@@ -371,6 +371,10 @@ route ごとの送信累計は `GET /stats` の `proxy` フィールドで観測
 }
 ```
 
+`queue_depth` は snapshot 時点における route の bounded channel の実占有数です。
+Tokio channel の capacity から直接算出するため、送受信が並行しても手動カウンタの
+underflow や古い値は返しません。
+
 ### Phase B (今後の予定) — crash-safe outbox
 
 現行 (Phase A) は「JSONL には確実に残るが、process crash 時に in-flight batch が転送
@@ -392,7 +396,7 @@ Codex の token usage は Codex が出す 2 つの形を重複排除して集計
 
 Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
 
-Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。SSE ログの `cache_write_token_count` と metric の token type `cache_write_input` は、どちらも `cache_creation_tokens` に集計します。実ログでは `input_token_count == tool_token_count` かつ output/cache-read/cache-write/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。ただし、同じ形でも cache write が 1 以上なら実 usage として集計します。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
+Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。SSE ログの `cache_write_token_count` と metric の token type `cache_write_input` は、どちらも `cache_creation_tokens` に集計します。実ログでは `input_token_count == tool_token_count` かつ output/cache-read/cache-write/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。ただし、同じ形でも cache write が 1 以上なら実 usage として集計します。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。tracing exporter によっては span event の name が source location になり、論理名 `codex.conversation_starts` は `event.name` 属性へ格納されます。provider/effort の補完では、この現行形式と論理名を直接持つ旧形式の両方を受け付けます。log record では論理名が body、`event.name` 属性、top-level の `LogRecord.event_name` のいずれに入る形式も受け付けます。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
 
 ### `GET /stats` (常時有効)
 

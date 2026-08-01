@@ -129,19 +129,17 @@ pub struct RouteMetrics {
     pub sent_total: AtomicU64,
     /// forward 失敗 (retry 上限に達したもの) 累計。
     pub failed_total: AtomicU64,
-    /// notify channel overflow で drop した累計。
+    /// notify channel の満杯または切断で drop した累計。
     pub dropped_total: AtomicU64,
-    /// 現在 queue に残っているおおよその件数 (snapshot 時に読む)。
-    pub queue_depth: AtomicU64,
 }
 
 impl RouteMetrics {
-    pub fn snapshot(&self) -> RouteMetricsSnapshot {
+    pub fn snapshot(&self, queue_depth: u64) -> RouteMetricsSnapshot {
         RouteMetricsSnapshot {
             sent: self.sent_total.load(Ordering::Relaxed),
             failed: self.failed_total.load(Ordering::Relaxed),
             dropped: self.dropped_total.load(Ordering::Relaxed),
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_depth,
         }
     }
 }
