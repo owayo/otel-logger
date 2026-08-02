@@ -195,10 +195,15 @@ fn warn_partial_metrics(
 #[derive(Clone)]
 pub struct HttpClient {
     client: reqwest::Client,
-    logs_url: String,
-    traces_url: String,
-    metrics_url: String,
+    urls: std::sync::Arc<HttpUrls>,
     headers: reqwest::header::HeaderMap,
+}
+
+/// clone 時に signal 別 URL の内部バッファを共有する。
+struct HttpUrls {
+    logs_url: reqwest::Url,
+    traces_url: reqwest::Url,
+    metrics_url: reqwest::Url,
 }
 
 impl HttpClient {
@@ -209,10 +214,36 @@ impl HttpClient {
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .build()
             .context("build reqwest client")?;
-        let base = route.endpoint.trim_end_matches('/').to_string();
-        let logs_url = format!("{base}/v1/logs");
-        let traces_url = format!("{base}/v1/traces");
-        let metrics_url = format!("{base}/v1/metrics");
+        let endpoint = reqwest::Url::parse(&route.endpoint).with_context(|| {
+            format!(
+                "parse HTTP endpoint `{}` for route `{}`",
+                route.endpoint, route.name
+            )
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") || !endpoint.has_host() {
+            bail!(
+                "HTTP endpoint `{}` for route `{}` must be an absolute HTTP(S) URL",
+                route.endpoint,
+                route.name
+            );
+        }
+        if endpoint.query().is_some() || endpoint.fragment().is_some() {
+            bail!(
+                "HTTP endpoint `{}` for route `{}` must not contain a query or fragment",
+                route.endpoint,
+                route.name
+            );
+        }
+
+        // 検証済みのベース URL に OTLP の signal 別パスを追加する。
+        let base = route.endpoint.trim_end_matches('/');
+        let signal_url = |path: &str| {
+            reqwest::Url::parse(&format!("{base}{path}"))
+                .with_context(|| format!("build OTLP/HTTP URL `{path}` for route `{}`", route.name))
+        };
+        let logs_url = signal_url("/v1/logs")?;
+        let traces_url = signal_url("/v1/traces")?;
+        let metrics_url = signal_url("/v1/metrics")?;
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -234,22 +265,24 @@ impl HttpClient {
         }
         Ok(Self {
             client,
-            logs_url,
-            traces_url,
-            metrics_url,
+            urls: std::sync::Arc::new(HttpUrls {
+                logs_url,
+                traces_url,
+                metrics_url,
+            }),
             headers,
         })
     }
 
     async fn export(&self, request: ExportRequest) -> Result<()> {
         let (url, body) = match request {
-            ExportRequest::Logs(req) => (self.logs_url.as_str(), encode_pb(req.as_ref())),
-            ExportRequest::Traces(req) => (self.traces_url.as_str(), encode_pb(req.as_ref())),
-            ExportRequest::Metrics(req) => (self.metrics_url.as_str(), encode_pb(req.as_ref())),
+            ExportRequest::Logs(req) => (&self.urls.logs_url, encode_pb(req.as_ref())),
+            ExportRequest::Traces(req) => (&self.urls.traces_url, encode_pb(req.as_ref())),
+            ExportRequest::Metrics(req) => (&self.urls.metrics_url, encode_pb(req.as_ref())),
         };
         let response = self
             .client
-            .post(url)
+            .post(url.clone())
             .headers(self.headers.clone())
             .body(Bytes::from(body))
             .send()
@@ -442,5 +475,64 @@ mod tests {
         let result = client.export(ExportRequest::Logs(Box::new(req))).await;
         let err = result.unwrap_err();
         assert!(err.to_string().contains("500"), "got: {err}");
+    }
+
+    #[test]
+    fn http_client_rejects_invalid_endpoint_at_startup() {
+        for endpoint in [
+            "",
+            "collector.example.com",
+            "ftp://collector.example.com",
+            "https://collector.example.com?tenant=example",
+            "https://collector.example.com/#fragment",
+        ] {
+            let route = ProxyRoute {
+                name: "openai".to_string(),
+                service_names: vec!["codex_cli_rs".to_string()],
+                signals: ProxySignal::ALL.to_vec(),
+                transport: ProxyTransport::HttpProtobuf,
+                endpoint: endpoint.to_string(),
+                headers: vec![],
+            };
+
+            let error = match RouteClient::build(&route, 3_000) {
+                Ok(_) => panic!("不正な endpoint `{endpoint}` が受理された"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("openai"),
+                "route 名を含むエラーを返す必要がある: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_client_appends_signal_paths_after_base_path() {
+        let route = ProxyRoute {
+            name: "openai".to_string(),
+            service_names: vec!["codex_cli_rs".to_string()],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: "https://collector.example.com/otlp/".to_string(),
+            headers: vec![],
+        };
+
+        let client = match RouteClient::build(&route, 3_000).expect("正しい endpoint を受理する")
+        {
+            RouteClient::Http(client) => client,
+            RouteClient::Grpc(_) => panic!("HTTP route が gRPC client になった"),
+        };
+        assert_eq!(
+            client.urls.logs_url.as_str(),
+            "https://collector.example.com/otlp/v1/logs"
+        );
+        assert_eq!(
+            client.urls.traces_url.as_str(),
+            "https://collector.example.com/otlp/v1/traces"
+        );
+        assert_eq!(
+            client.urls.metrics_url.as_str(),
+            "https://collector.example.com/otlp/v1/metrics"
+        );
     }
 }

@@ -308,6 +308,9 @@ proxy モードがあります。Claude Code (Anthropic 系) と Codex (OpenAI �
 - **振り分け**: 組み込み既定で `claude-code` → Anthropic route、
   `codex_cli_rs` / `codex_exec` / `codex-app-server` → OpenAI route。
   config で `service_names` を明示すれば上書き可能
+- **HTTP endpoint の検証**: `http-protobuf` route には絶対 `http://` / `https://`
+  URL を指定する。設定値の末尾へ signal 別パス (`/v1/logs`、`/v1/traces`、
+  `/v1/metrics`) を追加するため、query と fragment は startup 時に reject する
 - **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。
   route worker が指数バックオフで retry する (既定 8 回、200ms → 30s cap)。
   受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく

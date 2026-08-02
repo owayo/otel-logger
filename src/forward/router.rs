@@ -264,13 +264,17 @@ mod tests {
         }
     }
 
+    fn resource_for(service: &str) -> Resource {
+        Resource {
+            attributes: vec![kv_str("service.name", service)],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }
+    }
+
     fn resource_logs_for(service: &str) -> ResourceLogs {
         ResourceLogs {
-            resource: Some(Resource {
-                attributes: vec![kv_str("service.name", service)],
-                dropped_attributes_count: 0,
-                entity_refs: vec![],
-            }),
+            resource: Some(resource_for(service)),
             scope_logs: vec![ScopeLogs {
                 scope: Some(InstrumentationScope::default()),
                 log_records: vec![LogRecord::default()],
@@ -347,6 +351,62 @@ mod tests {
         router.notify(&TelemetryRecord::Metrics(Box::new(req)));
 
         assert_eq!(router.snapshot()[0].1.queue_depth, 0);
+    }
+
+    #[test]
+    fn routes_traces_and_metrics_by_service_name() {
+        let (openai, mut rx) = make_lane("openai", vec!["codex_cli_rs"]);
+        let router = ProxyRouter::new(vec![openai]);
+
+        router.notify(&TelemetryRecord::Traces(Box::new(
+            ExportTraceServiceRequest {
+                resource_spans: vec![
+                    opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+                        resource: Some(resource_for("codex_cli_rs")),
+                        ..Default::default()
+                    },
+                    opentelemetry_proto::tonic::trace::v1::ResourceSpans {
+                        resource: Some(resource_for("unknown-service")),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )));
+        match rx.try_recv().expect("trace が route に配送される") {
+            ExportRequest::Traces(request) => {
+                assert_eq!(request.resource_spans.len(), 1);
+                assert_eq!(
+                    extract_service_name(request.resource_spans[0].resource.as_ref()),
+                    "codex_cli_rs"
+                );
+            }
+            _ => panic!("trace 以外の signal が配送された"),
+        }
+
+        router.notify(&TelemetryRecord::Metrics(Box::new(
+            ExportMetricsServiceRequest {
+                resource_metrics: vec![
+                    opentelemetry_proto::tonic::metrics::v1::ResourceMetrics {
+                        resource: Some(resource_for("codex_cli_rs")),
+                        ..Default::default()
+                    },
+                    opentelemetry_proto::tonic::metrics::v1::ResourceMetrics {
+                        resource: Some(resource_for("unknown-service")),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )));
+        match rx.try_recv().expect("metrics が route に配送される") {
+            ExportRequest::Metrics(request) => {
+                assert_eq!(request.resource_metrics.len(), 1);
+                assert_eq!(
+                    extract_service_name(request.resource_metrics[0].resource.as_ref()),
+                    "codex_cli_rs"
+                );
+            }
+            _ => panic!("metrics 以外の signal が配送された"),
+        }
     }
 
     #[test]

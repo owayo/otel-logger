@@ -334,6 +334,10 @@ endpoints.
 - **Routing defaults**: `claude-code` → the Anthropic route,
   `codex_cli_rs` / `codex_exec` / `codex-app-server` → the OpenAI route.
   Override with `service_names` in the config to add or replace.
+- **HTTP endpoint validation**: `http-protobuf` routes require an absolute
+  `http://` or `https://` URL. Query strings and fragments are rejected at
+  startup because OTLP signal paths (`/v1/logs`, `/v1/traces`, and
+  `/v1/metrics`) are appended to the configured endpoint.
 - **Failure semantics**: JSONL is persisted first, then the payload is
   `try_send`'d to the per-route worker. Workers retry with exponential backoff
   (default 8 attempts, 200ms → 30s cap). The receive path is never blocked by
