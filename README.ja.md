@@ -47,7 +47,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
   - `service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) すべてを Codex として認識。Apps Server は `codex.turn.*` などの metrics を送らず logs / traces だけを送ってくるため、ここを取りこぼすと Apps Server 経由の token usage が累計から欠落する
   - provider/model/effort を固定 allowlist で制限せず動的に保持するため、`gpt-5.6-terra` や Fable のような新しい識別子も lossless に記録する。component 内に `/` や `%` が含まれても別バケットと衝突しない
-  - Codex は SSE の `response.completed` ログを token source として優先する。usage を持たない WebSocket `response.completed` や、`session_task.turn` / `session_task.review` などの trace span 上に出る同一 usage の別表現は、別 usage として加算しない
+  - Codex は model ごとに最初に観測した SSE `response.completed` ログまたは `codex.turn.token_usage` metric を token source として採用する。usage を持たない WebSocket `response.completed` や、`session_task.turn` / `session_task.review` などの trace span 上に出る同一 usage の別表現は、別 usage として加算しない
   - Codex 0.144.1+ の SSE completion に含まれる `model_reasoning_effort` を直接採用し、session 到着前でも実測した `gpt-5.6-terra` の high/xhigh を保持する。pending usage は provider/model/effort/conversation 単位で保留し、遅れて `codex.conversation_starts` が届いた時は、当該 conversation だけを確定 provider (Azure や OpenAI-compatible endpoint) へ移す。既知の SSE effort は保持し、SSE に effort が無い場合だけ session の値で補完する
   - `handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊さない
   - token / duration / cost の属性値や metric 値に NaN / Infinity / 範囲外の巨大な double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの `i64::MAX` / `u64::MAX` 飽和値や `cost_usd=inf` の混入を防ぐ)
@@ -136,9 +136,10 @@ otel-logger [OPTIONS]
 設定ファイル側の `log-dir` を無視し、`--log-dir` を指定した場合は設定ファイル側の
 `log-file` を無視します。
 
-`log-dir` 利用時の保持期間 cleanup は、`otel-logger.YYYY-MM-DD` 形式の日次ローテーション
+`log-dir` 利用時の保持期間 cleanup は、`otel-logger.YYYY-MM-DD` 形式かつ実在する暦日の日次ローテーション
 ファイルだけを削除対象にします。同じディレクトリにある `otel-logger.pid`、
 `otel-logger.stderr.log`、単体の `otel-logger.jsonl` などは削除しません。
+`otel-logger.2026-99-99` のように日付として成立しない名前も削除対象外です。
 
 コメント入りのテンプレートは `init` コマンドで生成できます:
 
@@ -389,17 +390,17 @@ checkpoint として保持し、起動時に catch-up 走査して欠測ゼロ�
 ## 累計トークン統計
 
 `otel-logger` は両エージェントのトークン / コスト / duration を集計し、2 つの方法で公開します。
-Claude は token/cost を metrics 主軸、request count/duration を log 補完で扱います。
+Claude は metrics で token/cost の初期値を集計し、対応する API request log が届いた場合はログ側へ置き換えたうえで request count/duration も補完します。
 Codex の token usage は Codex が出す 2 つの形を重複排除して集計します。現在のローカルログと CI artifact では `codex.sse_event` / `response.completed` log が最も完全な token counter を持つため、これが最初の token source ならそれを採用し、`codex.turn.token_usage` metrics は最初または唯一の token source として観測された場合の fallback として使います。
 
 | エージェント | tokens & cost                                              | request_count                       | duration                              | メタデータ                                                       |
 |--------------|------------------------------------------------------------|-------------------------------------|---------------------------------------|------------------------------------------------------------------|
 | claude-code  | metrics `claude_code.token.usage` + `claude_code.cost.usage` | log `claude_code.api_request`         | log `claude_code.api_request.duration_ms` | —                                                                |
-| codex        | log `codex.sse_event` / `response.completed` または fallback metric `codex.turn.token_usage` (Histogram、`total` は無視) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms`     | log/span event `codex.conversation_starts` (`provider`/`effort` 補完) |
+| codex        | model ごとの最初の source: log `codex.sse_event` / `response.completed` または metric `codex.turn.token_usage` (Histogram、`total` は無視) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms`     | log/span event `codex.conversation_starts` (`provider`/`effort` 補完) |
 
 Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
 
-Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。`tool_token_count` は他の token 種別と重複するため加算しません。SSE ログの `cache_write_token_count` と metric の token type `cache_write_input` は、どちらも `cache_creation_tokens` に集計します。実ログでは `input_token_count == tool_token_count` かつ output/cache-read/cache-write/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。ただし、同じ形でも cache write が 1 以上なら実 usage として集計します。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。tracing exporter によっては span event の name が source location になり、論理名 `codex.conversation_starts` は `event.name` 属性へ格納されます。provider/effort の補完では、この現行形式と論理名を直接持つ旧形式の両方を受け付けます。log record では論理名が body、`event.name` 属性、top-level の `LogRecord.event_name` のいずれに入る形式も受け付けます。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
+Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。ローカル実ログでは SSE 先着と metric 先着の両方があり、metric 先着時も後着 SSE と token 種別ごとの合計が完全一致することを確認しています。`tool_token_count` は他の token 種別と重複するため加算しません。SSE ログの `cache_write_token_count` と metric の token type `cache_write_input` は、どちらも `cache_creation_tokens` に集計します。実ログでは `input_token_count == tool_token_count` かつ output/cache-read/cache-write/reasoning がすべて 0 の tool-only `response.completed` が turn metrics / `handle_responses` span usage から除外されているため、`otel-logger` でも token usage としては数えません。ただし、同じ形でも cache write が 1 以上なら実 usage として集計します。`session_task.turn` / `session_task.review` span の `codex.turn.token_usage.*` も同じ usage の別表現なので、trace span から token は計上しません。tracing exporter によっては span event の name が source location になり、論理名 `codex.conversation_starts` は `event.name` 属性へ格納されます。provider/effort の補完では、この現行形式と論理名を直接持つ旧形式の両方を受け付けます。log record では論理名が body、`event.name` 属性、top-level の `LogRecord.event_name` のいずれに入る形式も受け付けます。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。
 
 ### `GET /stats` (常時有効)
 

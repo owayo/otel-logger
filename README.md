@@ -51,7 +51,7 @@ the agent emits during a CI job and surface it where developers already look.
   de-duplication between logs and metrics
   - Recognises every Codex binary via `service.name` (TUI `codex_cli_rs`, Exec `codex_exec`, Apps Server `codex-app-server` from Codex 0.140.0+) so Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
   - Keeps provider/model/effort values dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free
-  - For Codex, SSE `response.completed` logs are the preferred token source when present; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
+  - For Codex, the first SSE `response.completed` log or `codex.turn.token_usage` metric observed for each model becomes that model's token source; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
   - Codex 0.144.1+ `model_reasoning_effort` on SSE completions is used directly, preserving observed `gpt-5.6-terra` high/xhigh usage even before its session arrives. Pending usage is tracked by provider/model/effort/conversation, so a delayed `codex.conversation_starts` moves only that conversation to the confirmed provider (Azure or another OpenAI-compatible endpoint), retaining a known SSE effort and using the session effort only when SSE omitted it
   - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
   - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
@@ -147,9 +147,10 @@ For the mutually exclusive log sinks, this precedence also applies across
 `log-dir`, and specifying `--log-dir` ignores a configured `log-file`.
 
 When `log-dir` is used, retention cleanup only removes daily rotated files
-named `otel-logger.YYYY-MM-DD`. Other files in the same directory, such as
+named `otel-logger.YYYY-MM-DD` whose suffix is a real calendar date. Other files in the same directory, such as
 `otel-logger.pid`, `otel-logger.stderr.log`, or a standalone
-`otel-logger.jsonl`, are left untouched.
+`otel-logger.jsonl`, as well as date-shaped names that contain an impossible
+date, are left untouched.
 
 Generate a fully-commented starter file with the bundled command:
 
@@ -418,8 +419,9 @@ follow-up work.
 ## Cumulative usage stats
 
 `otel-logger` aggregates token / cost / duration usage from both agents and
-exposes the running totals two ways. Claude usage is metrics-first for
-tokens/cost and log-assisted for request count/duration. Codex token usage is
+exposes the running totals two ways. Claude metrics provide the initial
+token/cost totals, while a matching API request log supersedes them and also
+provides request count/duration. Codex token usage is
 deduplicated across the two shapes Codex emits: current local and CI logs
 provide the most complete token counters on
 `codex.sse_event` / `response.completed`, and `codex.turn.token_usage`
@@ -429,7 +431,7 @@ observed.
 | Agent       | tokens & cost                                            | request_count                       | duration                           | metadata                                                         |
 |-------------|----------------------------------------------------------|-------------------------------------|------------------------------------|------------------------------------------------------------------|
 | claude-code | metrics `claude_code.token.usage` + `claude_code.cost.usage` | log `claude_code.api_request`         | log `claude_code.api_request.duration_ms` | —                                                                |
-| codex       | log `codex.sse_event` / `response.completed` or fallback metric `codex.turn.token_usage` (Histogram, `total` ignored) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms` | log/span event `codex.conversation_starts` for `provider`/`effort` |
+| codex       | first source per model: log `codex.sse_event` / `response.completed` or metric `codex.turn.token_usage` (Histogram, `total` ignored) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms` | log/span event `codex.conversation_starts` for `provider`/`effort` |
 
 Anthropic logs strip variant suffixes from `model` (e.g. `claude-opus-4-7`)
 while metrics carry the full name (`claude-opus-4-7[1m]`). The aggregator
@@ -441,7 +443,8 @@ dropped with a warning.
 Codex emits both SSE completion logs and turn token metrics for the same
 usage. `otel-logger` accepts the first token source observed for each model
 and ignores the other source for that model's token counters to avoid
-double-counting.
+double-counting. Real local logs contain both arrival orders; when metrics
+arrived first, their per-class totals exactly matched the later SSE values.
 `tool_token_count` is not added because it overlaps the other token classes.
 `cache_write_token_count` in SSE logs and the metric token type
 `cache_write_input` both contribute to `cache_creation_tokens`.

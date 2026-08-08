@@ -1961,6 +1961,59 @@ mod tests {
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
     }
 
+    /// 実ログでは同じ turn の metric と SSE が交互に届き、model によっては metric が
+    /// 先着する。先に確定した metric source を維持し、後着 SSE を二重計上しないこと。
+    #[test]
+    fn codex_metric_source_prevents_later_sse_double_count() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.4-mini"),
+                kv_str("reasoning_effort", "low"),
+            ],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.4-mini", "input", 100.0),
+                codex_token_metric("gpt-5.4-mini", "output", 20.0),
+                codex_token_metric("gpt-5.4-mini", "cached_input", 50.0),
+                codex_token_metric("gpt-5.4-mini", "reasoning_output", 30.0),
+            ],
+        ));
+
+        let count = agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-5.4-mini"),
+                kv_str("input_token_count", "100"),
+                kv_str("output_token_count", "20"),
+                kv_int("cached_token_count", 50),
+                kv_int("cache_write_token_count", 0),
+                kv_int("reasoning_token_count", 30),
+                kv_str("tool_token_count", "120"),
+            ],
+        ));
+
+        assert_eq!(count, 0, "metric 確定後の同一 SSE は集計しない");
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.4-mini/low"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 100);
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 30);
+    }
+
     #[test]
     fn codex_sse_response_completed_log_counts_token_usage() {
         let agg = Aggregator::new();

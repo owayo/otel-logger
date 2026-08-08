@@ -344,12 +344,31 @@ fn is_rotated_log_filename(filename: &str) -> bool {
         return false;
     };
     let bytes = date.as_bytes();
-    bytes.len() == 10
-        && bytes[0..4].iter().all(u8::is_ascii_digit)
-        && bytes[4] == b'-'
-        && bytes[5..7].iter().all(u8::is_ascii_digit)
-        && bytes[7] == b'-'
-        && bytes[8..10].iter().all(u8::is_ascii_digit)
+    if bytes.len() != 10
+        || !bytes[0..4].iter().all(u8::is_ascii_digit)
+        || bytes[4] != b'-'
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || bytes[7] != b'-'
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+
+    // 桁だけを見ると `2026-99-99` のように LogRoller が生成しない名前まで削除対象に
+    // なる。年月日を暦として検証し、実在する日次ローテーション名だけを許可する。
+    let Ok(year) = date[0..4].parse::<i32>() else {
+        return false;
+    };
+    let Ok(month) = date[5..7].parse::<u8>() else {
+        return false;
+    };
+    let Ok(day) = date[8..10].parse::<u8>() else {
+        return false;
+    };
+    let Ok(month) = time::Month::try_from(month) else {
+        return false;
+    };
+    time::Date::from_calendar_date(year, month, day).is_ok()
 }
 
 #[cfg(test)]
@@ -467,12 +486,14 @@ mod tests {
         let stderr = dir.path().join("otel-logger.stderr.log");
         let jsonl = dir.path().join("otel-logger.jsonl");
         let unrelated = dir.path().join("other-app.log");
+        let invalid_date = dir.path().join("otel-logger.2020-99-99");
         std::fs::write(&old, "old").unwrap();
         std::fs::write(&recent, "recent").unwrap();
         std::fs::write(&pid, "12345").unwrap();
         std::fs::write(&stderr, "stderr").unwrap();
         std::fs::write(&jsonl, "jsonl").unwrap();
         std::fs::write(&unrelated, "other").unwrap();
+        std::fs::write(&invalid_date, "invalid date").unwrap();
 
         let three_days_ago = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         touch_mtime(&old, three_days_ago);
@@ -480,6 +501,7 @@ mod tests {
         touch_mtime(&stderr, three_days_ago);
         touch_mtime(&jsonl, three_days_ago);
         touch_mtime(&unrelated, three_days_ago);
+        touch_mtime(&invalid_date, three_days_ago);
 
         cleanup_old_rotated_logs(dir.path(), 1).unwrap();
 
@@ -489,6 +511,18 @@ mod tests {
         assert!(stderr.exists(), "stderr file must not be touched");
         assert!(jsonl.exists(), "non-rotated JSONL file must not be touched");
         assert!(unrelated.exists(), "unrelated file must not be touched");
+        assert!(
+            invalid_date.exists(),
+            "実在しない日付のファイルはローテーション出力として削除しない"
+        );
+    }
+
+    #[test]
+    fn rotated_log_filename_requires_a_real_calendar_date() {
+        assert!(is_rotated_log_filename("otel-logger.2024-02-29"));
+        assert!(!is_rotated_log_filename("otel-logger.2023-02-29"));
+        assert!(!is_rotated_log_filename("otel-logger.2026-13-01"));
+        assert!(!is_rotated_log_filename("otel-logger.2026-04-31"));
     }
 
     fn settings_with_log_file(path: std::path::PathBuf) -> crate::cli::Settings {
