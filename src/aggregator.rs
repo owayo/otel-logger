@@ -26,16 +26,23 @@ const SERVICE_CODEX_EXEC: &str = "codex_exec";
 /// `codex.conversation_starts` / `codex.sse_event` を発行するため、Codex 系の
 /// 集計対象に含める。
 const SERVICE_CODEX_APP_SERVER: &str = "codex-app-server";
+/// Codex MCP Server が送る OTLP の `service.name`。0.146.1 / 0.147.0 の実ログでは
+/// process / SQLite 初期化 metrics が観測されているため、他の Codex バイナリと同じ
+/// 集計対象として扱う。
+const SERVICE_CODEX_MCP_SERVER: &str = "codex_mcp_server";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_OPENAI: &str = "OpenAI";
 const UNKNOWN: &str = "unknown";
 
-/// OTLP の `service.name` が Codex 系 (TUI / Exec / Apps Server) かを判定する。
+/// OTLP の `service.name` が Codex 系 (TUI / Exec / Apps Server / MCP Server) かを判定する。
 /// 新しい Codex バイナリが増えた場合はここに追加する。
 fn is_codex_service(service: &str) -> bool {
     matches!(
         service,
-        SERVICE_CODEX_TUI | SERVICE_CODEX_EXEC | SERVICE_CODEX_APP_SERVER
+        SERVICE_CODEX_TUI
+            | SERVICE_CODEX_EXEC
+            | SERVICE_CODEX_APP_SERVER
+            | SERVICE_CODEX_MCP_SERVER
     )
 }
 
@@ -919,12 +926,7 @@ fn merge_codex_pending_sse(
     conversation_id: &str,
     effort: &str,
 ) {
-    if model.is_empty() || effort.is_empty() || effort == UNKNOWN {
-        return;
-    }
-    let from = Bucket::from_parts(provider.to_string(), model.to_string(), UNKNOWN.to_string());
-    let to = Bucket::from_parts(provider.to_string(), model.to_string(), effort.to_string());
-    if from == to {
+    if model.is_empty() {
         return;
     }
     if !conversation_id.is_empty() {
@@ -940,7 +942,7 @@ fn merge_codex_pending_sse(
         let matching: Vec<(PendingCodexSseKey, ModelStats)> = g
             .codex_pending_sse
             .iter()
-            .filter(|(k, _)| k.model == from.model && k.conversation_id == conversation_id)
+            .filter(|(k, _)| k.model == model && k.conversation_id == conversation_id)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if matching.is_empty() {
@@ -952,6 +954,10 @@ fn merge_codex_pending_sse(
             // response に最も近い SSE 自身の effort を優先し、SSE が unknown の場合だけ
             // 遅着した session の effort で補完する。
             let resolved_effort = if key.effort == UNKNOWN {
+                if effort.is_empty() || effort == UNKNOWN {
+                    // session 側にも effort が無ければ確定できないため pending を維持する。
+                    continue;
+                }
                 effort.to_string()
             } else {
                 key.effort.clone()
@@ -963,6 +969,14 @@ fn merge_codex_pending_sse(
                 move_codex_bucket_stats(g, &actual_from, &actual_to, &pending);
             }
         }
+        return;
+    }
+    if effort.is_empty() || effort == UNKNOWN {
+        return;
+    }
+    let from = Bucket::from_parts(provider.to_string(), model.to_string(), UNKNOWN.to_string());
+    let to = Bucket::from_parts(provider.to_string(), model.to_string(), effort.to_string());
+    if from == to {
         return;
     }
     // conversation_id が空: 古い telemetry 互換。unknown バケットの残り全体を新 effort へ移す。
@@ -3283,13 +3297,14 @@ mod tests {
         assert_eq!(updates, 1);
     }
 
-    /// `is_codex_service` は TUI / Exec / Apps Server を Codex として扱い、
+    /// `is_codex_service` は TUI / Exec / Apps Server / MCP Server を Codex として扱い、
     /// 既存の Claude や未知の service.name は false で弾く。
     #[test]
     fn is_codex_service_recognizes_all_codex_binaries() {
         assert!(is_codex_service(SERVICE_CODEX_TUI));
         assert!(is_codex_service(SERVICE_CODEX_EXEC));
         assert!(is_codex_service(SERVICE_CODEX_APP_SERVER));
+        assert!(is_codex_service(SERVICE_CODEX_MCP_SERVER));
         assert!(!is_codex_service(SERVICE_CLAUDE));
         assert!(!is_codex_service(""));
         assert!(!is_codex_service("codex-unknown"));
@@ -3452,6 +3467,47 @@ mod tests {
                 .buckets
                 .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.6-terra/high")),
             "SSE 時の OpenAI/gpt-5.6-terra/high バケットは pending の移動後に削除されるべき"
+        );
+    }
+
+    /// session に reasoning_effort が無くても、SSE 自身の既知 effort を使って
+    /// 暫定 OpenAI provider から遅着した非デフォルト provider へ移動する。
+    #[test]
+    fn codex_late_session_without_effort_moves_known_sse_effort_to_provider() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-provider-only"),
+                kv_str("model", "gpt-5.6-terra"),
+                kv_str("model_reasoning_effort", "high"),
+                kv_str("input_token_count", "100"),
+            ],
+        ));
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-provider-only"),
+                kv_str("provider_name", "azure"),
+                kv_str("model", "gpt-5.6-terra"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(
+            agent.buckets["azure/gpt-5.6-terra/high"].stats.input_tokens,
+            100
+        );
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.6-terra/high"))
         );
     }
 

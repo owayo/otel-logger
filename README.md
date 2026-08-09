@@ -32,8 +32,10 @@ traces, metrics, and logs, and writes them in two ways:
 - **stdout**: human-readable, color-coded one-liner per record (great for CI logs).
 - **JSON Lines** (`--log-file` / `--log-dir`): lossless, schema-preserving for offline analysis, either as one append-only file or daily-rotated files.
 
-It does **not** forward to Jaeger/Honeycomb/etc. — the goal is to capture what
-the agent emits during a CI job and surface it where developers already look.
+By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to
+capture what the agent emits during a CI job and surface it where developers
+already look. Optional OTLP proxy routes can forward the persisted payloads to
+upstream collectors.
 
 ## Features
 
@@ -49,7 +51,7 @@ the agent emits during a CI job and surface it where developers already look.
   - gRPC/HTTP raise their per-request decode limit to 32 MiB (above `tonic`'s 4 MiB / `axum`'s 2 MiB defaults) so large batches are persisted instead of being permanently rejected with `RESOURCE_EXHAUSTED` / `413` that exporter retries cannot recover from
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
-  - Recognises every Codex binary via `service.name` (TUI `codex_cli_rs`, Exec `codex_exec`, Apps Server `codex-app-server` from Codex 0.140.0+) so Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
+  - Recognises supported Codex processes via `service.name`: TUI (`codex_cli_rs`), Exec (`codex_exec`), Apps Server (`codex-app-server`, Codex 0.140.0+), and MCP Server (`codex_mcp_server`, observed in Codex 0.146.1/0.147.0). Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
   - Keeps provider/model/effort values dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free
   - For Codex, the first SSE `response.completed` log or `codex.turn.token_usage` metric observed for each model becomes that model's token source; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
   - Codex 0.144.1+ `model_reasoning_effort` on SSE completions is used directly, preserving observed `gpt-5.6-terra` high/xhigh usage even before its session arrives. Pending usage is tracked by provider/model/effort/conversation, so a delayed `codex.conversation_starts` moves only that conversation to the confirmed provider (Azure or another OpenAI-compatible endpoint), retaining a known SSE effort and using the session effort only when SSE omitted it
@@ -123,7 +125,7 @@ otel-logger [OPTIONS]
 | `--proxy-anthropic-endpoint` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | Forward `service.name=claude-code` payloads to this upstream OTLP endpoint (see [OTLP proxy forwarding](#otlp-proxy-forwarding)) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` or `http-protobuf`                                 |
 | `--proxy-anthropic-header` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` header (`env:VAR_NAME` resolves from env); repeatable |
-| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server`) payloads |
+| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server`) payloads |
 | `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | Same as above                                             |
 | `--proxy-openai-header` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | Same as above                                             |
 | `--proxy-checkpoint-dir` | | (next to JSONL) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | Directory for forward checkpoints (reserved for Phase B)  |
@@ -149,8 +151,8 @@ For the mutually exclusive log sinks, this precedence also applies across
 When `log-dir` is used, retention cleanup only removes daily rotated files
 named `otel-logger.YYYY-MM-DD` whose suffix is a real calendar date. Other files in the same directory, such as
 `otel-logger.pid`, `otel-logger.stderr.log`, or a standalone
-`otel-logger.jsonl`, as well as date-shaped names that contain an impossible
-date, are left untouched.
+`otel-logger.jsonl`, are left untouched. Date-shaped names containing an
+impossible date and symbolic links are also left untouched.
 
 Generate a fully-commented starter file with the bundled command:
 
@@ -333,8 +335,13 @@ endpoints.
   `--log-dir`) so every accepted payload remains durable even when forwarding
   fails. Automatic replay to the upstream is planned for Phase B.
 - **Routing defaults**: `claude-code` → the Anthropic route,
-  `codex_cli_rs` / `codex_exec` / `codex-app-server` → the OpenAI route.
-  Override with `service_names` in the config to add or replace.
+  `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → the
+  OpenAI route. Override with a non-empty `service_names` list in the config to
+  add or replace; empty names are rejected at startup so resources without a
+  `service.name` cannot be routed accidentally.
+- **Precedence**: CLI transport and headers override a matching built-in route
+  in the config while reusing its endpoint, following CLI > environment >
+  config precedence without requiring the endpoint to be repeated.
 - **HTTP endpoint validation**: `http-protobuf` routes require an absolute
   `http://` or `https://` URL. Query strings and fragments are rejected at
   startup because OTLP signal paths (`/v1/logs`, `/v1/traces`, and

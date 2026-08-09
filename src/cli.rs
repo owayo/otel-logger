@@ -112,7 +112,8 @@ pub struct Cli {
     pub proxy_anthropic_headers: Vec<String>,
 
     /// Forward Codex (`service.name=codex_cli_rs` etc.) telemetry to this OTLP endpoint.
-    /// Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server`) の OTLP を、
+    /// Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` /
+    /// `codex_mcp_server`) の OTLP を、
     /// JSONL 保存と同時にこの endpoint へ転送する。
     #[arg(long, env = "OTEL_LOGGER_PROXY_OPENAI_ENDPOINT", value_name = "URL")]
     pub proxy_openai_endpoint: Option<String>,
@@ -231,7 +232,12 @@ pub const DEFAULT_PROXY_RETRY_MAX: u32 = 8;
 /// 組み込みの vendor 既定マッピング。CLI 短縮フラグ / 明示的な
 /// `[[proxy.routes]]` で `service_names` を上書き可能。
 pub const DEFAULT_ANTHROPIC_SERVICES: &[&str] = &["claude-code"];
-pub const DEFAULT_OPENAI_SERVICES: &[&str] = &["codex_cli_rs", "codex_exec", "codex-app-server"];
+pub const DEFAULT_OPENAI_SERVICES: &[&str] = &[
+    "codex_cli_rs",
+    "codex_exec",
+    "codex-app-server",
+    "codex_mcp_server",
+];
 
 /// route 1 件分の解決済み設定。CLI/config/組み込み既定を merge 済みで、環境変数
 /// (`env:VAR`) も展開済みなので、あとは forwarder が使うだけの状態。
@@ -422,6 +428,14 @@ fn resolve_proxy_settings(
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for route in &routes {
         for svc in &route.service_names {
+            // service.name が無い resource は空文字として扱われるため、空の設定値を
+            // 許すと「未分類 resource」を意図せず転送してしまう。
+            if svc.is_empty() {
+                anyhow::bail!(
+                    "proxy route `{}` contains an empty `service_names` entry",
+                    route.name
+                );
+            }
             if let Some(prev) = seen.insert(svc.clone(), route.name.clone()) {
                 anyhow::bail!(
                     "proxy service_names `{svc}` is claimed by both routes `{prev}` and `{cur}`",
@@ -505,20 +519,17 @@ fn build_vendor_route(
             )
         }
         (None, Some(mut cfg)) => {
-            if cli_transport.is_some() {
-                anyhow::bail!(
-                    "--proxy-{name}-transport requires --proxy-{name}-endpoint (or a config endpoint)"
-                );
-            }
-            if !cli_headers.is_empty() {
-                anyhow::bail!(
-                    "--proxy-{name}-header requires --proxy-{name}-endpoint (or a config endpoint)"
-                );
-            }
-            let transport = cfg.transport.take().unwrap_or_default();
+            // endpoint は config の値を使い、CLI で指定された transport / header だけを
+            // 上書きする。優先順位 (CLI > config) を守るため、endpoint の再指定は要求しない。
+            let transport = cli_transport
+                .map(ProxyTransport::from)
+                .or(cfg.transport.take())
+                .unwrap_or_default();
+            let mut headers = cfg.headers;
+            merge_cli_headers(&mut headers, &cli_headers)?;
             let signals = normalize_signals(cfg.signal_types);
             let service_names = normalize_service_names(cfg.service_names, default_services);
-            (cfg.endpoint, transport, cfg.headers, signals, service_names)
+            (cfg.endpoint, transport, headers, signals, service_names)
         }
         (None, None) => {
             if cli_transport.is_some() || !cli_headers.is_empty() {
@@ -977,6 +988,7 @@ mod tests {
                 "codex_cli_rs".to_string(),
                 "codex_exec".to_string(),
                 "codex-app-server".to_string(),
+                "codex_mcp_server".to_string(),
             ]
         );
         assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
@@ -1072,6 +1084,64 @@ mod tests {
         );
         assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
         assert_eq!(route.endpoint, "https://custom.example");
+    }
+
+    #[test]
+    fn merge_proxy_cli_options_override_config_route_without_repeating_endpoint() {
+        use crate::config::ProxyConfig;
+
+        let mut cli = cli_with_log_file();
+        cli.proxy_openai_transport = Some(ProxyTransportArg::HttpProtobuf);
+        cli.proxy_openai_headers = vec!["X-Source=cli".to_string()];
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "openai".to_string(),
+                    service_names: Vec::new(),
+                    signal_types: Vec::new(),
+                    transport: Some(ProxyTransport::Grpc),
+                    endpoint: "https://config.example".to_string(),
+                    headers: BTreeMap::from([
+                        ("X-Keep".to_string(), "config".to_string()),
+                        ("X-Source".to_string(), "config".to_string()),
+                    ]),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        let route = &settings.proxy.unwrap().routes[0];
+        let headers: BTreeMap<_, _> = route.headers.iter().cloned().collect();
+        assert_eq!(route.endpoint, "https://config.example");
+        assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
+        assert_eq!(headers.get("X-Keep"), Some(&"config".to_string()));
+        assert_eq!(headers.get("X-Source"), Some(&"cli".to_string()));
+    }
+
+    #[test]
+    fn merge_proxy_rejects_empty_service_name() {
+        use crate::config::ProxyConfig;
+
+        let cli = cli_with_log_file();
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "custom".to_string(),
+                    service_names: vec![String::new()],
+                    signal_types: Vec::new(),
+                    transport: None,
+                    endpoint: "https://collector.example".to_string(),
+                    headers: BTreeMap::new(),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let err = Settings::merge_with_home(cli, config, None).unwrap_err();
+        assert!(err.to_string().contains("empty `service_names`"));
     }
 
     #[test]

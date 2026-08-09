@@ -320,7 +320,9 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        // LogRoller が生成する通常ファイルだけを対象にする。`Path::is_file()` は
+        // symlink を辿るため、同じ名前の symlink まで誤って削除対象にしてしまう。
+        if !entry.file_type()?.is_file() {
             continue;
         }
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
@@ -523,6 +525,26 @@ mod tests {
         assert!(!is_rotated_log_filename("otel-logger.2023-02-29"));
         assert!(!is_rotated_log_filename("otel-logger.2026-13-01"));
         assert!(!is_rotated_log_filename("otel-logger.2026-04-31"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_remove_symlink_named_like_rotated_log() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.jsonl");
+        let link = dir.path().join("otel-logger.2020-01-01");
+        std::fs::write(&target, "not a LogRoller output").unwrap();
+        symlink(&target, &link).unwrap();
+
+        // cutoff=now としても symlink は通常ファイルではないため削除しない。
+        cleanup_old_rotated_logs(dir.path(), 0).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "LogRoller が生成しない symlink は削除対象外"
+        );
     }
 
     fn settings_with_log_file(path: std::path::PathBuf) -> crate::cli::Settings {

@@ -30,7 +30,7 @@ OTLP/gRPC を `:4317`、OTLP/HTTP を `:4318` で受け、Traces / Metrics / Log
 - **stdout**: 1 件ずつ整形した可読ログ (CI ログでそのまま読める)
 - **JSON Lines** (`--log-file` / `--log-dir`): 元の OTLP 構造を欠落させない永続化先。単一の追記ファイルまたは日次ローテーションファイルとして保存
 
-Jaeger や Honeycomb への転送は行いません。CI 実行中にエージェントが吐くテレメトリを、開発者がいつも見ている場所 (CI ログ / アーティファクト) に出すことだけを目的にしています。
+既定では Jaeger や Honeycomb への転送を行いません。CI 実行中にエージェントが吐くテレメトリを、開発者がいつも見ている場所 (CI ログ / アーティファクト) に出すことが主目的です。任意の OTLP proxy route を設定すると、永続化した payload を上流 collector にも転送できます。
 
 ## 特徴
 
@@ -45,7 +45,7 @@ Jaeger や Honeycomb への転送は行いません。CI 実行中にエージ�
   - 各 batch は ACK 前に `BufWriter::flush` で kernel まで書き出すため、process crash で末尾の write がメモリバッファに取り残されることがない
   - gRPC / HTTP の 1 リクエスト上限を 32 MiB (`tonic` 既定 4 MiB / `axum` 既定 2 MiB より引き上げ) にし、大きな batch を `RESOURCE_EXHAUSTED` / `413` で恒久拒否せず保存する (exporter の retry でも回復できない欠落を防ぐ)
 - Claude/Codex の累計使用量を `/stats` と `--summary` で表示し、logs と metrics の二重計上を回避
-  - `service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) すべてを Codex として認識。Apps Server は `codex.turn.*` などの metrics を送らず logs / traces だけを送ってくるため、ここを取りこぼすと Apps Server 経由の token usage が累計から欠落する
+  - `service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) / MCP Server (`codex_mcp_server`、Codex 0.146.1 / 0.147.0 の実ログで確認) を Codex として認識。Apps Server は `codex.turn.*` などの metrics を送らず logs / traces だけを送ってくるため、ここを取りこぼすと Apps Server 経由の token usage が累計から欠落する
   - provider/model/effort を固定 allowlist で制限せず動的に保持するため、`gpt-5.6-terra` や Fable のような新しい識別子も lossless に記録する。component 内に `/` や `%` が含まれても別バケットと衝突しない
   - Codex は model ごとに最初に観測した SSE `response.completed` ログまたは `codex.turn.token_usage` metric を token source として採用する。usage を持たない WebSocket `response.completed` や、`session_task.turn` / `session_task.review` などの trace span 上に出る同一 usage の別表現は、別 usage として加算しない
   - Codex 0.144.1+ の SSE completion に含まれる `model_reasoning_effort` を直接採用し、session 到着前でも実測した `gpt-5.6-terra` の high/xhigh を保持する。pending usage は provider/model/effort/conversation 単位で保留し、遅れて `codex.conversation_starts` が届いた時は、当該 conversation だけを確定 provider (Azure や OpenAI-compatible endpoint) へ移す。既知の SSE effort は保持し、SSE に effort が無い場合だけ session の値で補完する
@@ -115,7 +115,7 @@ otel-logger [OPTIONS]
 | `--proxy-anthropic-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | `service.name=claude-code` の受信 payload を転送する上流 OTLP endpoint (詳細は [OTLP proxy 転送](#otlp-proxy-転送) 節) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` / `http-protobuf`                                    |
 | `--proxy-anthropic-header` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` 形式 (`env:VAR_NAME` で環境変数解決)。複数指定可 |
-| `--proxy-openai-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server`) の転送先 |
+| `--proxy-openai-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server`) の転送先 |
 | `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | 同上                                                        |
 | `--proxy-openai-header` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | 同上                                                        |
 | `--proxy-checkpoint-dir` | | (JSONL の隣) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | 転送 checkpoint 用ディレクトリ (Phase B 用に予約)              |
@@ -139,7 +139,8 @@ otel-logger [OPTIONS]
 `log-dir` 利用時の保持期間 cleanup は、`otel-logger.YYYY-MM-DD` 形式かつ実在する暦日の日次ローテーション
 ファイルだけを削除対象にします。同じディレクトリにある `otel-logger.pid`、
 `otel-logger.stderr.log`、単体の `otel-logger.jsonl` などは削除しません。
-`otel-logger.2026-99-99` のように日付として成立しない名前も削除対象外です。
+`otel-logger.2026-99-99` のように日付として成立しない名前やシンボリックリンクも
+削除対象外です。
 
 コメント入りのテンプレートは `init` コマンドで生成できます:
 
@@ -307,8 +308,12 @@ proxy モードがあります。Claude Code (Anthropic 系) と Codex (OpenAI �
 - **前提**: proxy を有効化するときは `--log-file` か `--log-dir` のどちらかを必ず指定する
   (転送に失敗しても受理済み payload を JSONL に残すため。上流への自動再送は Phase B で実装予定)
 - **振り分け**: 組み込み既定で `claude-code` → Anthropic route、
-  `codex_cli_rs` / `codex_exec` / `codex-app-server` → OpenAI route。
-  config で `service_names` を明示すれば上書き可能
+  `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` →
+  OpenAI route。config で空でない `service_names` を明示すれば上書き可能。
+  空の名前は startup 時に reject し、`service.name` が無い resource の誤転送を防ぐ
+- **優先順位**: 組み込み route と同名の config endpoint はそのまま利用しつつ、CLI の
+  transport / header で上書きできる。endpoint を CLI で重ねて指定しなくても
+  CLI > 環境変数 > config の優先順位を守る
 - **HTTP endpoint の検証**: `http-protobuf` route には絶対 `http://` / `https://`
   URL を指定する。設定値の末尾へ signal 別パス (`/v1/logs`、`/v1/traces`、
   `/v1/metrics`) を追加するため、query と fragment は startup 時に reject する
