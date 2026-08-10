@@ -52,6 +52,7 @@ upstream collectors.
 - Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
   de-duplication between logs and metrics
   - Recognises supported Codex processes via `service.name`: TUI (`codex_cli_rs`), Exec (`codex_exec`), Apps Server (`codex-app-server`, Codex 0.140.0+), and MCP Server (`codex_mcp_server`, observed in Codex 0.146.1/0.147.0). Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
+  - Keeps the last-session fallback for Codex metrics scoped to the same `service.name`, so concurrently running TUI and Exec processes cannot assign each other's provider or reasoning effort
   - Keeps provider/model/effort values dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free
   - For Codex, the first SSE `response.completed` log or `codex.turn.token_usage` metric observed for each model becomes that model's token source; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
   - Codex 0.144.1+ `model_reasoning_effort` on SSE completions is used directly, preserving observed `gpt-5.6-terra` high/xhigh usage even before its session arrives. Pending usage is tracked by provider/model/effort/conversation, so a delayed `codex.conversation_starts` moves only that conversation to the confirmed provider (Azure or another OpenAI-compatible endpoint), retaining a known SSE effort and using the session effort only when SSE omitted it
@@ -480,6 +481,10 @@ matching `conversation_starts` has not been seen yet, the entry lands in an
 `effort=unknown` bucket and is merged into the correct effort bucket once the
 metadata catches up. This keeps interleaved or long-running Codex
 conversations from moving token usage into the wrong effort bucket.
+Codex turn metrics do not carry `conversation.id` or reasoning effort. Their
+last-session fallback is therefore isolated by `service.name`, preventing a
+concurrent TUI (`codex_cli_rs`) and Exec (`codex_exec`) process from assigning
+one process's provider/effort metadata to the other's metrics.
 
 ### `GET /stats` (always on)
 

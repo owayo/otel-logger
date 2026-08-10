@@ -233,10 +233,10 @@ struct AggregatorInner {
     /// 二重計上を避けるため取り消す metrics 側の累計 usage。
     claude_metric_usage: HashMap<ClaudeUsageKey, ModelStats>,
 
-    /// `codex.conversation_starts` の log/event から最後に観測した Codex セッション情報。
-    /// Codex metrics には `reasoning_effort` が載らないため、直近のセッション値に
-    /// フォールバックする。
-    codex_last_session: Option<CodexSession>,
+    /// `service.name` ごとに最後に観測した Codex セッション情報。
+    /// Codex metrics には `conversation.id` / `reasoning_effort` が載らないため、同じ
+    /// service の直近セッション値にフォールバックし、別プロセスの effort 混入を防ぐ。
+    codex_last_sessions: HashMap<String, CodexSession>,
 
     /// `conversation.id` ごとの Codex セッション情報。
     /// SSE 完了ログには `conversation.id` が載るため、同時進行のセッションが混ざっても
@@ -300,7 +300,7 @@ impl Aggregator {
                 claude_canonical_models: HashMap::new(),
                 claude_usage_sources: HashMap::new(),
                 claude_metric_usage: HashMap::new(),
-                codex_last_session: None,
+                codex_last_sessions: HashMap::new(),
                 codex_sessions: HashMap::new(),
                 codex_token_sources: HashMap::new(),
                 codex_pending_sse: HashMap::new(),
@@ -330,10 +330,10 @@ impl Aggregator {
                     if is_codex_service(service)
                         && let Some(session) = extract_codex_conversation_starts(log)
                     {
-                        update_codex_session(&mut g, session);
+                        update_codex_session(&mut g, service, session);
                     }
                     if is_codex_service(service)
-                        && let Some(parsed) = extract_codex_sse_response_completed(&g, log)
+                        && let Some(parsed) = extract_codex_sse_response_completed(&g, service, log)
                     {
                         let CodexSseExtraction {
                             bucket,
@@ -384,14 +384,14 @@ impl Aggregator {
                         if otel_event_matches(&ev.name, &ev.attributes, "codex.conversation_starts")
                             && let Some(session) = extract_session_from_attrs(&ev.attributes)
                         {
-                            update_codex_session(&mut g, session);
+                            update_codex_session(&mut g, service, session);
                             session_updates += 1;
                         }
                     }
                     // `codex.conversation_starts` が落ちても、同じジョブの後続実行では
                     // `handle_responses` span に effort が残るため、そこから補完する。
                     if span.name == "handle_responses"
-                        && update_codex_effort_from_request_attrs(&mut g, &span.attributes)
+                        && update_codex_effort_from_request_attrs(&mut g, service, &span.attributes)
                     {
                         session_updates += 1;
                     }
@@ -422,11 +422,15 @@ impl Aggregator {
                         };
                     } else if is_codex_service(service_str) {
                         count += match metric.name.as_str() {
-                            "codex.turn.token_usage" => ingest_codex_token(&mut g, metric),
-                            "codex.conversation.turn.count" => {
-                                ingest_codex_turn_count(&mut g, metric)
+                            "codex.turn.token_usage" => {
+                                ingest_codex_token(&mut g, service_str, metric)
                             }
-                            "codex.turn.e2e_duration_ms" => ingest_codex_duration(&mut g, metric),
+                            "codex.conversation.turn.count" => {
+                                ingest_codex_turn_count(&mut g, service_str, metric)
+                            }
+                            "codex.turn.e2e_duration_ms" => {
+                                ingest_codex_duration(&mut g, service_str, metric)
+                            }
                             _ => 0,
                         };
                     }
@@ -613,6 +617,7 @@ struct CodexSseExtraction {
 
 fn extract_codex_sse_response_completed(
     g: &AggregatorInner,
+    service: &str,
     log: &LogRecord,
 ) -> Option<CodexSseExtraction> {
     let attrs = &log.attributes;
@@ -656,7 +661,7 @@ fn extract_codex_sse_response_completed(
     let session = if has_conversation_id {
         codex_session_for_attrs(g, attrs)
     } else {
-        g.codex_last_session.as_ref()
+        codex_last_session(g, service)
     };
     let model = string_attr(attrs, "model")
         .filter(|model| !model.is_empty())
@@ -756,7 +761,7 @@ fn ingest_claude_cost(g: &mut AggregatorInner, metric: &Metric) -> usize {
     hits
 }
 
-fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
+fn ingest_codex_token(g: &mut AggregatorInner, service: &str, metric: &Metric) -> usize {
     let Some(MetricData::Histogram(hist)) = metric.data.as_ref() else {
         return 0;
     };
@@ -773,8 +778,8 @@ fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
             continue;
         }
         let token_type = string_attr(&dp.attributes, "token_type").unwrap_or("");
-        let provider = codex_provider(g);
-        let effort = codex_effort(g);
+        let provider = codex_provider(g, service);
+        let effort = codex_effort(g, service);
         let value = histogram_sum_as_u64(dp);
         let mut stats = ModelStats::default();
         match token_type {
@@ -795,7 +800,7 @@ fn ingest_codex_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
     hits
 }
 
-fn ingest_codex_turn_count(g: &mut AggregatorInner, metric: &Metric) -> usize {
+fn ingest_codex_turn_count(g: &mut AggregatorInner, service: &str, metric: &Metric) -> usize {
     let Some(MetricData::Sum(sum)) = metric.data.as_ref() else {
         return 0;
     };
@@ -807,8 +812,8 @@ fn ingest_codex_turn_count(g: &mut AggregatorInner, metric: &Metric) -> usize {
         let model = string_attr(&dp.attributes, "model")
             .map(str::to_string)
             .unwrap_or_default();
-        let provider = codex_provider(g);
-        let effort = codex_effort(g);
+        let provider = codex_provider(g, service);
+        let effort = codex_effort(g, service);
         let stats = ModelStats {
             request_count: number_value_as_u64(dp),
             ..Default::default()
@@ -820,7 +825,7 @@ fn ingest_codex_turn_count(g: &mut AggregatorInner, metric: &Metric) -> usize {
     hits
 }
 
-fn ingest_codex_duration(g: &mut AggregatorInner, metric: &Metric) -> usize {
+fn ingest_codex_duration(g: &mut AggregatorInner, service: &str, metric: &Metric) -> usize {
     let Some(MetricData::Histogram(hist)) = metric.data.as_ref() else {
         return 0;
     };
@@ -832,8 +837,8 @@ fn ingest_codex_duration(g: &mut AggregatorInner, metric: &Metric) -> usize {
         let model = string_attr(&dp.attributes, "model")
             .map(str::to_string)
             .unwrap_or_default();
-        let provider = codex_provider(g);
-        let effort = codex_effort(g);
+        let provider = codex_provider(g, service);
+        let effort = codex_effort(g, service);
         let stats = ModelStats {
             duration_ms: histogram_sum_as_u64(dp),
             ..Default::default()
@@ -845,12 +850,16 @@ fn ingest_codex_duration(g: &mut AggregatorInner, metric: &Metric) -> usize {
     hits
 }
 
-fn codex_provider(g: &AggregatorInner) -> String {
-    codex_provider_from_session(g.codex_last_session.as_ref())
+fn codex_last_session<'a>(g: &'a AggregatorInner, service: &str) -> Option<&'a CodexSession> {
+    g.codex_last_sessions.get(service)
 }
 
-fn codex_effort(g: &AggregatorInner) -> String {
-    codex_effort_from_session(g.codex_last_session.as_ref())
+fn codex_provider(g: &AggregatorInner, service: &str) -> String {
+    codex_provider_from_session(codex_last_session(g, service))
+}
+
+fn codex_effort(g: &AggregatorInner, service: &str) -> String {
+    codex_effort_from_session(codex_last_session(g, service))
 }
 
 fn codex_provider_from_session(session: Option<&CodexSession>) -> String {
@@ -886,16 +895,17 @@ fn claude_usage_source_key(model: &str, effort: &str) -> ClaudeUsageKey {
     }
 }
 
-fn update_codex_session(g: &mut AggregatorInner, session: CodexSession) {
-    update_codex_session_with_last(g, session, true);
+fn update_codex_session(g: &mut AggregatorInner, service: &str, session: CodexSession) {
+    update_codex_session_with_last(g, service, session, true);
 }
 
-/// `update_last=false` のときは `codex_last_session` を更新しない。
+/// `update_last=false` のときは当該 service の last session を更新しない。
 /// `conversation.id` 付きの effort 補完が別 conversation の last session を上書きするのを防ぐ
 /// ためのフック。conversation.id を持たない後続 metric の effort バケットが、無関係な
 /// conversation の span に引きずられないようにする (AGENTS.md の方針)。
 fn update_codex_session_with_last(
     g: &mut AggregatorInner,
+    service: &str,
     session: CodexSession,
     update_last: bool,
 ) {
@@ -908,7 +918,7 @@ fn update_codex_session_with_last(
             .insert(conversation_id.clone(), session.clone());
     }
     if update_last {
-        g.codex_last_session = Some(session);
+        g.codex_last_sessions.insert(service.to_string(), session);
     }
     merge_codex_pending_sse(g, &provider, &model, &conversation_id, &effort);
 }
@@ -1042,10 +1052,14 @@ fn sum_pending_for_bucket(g: &AggregatorInner, bucket: &Bucket) -> ModelStats {
 /// (provider/model は `conversation_starts` または metric data point 側に任せる)。
 ///
 /// span 側に `conversation.id` がある場合は、その conversation の既知 session の effort
-/// だけを更新する。`codex_last_session` を黙って上書きすると、並行する別 conversation の
-/// effort バケットへ値を寄せてしまう。`conversation.id` が無い古い span に限り、最後の
-/// session に対する fallback として作用させる。
-fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyValue]) -> bool {
+/// だけを更新する。同じ service の last session を黙って上書きすると、並行する別
+/// conversation の effort バケットへ値を寄せてしまう。`conversation.id` が無い古い span
+/// に限り、同じ service の最後の session に対する fallback として作用させる。
+fn update_codex_effort_from_request_attrs(
+    g: &mut AggregatorInner,
+    service: &str,
+    attrs: &[KeyValue],
+) -> bool {
     let Some(effort) = string_attr(attrs, "codex.request.reasoning_effort") else {
         return false;
     };
@@ -1069,7 +1083,7 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
             },
         }
     } else {
-        match g.codex_last_session.clone() {
+        match codex_last_session(g, service).cloned() {
             Some(mut session) => {
                 session.effort = effort.to_string();
                 session
@@ -1083,18 +1097,16 @@ fn update_codex_effort_from_request_attrs(g: &mut AggregatorInner, attrs: &[KeyV
         }
     };
     // conversation.id がある span は、その conversation の session の effort だけを更新する。
-    // 別 conversation の last session を上書きすると、conversation.id を持たない後続 metric の
-    // effort バケットが無関係な conversation に引きずられる (AGENTS.md の方針)。conversation.id
-    // が無い古い span、または last session が同じ conversation のときだけ last を更新する。
-    // ただし `codex_last_session` が None の初回 seed は上書きにあたらず、ここで設定しないと
-    // conversation.id を持たない後続 metric が effort=unknown に落ちてしまうため、id 付き span
-    // でも last を seed する (上書き対象の別 conversation が存在しないので方針には反しない)。
+    // 同じ service の別 conversation の last session を上書きすると、conversation.id を持たない
+    // 後続 metric の effort バケットが無関係な conversation に引きずられる。conversation.id が
+    // 無い古い span、または同じ service の last session と同一 conversation のときだけ更新する。
+    // ただし当該 service の初回 seed は上書きにあたらず、ここで設定しないと後続 metric が
+    // effort=unknown に落ちるため、conversation.id 付き span でも last session を seed する。
     let update_last = conversation_id.is_none()
-        || g.codex_last_session.is_none()
-        || g.codex_last_session
-            .as_ref()
+        || codex_last_session(g, service).is_none()
+        || codex_last_session(g, service)
             .is_some_and(|last| last.conversation_id == session.conversation_id);
-    update_codex_session_with_last(g, session, update_last);
+    update_codex_session_with_last(g, service, session, update_last);
     true
 }
 
@@ -2523,6 +2535,58 @@ mod tests {
         let bucket = agent.buckets.get(&bucket_key).unwrap();
         assert_eq!(bucket.stats.request_count, 2);
         assert_eq!(bucket.stats.duration_ms, 5000);
+    }
+
+    /// 実ログ回帰: TUI と Exec が同時稼働すると、conversation id を持たない turn metrics が
+    /// 別 service の直近 session を参照して effort バケットを誤ることがある。同じ service の
+    /// last session だけを参照し、`gpt-5.6-sol/xhigh` を Exec 側の low へ混入させない。
+    #[test]
+    fn codex_metrics_use_last_session_from_same_service() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_TUI,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-tui"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.6-sol"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-exec"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.4-mini"),
+                kv_str("reasoning_effort", "low"),
+            ],
+        ));
+
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_TUI,
+            vec![
+                codex_turn_count("gpt-5.6-sol", 1),
+                codex_duration_metric("gpt-5.6-sol", 2500.0),
+                codex_token_metric("gpt-5.6-sol", "input", 42.0),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).expect("Codex 集計が存在する");
+        let xhigh = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.6-sol/xhigh"))
+            .expect("TUI の xhigh バケットへ集計される");
+        assert_eq!(xhigh.stats.request_count, 1);
+        assert_eq!(xhigh.stats.duration_ms, 2500);
+        assert_eq!(xhigh.stats.input_tokens, 42);
+        assert!(
+            !agent
+                .buckets
+                .contains_key(&format!("{PROVIDER_OPENAI}/gpt-5.6-sol/low"))
+        );
     }
 
     #[test]
