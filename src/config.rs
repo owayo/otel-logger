@@ -70,7 +70,7 @@ color = "auto"
 # [proxy]
 # queue-capacity = 1024   # per-route の bounded channel 容量
 # timeout-ms = 5000       # 1 request の I/O timeout
-# retry-max = 8           # 指数バックオフの最大試行回数
+# retry-max = 8           # 初回送信後の指数バックオフ最大再試行回数
 # checkpoint-dir = "/var/lib/otel-logger/.otel-logger-proxy"  # Phase B 用の予約設定
 #
 # [[proxy.routes]]

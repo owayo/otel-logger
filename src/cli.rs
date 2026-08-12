@@ -225,8 +225,8 @@ pub enum LogSink {
 pub const DEFAULT_PROXY_QUEUE_CAPACITY: usize = 1024;
 /// 1 回の proxy 送信の I/O timeout デフォルト (ミリ秒)。
 pub const DEFAULT_PROXY_TIMEOUT_MS: u64 = 5000;
-/// 送信失敗時の指数バックオフ試行回数デフォルト。Phase A では使い切った request を
-/// 自動再送せず、JSONL からの再走査は Phase B で実装する。
+/// 送信失敗時の指数バックオフ最大再試行回数デフォルト (初回送信を除く)。
+/// Phase A では使い切った request を自動再送せず、JSONL からの再走査は Phase B で実装する。
 pub const DEFAULT_PROXY_RETRY_MAX: u32 = 8;
 
 /// 組み込みの vendor 既定マッピング。CLI 短縮フラグ / 明示的な

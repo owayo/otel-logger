@@ -53,7 +53,7 @@ axum = { version = "0.8.9", default-features = false, features = [
     "query",
 ] }
 bytes = "1.12.1"
-http = "1.4.2"
+http = "1.5.0"
 # OTLP/HTTP protobuf での proxy 転送で使う HTTP client。
 # rustls + プラットフォームの証明書検証 + http2 に絞って余計な依存を抱えない。
 reqwest = { version = "0.13.4", default-features = false, features = [
@@ -80,7 +80,7 @@ clap = { version = "4.6.4", features = ["derive", "env"] }
 # シリアライズ / 出力
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-toml = "1.1.3"
+toml = "1.1.4"
 
 # その他
 anyhow = "1.0.104"

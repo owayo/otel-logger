@@ -319,7 +319,7 @@ proxy モードがあります。Claude Code (Anthropic 系) と Codex (OpenAI �
   URL を指定する。設定値の末尾へ signal 別パス (`/v1/logs`、`/v1/traces`、
   `/v1/metrics`) を追加するため、query と fragment は startup 時に reject する
 - **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。
-  route worker が指数バックオフで retry する (既定 8 回、200ms → 30s cap)。
+  route worker が指数バックオフで retry する (既定では初回送信後に最大 8 回、200ms → 30s cap)。
   受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく
   送信中の request も即座に中断し、設定した request timeout を待たない
 - **認証**: header 値に `env:VAR_NAME` を書くと環境変数から解決する。secret を

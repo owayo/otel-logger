@@ -1,4 +1,4 @@
-//! Per-route worker task。ExportRequest を受け取り、retry しながら送信する。
+//! route ごとの worker task。ExportRequest を受け取り、retry しながら送信する。
 //!
 //! shutdown token が cancel されるか channel が close されたら終了する。
 
@@ -119,9 +119,12 @@ async fn send_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    use axum::{Router, extract::State, routing::post};
+    use axum::{Router, extract::State, http::StatusCode, routing::post};
     use tokio::{net::TcpListener, sync::Notify};
 
     use super::*;
@@ -131,6 +134,47 @@ mod tests {
     async fn stalled_upstream(State(started): State<Arc<Notify>>) {
         started.notify_one();
         std::future::pending::<()>().await;
+    }
+
+    async fn failing_upstream(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode {
+        attempts.fetch_add(1, Ordering::Relaxed);
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    /// `retry_max` は初回送信を含む総試行回数ではなく、初回失敗後の再試行回数として扱う。
+    #[tokio::test]
+    async fn retry_max_counts_retries_after_initial_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/logs", post(failing_upstream))
+            .with_state(Arc::clone(&attempts));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let route = ProxyRoute {
+            name: "test".to_string(),
+            service_names: vec!["test-service".to_string()],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 3_000).unwrap();
+        let request = ExportRequest::Logs(Box::default());
+        let shutdown = CancellationToken::new();
+
+        let result = send_with_retry("test", &client, &request, 1, &shutdown).await;
+
+        assert!(result.is_err(), "再試行上限後は送信失敗を返す");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "初回送信に加えて retry_max 回だけ再試行する"
+        );
+        server.abort();
     }
 
     /// 上流が応答しない送信中でも、shutdown を受けたら timeout を待たずに中断する。

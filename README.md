@@ -349,8 +349,9 @@ endpoints.
   `/v1/metrics`) are appended to the configured endpoint.
 - **Failure semantics**: JSONL is persisted first, then the payload is
   `try_send`'d to the per-route worker. Workers retry with exponential backoff
-  (default 8 attempts, 200ms → 30s cap). The receive path is never blocked by
-  the upstream, and shutdown cancels both an in-flight request and backoff
+  (by default, up to 8 retries after the initial attempt; 200ms → 30s cap).
+  The receive path is never blocked by the upstream, and shutdown cancels both
+  an in-flight request and backoff
   immediately instead of waiting for the configured request timeout.
 - **Auth**: header values may be written as `env:VAR_NAME` to resolve from an
   environment variable, so secrets never appear in `ps` output or config files.

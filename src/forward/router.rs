@@ -37,7 +37,7 @@ pub struct ProxyRouter {
 struct RouterInner {
     /// route index → RouteLane。
     lanes: Vec<Arc<RouteLane>>,
-    /// service.name (as-is) → route index。case-sensitive で判定する
+    /// service.name（受信値をそのまま使用）→ route index。大文字・小文字を区別する。
     /// (OTLP service.name は case-sensitive)。
     matcher: HashMap<String, usize>,
 }
@@ -325,8 +325,23 @@ mod tests {
         let snapshot = router.snapshot().into_iter().collect::<HashMap<_, _>>();
         assert_eq!(snapshot["anthropic"].queue_depth, 1);
         assert_eq!(snapshot["openai"].queue_depth, 1);
-        // unknown-service は skip されるので dropped は上がらない
+        // unknown-service は振り分け対象外なので dropped は上がらない。
         assert_eq!(anthropic.metrics.dropped_total.load(Ordering::Relaxed), 0);
+        assert_eq!(openai.metrics.dropped_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn skips_resource_without_service_name() {
+        let (openai, _rx) = make_lane("openai", vec!["codex_cli_rs"]);
+        let router = ProxyRouter::new(vec![openai.clone()]);
+        let mut resource_logs = resource_logs_for("codex_cli_rs");
+        resource_logs.resource = None;
+
+        router.notify(&TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![resource_logs],
+        })));
+
+        assert_eq!(router.snapshot()[0].1.queue_depth, 0);
         assert_eq!(openai.metrics.dropped_total.load(Ordering::Relaxed), 0);
     }
 
