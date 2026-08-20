@@ -572,4 +572,124 @@ mod tests {
         assert!(rendered.contains("severity=\"BAD\\u{001b}[0M\""));
         assert!(rendered.contains("\"bad\\u{001b}key\"=value"));
     }
+
+    #[test]
+    fn render_traces_escapes_untrusted_labels() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", "svc\x1b[31m")],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "scope\x1b]0;bad".to_string(),
+                        ..Default::default()
+                    }),
+                    spans: vec![Span {
+                        name: "span\x1b[2J".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let rendered = render(&TelemetryRecord::Traces(Box::new(req)), false);
+
+        assert!(
+            !rendered.contains('\x1b'),
+            "trace の pretty 出力へ escape sequence を残さない"
+        );
+        assert!(rendered.contains("service=\"svc\\u{001b}[31m\""));
+        assert!(rendered.contains("scope=\"scope\\u{001b}]0;bad\""));
+        assert!(rendered.contains("span=\"span\\u{001b}[2J\""));
+    }
+
+    #[test]
+    fn render_metrics_escapes_untrusted_labels() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", "svc\x1b[31m")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "scope\x1b]0;bad".to_string(),
+                        ..Default::default()
+                    }),
+                    metrics: vec![Metric {
+                        name: "metric\x1b[2J".to_string(),
+                        description: "description\x1b[3J".to_string(),
+                        unit: "unit\x1b[4J".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let rendered = render(&TelemetryRecord::Metrics(Box::new(req)), false);
+
+        assert!(
+            !rendered.contains('\x1b'),
+            "metric の pretty 出力へ escape sequence を残さない"
+        );
+        assert!(rendered.contains("service=\"svc\\u{001b}[31m\""));
+        assert!(rendered.contains("scope=\"scope\\u{001b}]0;bad\""));
+        assert!(rendered.contains("name=\"metric\\u{001b}[2J\""));
+        assert!(rendered.contains("unit=\"unit\\u{001b}[4J\""));
+        assert!(rendered.contains("(\"description\\u{001b}[3J\")"));
+    }
+
+    #[test]
+    fn render_summary_escapes_untrusted_bucket_metadata() {
+        use crate::aggregator::{AgentStats, BucketStats, ModelStats, UsageSnapshot};
+        use std::collections::BTreeMap;
+
+        let bucket = BucketStats {
+            provider: "provider\x1b[31m".to_string(),
+            model: "model\x1b[2J".to_string(),
+            effort: "effort\x1b]0;bad".to_string(),
+            stats: ModelStats {
+                request_count: 1,
+                ..Default::default()
+            },
+        };
+        let snapshot = UsageSnapshot {
+            started_at: "2026-08-20T00:00:00Z".to_string(),
+            last_updated: None,
+            agents: BTreeMap::from([(
+                "agent\x1b[4J".to_string(),
+                AgentStats {
+                    total: ModelStats::default(),
+                    buckets: BTreeMap::from([("bucket".to_string(), bucket)]),
+                },
+            )]),
+        };
+
+        let rendered = render_summary(&snapshot, false);
+
+        assert!(
+            !rendered.contains('\x1b'),
+            "累計サマリーへ escape sequence を残さない"
+        );
+        assert!(rendered.contains("[stats:\"agent\\u{001b}[4J\"]"));
+        assert!(rendered.contains("provider=\"provider\\u{001b}[31m\""));
+        assert!(rendered.contains("model=\"model\\u{001b}[2J\""));
+        assert!(rendered.contains("effort=\"effort\\u{001b}]0;bad\""));
+    }
 }
