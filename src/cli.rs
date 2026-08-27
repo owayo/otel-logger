@@ -1144,6 +1144,107 @@ mod tests {
         assert!(err.to_string().contains("empty `service_names`"));
     }
 
+    /// custom route は endpoint 必須。空 endpoint を許すと worker 起動後の全送信が
+    /// 失敗し続けるため、startup で弾く。
+    #[test]
+    fn merge_proxy_custom_route_rejects_empty_endpoint() {
+        use crate::config::ProxyConfig;
+
+        let cli = cli_with_log_file();
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "custom".to_string(),
+                    service_names: vec!["my-service".to_string()],
+                    signal_types: Vec::new(),
+                    transport: None,
+                    endpoint: String::new(),
+                    headers: BTreeMap::new(),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let err = Settings::merge_with_home(cli, config, None).unwrap_err();
+        assert!(
+            err.to_string().contains("empty endpoint"),
+            "空 endpoint は startup で拒否する: {err}"
+        );
+    }
+
+    /// custom route は service_names を省略できない (組み込み既定を持たないため)。
+    #[test]
+    fn merge_proxy_custom_route_requires_service_names() {
+        use crate::config::ProxyConfig;
+
+        let cli = cli_with_log_file();
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "custom".to_string(),
+                    service_names: Vec::new(),
+                    signal_types: Vec::new(),
+                    transport: None,
+                    endpoint: "https://collector.example".to_string(),
+                    headers: BTreeMap::new(),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let err = Settings::merge_with_home(cli, config, None).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one `service_names`"),
+            "service_names 未指定の custom route は拒否する: {err}"
+        );
+    }
+
+    /// RFC 7230 の token を外れた header key は送信前に拒否する。
+    /// `:` や空白を含む key をそのまま渡すと、転送先で不正な header 行になる。
+    #[test]
+    fn merge_proxy_rejects_invalid_header_key() {
+        let mut cli = cli_with_log_file();
+        cli.proxy_anthropic_endpoint = Some("https://collector.example:4317".to_string());
+        cli.proxy_anthropic_headers = vec!["X Invalid=value".to_string()];
+
+        let err = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid character"),
+            "token 外の文字を含む header key は拒否する: {err}"
+        );
+    }
+
+    /// `signal_types` の重複指定は正規化して 1 個ずつにする。
+    /// 重複したまま保持すると同じ payload を同じ route へ複数回送ることになる。
+    #[test]
+    fn merge_proxy_normalizes_duplicate_signal_types() {
+        use crate::config::ProxyConfig;
+
+        let cli = cli_with_log_file();
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "anthropic".to_string(),
+                    service_names: Vec::new(),
+                    signal_types: vec![ProxySignal::Logs, ProxySignal::Logs, ProxySignal::Metrics],
+                    transport: None,
+                    endpoint: "https://collector.example".to_string(),
+                    headers: BTreeMap::new(),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        let route = &settings.proxy.unwrap().routes[0];
+        assert_eq!(route.signals, vec![ProxySignal::Logs, ProxySignal::Metrics]);
+        assert!(route.accepts_signal(ProxySignal::Logs));
+        assert!(!route.accepts_signal(ProxySignal::Traces));
+    }
+
     #[test]
     fn merge_proxy_service_name_conflict_is_rejected() {
         // 別 route 同士で同じ service.name を主張したら error。

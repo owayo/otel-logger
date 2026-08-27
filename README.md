@@ -462,7 +462,12 @@ Real logs also include tool-only `response.completed` events where
 reasoning are all zero; Codex excludes those from turn metrics and
 `handle_responses` span usage, so `otel-logger` does not count them as token
 usage. An otherwise tool-only-shaped completion with positive cache-write
-usage remains counted.
+usage remains counted. This was verified against a real CI log (Codex
+0.150.1, two conversations, 27 SSE completions): the SSE totals minus the
+tool-only events matched `codex.turn.token_usage` exactly for every token
+class (input 1,513,467 / output 17,618 / cached_input 1,316,096 /
+reasoning_output 9,550 / cache_write_input 0), so either arrival order
+produces the same cumulative numbers.
 `session_task.turn` / `session_task.review` spans can also carry
 `codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
 spans are not used as token sources.

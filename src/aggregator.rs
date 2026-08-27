@@ -1788,6 +1788,52 @@ mod tests {
         assert_eq!(bucket.stats.input_tokens, 7);
     }
 
+    /// bare name のログが usage 付きで先着し、後から完全名 (`[1m]` 付き) の metrics が
+    /// 届いた場合でも、同じ usage を二重計上しない。
+    /// `merge_bare_into_full` はバケットを統合するが、`claude_usage_sources` の key は
+    /// model 名を含むため、統合後の完全名でも「ログを採用済み」と判定できる必要がある。
+    #[test]
+    fn claude_log_with_usage_then_metric_does_not_double_count_after_bare_merge() {
+        let agg = Aggregator::new();
+        // ログが bare name + usage 付きで先着する (実際の `claude_code.api_request` の形)。
+        let log_req = make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-4-7"),
+                kv_str("effort", "max"),
+                kv_int("duration_ms", 1000),
+                kv_int("input_tokens", 100),
+                kv_int("output_tokens", 20),
+            ],
+        );
+        agg.ingest_logs(&log_req);
+
+        // 同じ usage が、少し遅れて完全名の metrics としても届く。
+        let metric_req = make_metric_req(
+            SERVICE_CLAUDE,
+            vec![
+                claude_token_metric("claude-opus-4-7[1m]", "max", "input", 100),
+                claude_token_metric("claude-opus-4-7[1m]", "max", "output", 20),
+            ],
+        );
+        agg.ingest_metrics(&metric_req);
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket = agent
+            .buckets
+            .get("anthropic/claude-opus-4-7[1m]/max")
+            .unwrap();
+        assert_eq!(
+            bucket.stats.input_tokens, 100,
+            "ログを採用済みの usage は metrics で二重計上しない"
+        );
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(agent.total.input_tokens, 100);
+        assert_eq!(agent.total.output_tokens, 20);
+    }
+
     #[test]
     fn claude_log_then_metric_folds_separator_model_into_full() {
         let agg = Aggregator::new();
@@ -2284,6 +2330,123 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(!agg.snapshot().agents.contains_key(AGENT_CODEX));
+    }
+
+    /// 実 CI ログ (Codex 0.150.1) と同じ形で、tool-only の `response.completed` と
+    /// 通常の完了イベントが同じ conversation に混在するケース。tool-only 分だけを
+    /// 除外した合計が `codex.turn.token_usage` metric と一致するという不変条件を固定する
+    /// (実ログでは SSE 合計 − tool-only = metric 合計がすべての token 種別で一致した)。
+    #[test]
+    fn codex_mixed_tool_only_and_real_sse_totals_exclude_tool_only() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-xhigh"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.6-terra"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+
+        // turn の先頭に出る tool-only completion (input == tool、他はすべて 0)。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-xhigh"),
+                kv_str("model", "gpt-5.6-terra"),
+                kv_str("input_token_count", "11438"),
+                kv_str("output_token_count", "0"),
+                kv_str("cached_token_count", "0"),
+                kv_str("reasoning_token_count", "0"),
+                kv_str("cache_write_token_count", "0"),
+                kv_str("tool_token_count", "11438"),
+            ],
+        ));
+        // 実 usage を伴う completion 2 件。
+        for (input, cached, output, reasoning, tool) in [
+            ("30880", "0", "325", "152", "31205"),
+            ("36393", "30464", "89", "8", "36482"),
+        ] {
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_EXEC,
+                "",
+                vec![
+                    kv_str("event.name", "codex.sse_event"),
+                    kv_str("event.kind", "response.completed"),
+                    kv_str("conversation.id", "conv-xhigh"),
+                    kv_str("model", "gpt-5.6-terra"),
+                    kv_str("model_reasoning_effort", "xhigh"),
+                    kv_str("input_token_count", input),
+                    kv_str("output_token_count", output),
+                    kv_str("cached_token_count", cached),
+                    kv_str("reasoning_token_count", reasoning),
+                    kv_str("cache_write_token_count", "0"),
+                    kv_str("tool_token_count", tool),
+                ],
+            ));
+        }
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.6-terra/xhigh"))
+            .unwrap();
+        // tool-only の 11438 は含めない。
+        assert_eq!(bucket.stats.input_tokens, 30880 + 36393);
+        assert_eq!(bucket.stats.output_tokens, 325 + 89);
+        assert_eq!(bucket.stats.cache_read_tokens, 30464);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 152 + 8);
+
+        // 同じ turn の token usage が metric としても後着するが、model 単位で
+        // 既に Logs を採用しているため二重計上しない。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.6-terra", "input", 67273.0),
+                codex_token_metric("gpt-5.6-terra", "output", 414.0),
+            ],
+        ));
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 30880 + 36393);
+        assert_eq!(agent.total.output_tokens, 325 + 89);
+    }
+
+    /// Claude Code が新しく送るようになったイベント (`skill_activated` / `at_mention` /
+    /// `retention_sweep` / `feedback_survey`) は usage を持たない。`api_request` と
+    /// 取り違えて累計へ混入させない。
+    #[test]
+    fn claude_non_api_request_log_events_do_not_affect_usage() {
+        let agg = Aggregator::new();
+        for body in [
+            "claude_code.skill_activated",
+            "claude_code.at_mention",
+            "claude_code.retention_sweep",
+            "claude_code.feedback_survey",
+            "claude_code.tool_result",
+        ] {
+            let count = agg.ingest_logs(&make_log_req(
+                SERVICE_CLAUDE,
+                body,
+                vec![
+                    kv_str("model", "claude-opus-5"),
+                    kv_str("effort", "max"),
+                    kv_int("input_tokens", 999),
+                    kv_int("duration_ms", 999),
+                ],
+            ));
+            assert_eq!(count, 0, "{body} は usage サンプルとして数えない");
+        }
+        assert!(
+            agg.snapshot().agents.is_empty(),
+            "usage を持たないイベントだけではバケットを作らない"
+        );
     }
 
     #[test]
