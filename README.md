@@ -468,6 +468,11 @@ tool-only events matched `codex.turn.token_usage` exactly for every token
 class (input 1,513,467 / output 17,618 / cached_input 1,316,096 /
 reasoning_output 9,550 / cache_write_input 0), so either arrival order
 produces the same cumulative numbers.
+The 2026-09-06 local capture from Codex 0.153.4 also showed a second
+`gpt-5.6-sol/xhigh` conversation continuing to emit SSE completions after the
+first conversation's turn-metric snapshot. Once Logs is selected for that
+model, it remains selected: the snapshot is skipped as a duplicate, while the
+later conversation's SSE usage continues to be counted.
 `session_task.turn` / `session_task.review` spans can also carry
 `codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
 spans are not used as token sources.
@@ -593,6 +598,7 @@ make clippy     # cargo clippy --all-targets -- -D warnings
 make fmt        # cargo fmt
 make run        # run with --log-file ./otel-logger.jsonl
 make docker     # build the container image
+cargo audit     # scan Cargo.lock with the RustSec advisory database
 ```
 
 ## How it works

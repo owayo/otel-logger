@@ -2645,6 +2645,92 @@ mod tests {
         assert_eq!(bucket.stats.input_tokens, 100);
     }
 
+    /// 2026-09-06 の Codex 0.153.4 実ログでは、同じ model/effort の先行 conversation の
+    /// SSE と turn metric が揃った後にも、別 conversation の SSE が続いて届いた。
+    /// model の token source は Logs のまま維持し、metric の重複分だけを除外しつつ、
+    /// 後続 conversation の新しい usage は欠落させない。
+    #[test]
+    fn codex_later_same_model_sse_is_counted_after_metric_snapshot() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-completed"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.6-sol"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-completed"),
+                kv_str("model", "gpt-5.6-sol"),
+                kv_str("model_reasoning_effort", "xhigh"),
+                kv_str("input_token_count", "100"),
+                kv_str("output_token_count", "20"),
+                kv_int("cached_token_count", 50),
+                kv_int("cache_write_token_count", 0),
+                kv_int("reasoning_token_count", 3),
+                kv_str("tool_token_count", "120"),
+            ],
+        ));
+
+        // 先行 conversation と同じ usage の metric snapshot は二重計上しない。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![
+                codex_token_metric("gpt-5.6-sol", "input", 100.0),
+                codex_token_metric("gpt-5.6-sol", "output", 20.0),
+                codex_token_metric("gpt-5.6-sol", "cached_input", 50.0),
+                codex_token_metric("gpt-5.6-sol", "reasoning_output", 3.0),
+            ],
+        ));
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-active"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-5.6-sol"),
+                kv_str("reasoning_effort", "xhigh"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-active"),
+                kv_str("model", "gpt-5.6-sol"),
+                kv_str("model_reasoning_effort", "xhigh"),
+                kv_str("input_token_count", "40"),
+                kv_str("output_token_count", "5"),
+                kv_int("cached_token_count", 10),
+                kv_int("cache_write_token_count", 0),
+                kv_int("reasoning_token_count", 1),
+                kv_str("tool_token_count", "45"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get(&format!("{PROVIDER_OPENAI}/gpt-5.6-sol/xhigh"))
+            .unwrap();
+        assert_eq!(bucket.stats.input_tokens, 140);
+        assert_eq!(bucket.stats.output_tokens, 25);
+        assert_eq!(bucket.stats.cache_read_tokens, 60);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 4);
+    }
+
     #[test]
     fn codex_token_source_is_tracked_per_model() {
         let agg = Aggregator::new();
