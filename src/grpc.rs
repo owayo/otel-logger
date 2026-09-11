@@ -45,10 +45,12 @@ impl OtlpService {
     }
 }
 
-/// JSONL 永続化失敗を gRPC client へ `Status::internal` として返す。
-/// 受信した payload を欠落させないために、exporter 側で retry を促す。
+/// JSONL 永続化失敗を gRPC client へ `Status::unavailable` として返す。
+/// OTLP は retryable なエラーを `Unavailable` で示すよう定めており、`Internal` は
+/// non-retryable (client は payload を drop する) 扱いになる。受信した payload を
+/// 欠落させないために、必ず retryable な code で返して exporter に再送させる。
 fn persistence_status(e: anyhow::Error) -> Status {
-    Status::internal(format!("failed to persist telemetry: {e}"))
+    Status::unavailable(format!("failed to persist telemetry: {e}"))
 }
 
 #[tonic::async_trait]
@@ -120,11 +122,13 @@ mod tests {
         }
     }
 
-    /// JSONL 永続化失敗は gRPC で必ず `Internal` を返し、exporter 側に retry させる契約を固定する。
+    /// JSONL 永続化失敗は gRPC で必ず retryable な `Unavailable` を返し、exporter 側に
+    /// retry させる契約を固定する。`Internal` は OTLP 上 non-retryable で、client が
+    /// payload を drop してしまうため使わない。
     #[test]
-    fn persistence_status_maps_to_internal_code() {
+    fn persistence_status_maps_to_retryable_code() {
         let status = persistence_status(anyhow::anyhow!("disk full"));
-        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(
             status.message().contains("disk full"),
             "原因を message に含める: {}",

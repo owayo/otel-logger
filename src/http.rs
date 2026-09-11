@@ -20,6 +20,7 @@ use prost::Message;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::server::OTLP_MAX_REQUEST_BYTES;
 use crate::sink::{Sink, TelemetryRecord};
@@ -42,7 +43,7 @@ enum HttpError {
     #[error("failed to decode JSON body: {0}")]
     BadJson(#[from] serde_json::Error),
     /// JSONL や stdout への永続化に失敗した。受信した payload を欠落させたくないので
-    /// クライアントに 5xx を返し、OTLP exporter 側で retry させる。
+    /// クライアントに retry 可能な応答を返し、OTLP exporter 側で再送させる。
     #[error("failed to persist telemetry: {0}")]
     Persistence(#[source] anyhow::Error),
 }
@@ -52,7 +53,10 @@ impl IntoResponse for HttpError {
         let status = match &self {
             HttpError::UnsupportedContentType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             HttpError::BadProtobuf(_) | HttpError::BadJson(_) => StatusCode::BAD_REQUEST,
-            HttpError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // OTLP/HTTP が retry を許すのは 429 / 502 / 503 / 504 だけで、それ以外の
+            // 4xx / 5xx は "MUST NOT be retried" (client は payload を drop する)。
+            // 500 を返すと再送されず欠測するため、503 で retry させる。
+            HttpError::Persistence(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (status, self.to_string()).into_response()
     }
@@ -204,6 +208,11 @@ pub fn router(sink: Sink) -> Router {
         .with_state(sink)
         // 既定 (2MiB) では大きな batch が抽出前に 413 で拒否されるため、上限を引き上げる。
         .layer(DefaultBodyLimit::max(OTLP_MAX_REQUEST_BYTES))
+        // `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter は body を圧縮して送る。
+        // 解凍しないと decode 失敗で 400 を返し、OTLP 仕様上 400 は retry 禁止なので
+        // batch が恒久的に失われる。DefaultBodyLimit より外側に置くことで、size 上限は
+        // 解凍後の body に対して効く (仕様が要求する "including after decompression")。
+        .layer(RequestDecompressionLayer::new().gzip(true))
 }
 
 pub async fn serve(
@@ -337,6 +346,71 @@ mod tests {
             response.status(),
             StatusCode::BAD_REQUEST,
             "2MiB 超の body が size 制限ではなく protobuf decode 失敗で弾かれること"
+        );
+    }
+
+    /// JSONL 永続化に失敗したときは retry 可能な応答を返す。OTLP/HTTP で retry される
+    /// のは 429 / 502 / 503 / 504 だけで、500 は "MUST NOT be retried" のため
+    /// exporter が batch を drop してしまう。
+    #[test]
+    fn persistence_error_maps_to_retryable_status() {
+        let response = HttpError::Persistence(anyhow::anyhow!("disk full")).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter は body を gzip して送る。
+    /// 解凍せずに protobuf decode すると 400 になり、400 は retry 禁止なので
+    /// batch が恒久的に失われる。
+    #[tokio::test]
+    async fn router_accepts_gzip_encoded_body() {
+        use std::io::Write as _;
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tower::ServiceExt as _;
+
+        use crate::cli::{ColorMode, Settings};
+
+        let settings = Settings {
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            log_sink: None,
+            no_stdout: true,
+            summary: false,
+            color: ColorMode::Never,
+            dry_run: false,
+            proxy: None,
+        };
+        let sink = Sink::from_settings(&settings).await.unwrap();
+        let app = router(sink);
+
+        // 解凍されなければ gzip のマジックバイトを protobuf として読もうとして失敗する。
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
+                resource: None,
+                scope_logs: vec![],
+                schema_url: "https://example.invalid/schema".into(),
+            }],
+        };
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&payload.encode_to_vec()).unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(gzipped))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "gzip した OTLP request を解凍して受け付けること"
         );
     }
 }

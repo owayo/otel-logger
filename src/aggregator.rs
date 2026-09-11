@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::RwLock;
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
@@ -224,6 +224,12 @@ struct AggregatorInner {
     /// 1M 版と通常版が別集計にならないようにする。
     claude_canonical_models: HashMap<String, String>,
 
+    /// metrics 側で実際に観測した model 名。metrics が接尾辞なしの名前を直接送って
+    /// きた場合、その名前は「ログで接尾辞が落ちた表記」ではなく実在する別バリアント
+    /// (1M 無効版など) なので、完全名バケットへ昇格・畳み込みしてはいけない。
+    /// 単価が異なるため、混ぜるとコスト按分がそのまま誤る。
+    claude_metric_models: HashSet<String>,
+
     /// Claude は API request ログと metrics の両方に token/cost を持つ。
     /// ログは request_id 単位で即時に届き、metrics より新しい分まで含むため、
     /// ログが見えた model/effort ではログを token source として採用する。
@@ -231,7 +237,11 @@ struct AggregatorInner {
 
     /// metrics を先に計上した後で同じ model/effort の API request ログが届いた場合に、
     /// 二重計上を避けるため取り消す metrics 側の累計 usage。
-    claude_metric_usage: HashMap<ClaudeUsageKey, ModelStats>,
+    /// source key は model 名を bare 化するため 1 key が複数バケット (`claude-opus-5` と
+    /// `claude-opus-5[1m]`) に対応しうる。合計を 1 バケットから引くと引きすぎた分が
+    /// bucket 側で 0 にクランプされ、`total` だけ余分に減って
+    /// `total == Σbuckets` が壊れるので、記録したバケットごとに保持して同じ場所へ返す。
+    claude_metric_usage: HashMap<ClaudeUsageKey, BTreeMap<Bucket, ModelStats>>,
 
     /// `service.name` ごとに最後に観測した Codex セッション情報。
     /// Codex metrics には `conversation.id` / `reasoning_effort` が載らないため、同じ
@@ -270,6 +280,11 @@ struct CodexSession {
     provider: String,
     model: String,
     effort: String,
+    /// provider が `codex.conversation_starts` 由来で確定しているか。
+    /// `handle_responses` span から合成した session は provider を持たず既定値
+    /// (OpenAI) を置くだけなので false。暫定 provider を確定扱いにすると、
+    /// 後から非既定 provider の session が届いても SSE usage を移せなくなる。
+    provider_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +313,7 @@ impl Aggregator {
                 last_updated: None,
                 agents: BTreeMap::new(),
                 claude_canonical_models: HashMap::new(),
+                claude_metric_models: HashSet::new(),
                 claude_usage_sources: HashMap::new(),
                 claude_metric_usage: HashMap::new(),
                 codex_last_sessions: HashMap::new(),
@@ -483,9 +499,13 @@ fn record_claude_log_usage(g: &mut AggregatorInner, bucket: &Bucket, stats: &Mod
     }
     let source_key = claude_usage_source_key(&bucket.model, &bucket.effort);
     if g.claude_usage_sources.get(&source_key) == Some(&ClaudeUsageSource::Metrics)
-        && let Some(metric_stats) = g.claude_metric_usage.remove(&source_key)
+        && let Some(per_bucket) = g.claude_metric_usage.remove(&source_key)
     {
-        subtract_from(g, AGENT_CLAUDE, bucket, &metric_stats);
+        // 計上した先のバケットへそのまま返す。ログ側の 1 バケットに合計を押し付けると、
+        // 引ききれない分が bucket 側でクランプされて `total` だけ余分に減る。
+        for (metric_bucket, metric_stats) in per_bucket {
+            subtract_from(g, AGENT_CLAUDE, &metric_bucket, &metric_stats);
+        }
     }
     record_into(g, AGENT_CLAUDE, bucket, stats);
     g.claude_usage_sources
@@ -509,6 +529,8 @@ fn record_claude_metric_usage(
         .insert(source_key.clone(), ClaudeUsageSource::Metrics);
     g.claude_metric_usage
         .entry(source_key)
+        .or_default()
+        .entry(bucket.clone())
         .or_default()
         .add(stats);
     true
@@ -603,6 +625,7 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
         provider,
         model,
         effort,
+        provider_confirmed: true,
     })
 }
 
@@ -687,11 +710,14 @@ fn extract_codex_sse_response_completed(
     let bucket = Bucket::from_parts(codex_provider_from_session(session), model, effort);
     // session 未着時は provider が暫定値になるため、effort を直接取得できた場合も pending
     // に積む。id 無しの旧 telemetry は従来どおり unknown バケット全体を後から移す。
-    let pending_conversation_id = if has_conversation_id && session.is_none() {
-        conversation_id
-    } else {
-        None
-    };
+    // `handle_responses` span から合成しただけの session も provider が暫定値なので、
+    // 確定済み (`conversation_starts` 由来) でない限り pending を維持する。
+    let pending_conversation_id =
+        if has_conversation_id && session.is_none_or(|s| !s.provider_confirmed) {
+            conversation_id
+        } else {
+            None
+        };
     Some(CodexSseExtraction {
         bucket,
         stats,
@@ -791,6 +817,13 @@ fn ingest_codex_token(g: &mut AggregatorInner, service: &str, metric: &Metric) -
             // `total` は他の token 種別と重複するため無視する。
             _ => continue,
         }
+        if value == 0 {
+            // usage を持たない data point (実ログの `cache_write_input=0` や、
+            // `sum` を省略した histogram) で token source を Metrics に固定すると、
+            // 以降その model の SSE 完了ログを恒久的に取り込めなくなる。
+            // Claude 側の `has_usage()` ガードと挙動を揃える。
+            continue;
+        }
         let bucket = Bucket::from_parts(provider, model, effort);
         record_into(g, AGENT_CODEX, &bucket, &stats);
         g.codex_token_sources
@@ -814,8 +847,14 @@ fn ingest_codex_turn_count(g: &mut AggregatorInner, service: &str, metric: &Metr
             .unwrap_or_default();
         let provider = codex_provider(g, service);
         let effort = codex_effort(g, service);
+        let request_count = number_value_as_u64(dp);
+        if request_count == 0 {
+            // 0 件の data point で空バケットを作ると `/stats` と summary に
+            // 値を持たない provider/model/effort が並ぶ。
+            continue;
+        }
         let stats = ModelStats {
-            request_count: number_value_as_u64(dp),
+            request_count,
             ..Default::default()
         };
         let bucket = Bucket::from_parts(provider, model, effort);
@@ -839,8 +878,13 @@ fn ingest_codex_duration(g: &mut AggregatorInner, service: &str, metric: &Metric
             .unwrap_or_default();
         let provider = codex_provider(g, service);
         let effort = codex_effort(g, service);
+        let duration_ms = histogram_sum_as_u64(dp);
+        if duration_ms == 0 {
+            // 同上。`sum` 省略の histogram で空バケットを作らない。
+            continue;
+        }
         let stats = ModelStats {
-            duration_ms: histogram_sum_as_u64(dp),
+            duration_ms,
             ..Default::default()
         };
         let bucket = Bucket::from_parts(provider, model, effort);
@@ -1080,6 +1124,8 @@ fn update_codex_effort_from_request_attrs(
                     .map(str::to_string)
                     .unwrap_or_default(),
                 effort: effort.to_string(),
+                // span は provider を運ばないため、ここでの provider は暫定値。
+                provider_confirmed: false,
             },
         }
     } else {
@@ -1093,6 +1139,7 @@ fn update_codex_effort_from_request_attrs(
                 provider: PROVIDER_OPENAI.to_string(),
                 model: String::new(),
                 effort: effort.to_string(),
+                provider_confirmed: false,
             },
         }
     };
@@ -1114,6 +1161,11 @@ fn update_codex_effort_from_request_attrs(
 /// `claude-opus-4-7[1m]` のように報告される。`[` より前を bare name として扱い、
 /// 完全名を覚えて後続ログを metrics と同じバケットへ寄せる。
 fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
+    if !full.is_empty() {
+        // この関数は metrics 経路からしか呼ばれない。metrics が送ってきた名前を
+        // 覚えておき、同名がログにも出たときに別バリアントへ昇格させないようにする。
+        g.claude_metric_models.insert(full.to_string());
+    }
     let bare = match full.find('[') {
         Some(i) => &full[..i],
         None => full,
@@ -1128,6 +1180,11 @@ fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
         return;
     }
     let bare = bare.to_string();
+    if g.claude_metric_models.contains(&bare) {
+        // metrics が接尾辞なしの名前も直接送っている = 1M 無効版などが実在する。
+        // 単価が違うので完全名バケットへ畳み込まない。
+        return;
+    }
     let already = g.claude_canonical_models.get(&bare).cloned();
     if already.as_deref() == Some(full) {
         return;
@@ -1168,6 +1225,11 @@ fn merge_bare_into_full(agent_stats: &mut AgentStats, bare: &str, full: &str) {
 }
 
 fn canonical_claude_model(g: &AggregatorInner, raw: &str) -> String {
+    if g.claude_metric_models.contains(raw) {
+        // metrics が同じ名前を直接送っているなら、接尾辞が落ちた表記ではなく
+        // 実在する別バリアント。昇格させると単価の違う usage が混ざる。
+        return raw.to_string();
+    }
     g.claude_canonical_models
         .get(raw)
         .cloned()
@@ -3854,5 +3916,313 @@ mod tests {
         assert_eq!(bucket.stats.request_count, 1);
         assert_eq!(bucket.stats.input_tokens, 42);
         assert_eq!(bucket.stats.output_tokens, 7);
+    }
+
+    /// 2026-09-10/11 のローカル実ログ (Claude Code 2.1.267) では、同じ `claude-opus-5` に
+    /// effort=high と effort=max のログが混在する一方、metrics は完全名 `claude-opus-5[1m]`
+    /// の max だけを送っていた。完全名を学習した時点で effort 違いのバケットもすべて
+    /// 完全名側へ移さないと、`/stats` に bare と完全名が並んで同じ model が二重に見える。
+    #[test]
+    fn claude_bare_merge_moves_every_effort_bucket() {
+        let agg = Aggregator::new();
+        for (effort, input, output) in [("high", 330, 144_006), ("max", 141_657, 3_724_126)] {
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CLAUDE,
+                "claude_code.api_request",
+                vec![
+                    kv_str("model", "claude-opus-5"),
+                    kv_str("effort", effort),
+                    kv_int("input_tokens", input),
+                    kv_int("output_tokens", output),
+                ],
+            ));
+        }
+        // metrics は完全名かつ max のみだが、bare 名の high バケットも巻き取る必要がある。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric(
+                "claude-opus-5[1m]",
+                "max",
+                "input",
+                141_657,
+            )],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        assert!(
+            !agent
+                .buckets
+                .keys()
+                .any(|key| key.contains("/claude-opus-5/")),
+            "bare 名のバケットが残ると同じ model が二重に見える: {:?}",
+            agent.buckets.keys().collect::<Vec<_>>()
+        );
+        let high = agent
+            .buckets
+            .get("anthropic/claude-opus-5[1m]/high")
+            .expect("high バケットも完全名へ移る");
+        assert_eq!(high.stats.input_tokens, 330);
+        assert_eq!(high.stats.output_tokens, 144_006);
+        let max = agent
+            .buckets
+            .get("anthropic/claude-opus-5[1m]/max")
+            .expect("max バケット");
+        // ログを token source に採用済みなので、後着 metrics 分は加算しない。
+        assert_eq!(max.stats.input_tokens, 141_657);
+        assert_eq!(max.stats.output_tokens, 3_724_126);
+        assert_eq!(agent.total.input_tokens, 141_657 + 330);
+        assert_eq!(agent.total.output_tokens, 3_724_126 + 144_006);
+    }
+
+    /// Codex 0.153.4 / 0.154.0 の実ログでは `codex.tool_decision` / `codex.websocket_request`
+    /// など token を持たないログイベントが usage 付きイベントより桁違いに多く届く。
+    /// これらを usage として拾うと token source が Logs へ切り替わり、後着の
+    /// `codex.turn.token_usage` metrics を丸ごと捨ててしまう。
+    #[test]
+    fn codex_non_usage_log_events_do_not_affect_usage() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+        for event in [
+            "codex.tool_decision",
+            "codex.tool_result",
+            "codex.websocket_request",
+            "codex.websocket_connect",
+            "codex.api_request",
+            "codex.startup_phase",
+            "codex.user_prompt",
+            "codex.turn_ttft",
+        ] {
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_EXEC,
+                "",
+                vec![
+                    kv_str("event.name", event),
+                    kv_str("model", "gpt-6-astra"),
+                    kv_str("duration_ms", "12"),
+                    kv_str("success", "true"),
+                ],
+            ));
+        }
+        let snap = agg.snapshot();
+        assert!(
+            snap.agents
+                .get(AGENT_CODEX)
+                .is_none_or(|agent| !agent.total.has_usage()),
+            "token を持たないログイベントで usage を計上してはいけない"
+        );
+
+        // token source が奪われていないので、後着の metrics をそのまま採用できる。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-6-astra", "input", 4_230_150.0)],
+        ));
+        let snap = agg.snapshot();
+        let bucket = snap
+            .agents
+            .get(AGENT_CODEX)
+            .and_then(|agent| {
+                agent
+                    .buckets
+                    .get(&format!("{PROVIDER_OPENAI}/gpt-6-astra/medium"))
+            })
+            .expect("metrics 由来のバケット");
+        assert_eq!(bucket.stats.input_tokens, 4_230_150);
+    }
+
+    /// 1M 有効と無効の Claude Code が同じ receiver へ送ると、metrics に完全名
+    /// `claude-opus-5[1m]` と接尾辞なし `claude-opus-5` の両方が現れる。
+    /// `claude_usage_source_key` は model を bare 化するため 1 key が 2 バケットに対応する。
+    /// 取り消しをログ側の 1 バケットへまとめて押し付けると、引ききれない分が bucket 側で
+    /// 0 にクランプされ `total` だけ余分に減って `total == Σbuckets` が壊れる。
+    #[test]
+    fn claude_metric_usage_is_cancelled_per_bucket() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric(
+                "claude-opus-5[1m]",
+                "max",
+                "input",
+                100,
+            )],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric("claude-opus-5", "max", "input", 50)],
+        ));
+        // ログが届いて token source が Logs へ切り替わる。metrics 分は計上した
+        // バケットそれぞれから取り消さなければならない。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-5"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 100),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        let bucket_sum: u64 = agent.buckets.values().map(|b| b.stats.input_tokens).sum();
+        assert_eq!(
+            agent.total.input_tokens, bucket_sum,
+            "total と bucket 合計が乖離してはいけない: total={} buckets={:?}",
+            agent.total.input_tokens, agent.buckets
+        );
+        assert_eq!(agent.total.input_tokens, 100);
+    }
+
+    /// metrics が接尾辞なしの model 名を直接送ってきた場合、それは「ログで接尾辞が
+    /// 落ちた表記」ではなく実在する別バリアント (1M 無効版)。単価が異なるため
+    /// 完全名バケットへ畳み込むと、コスト按分がそのまま誤る。
+    #[test]
+    fn claude_bare_metric_model_is_not_folded_into_variant() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric("claude-opus-5", "max", "input", 50)],
+        ));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric(
+                "claude-opus-5[1m]",
+                "max",
+                "input",
+                100,
+            )],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        assert_eq!(
+            agent
+                .buckets
+                .get("anthropic/claude-opus-5/max")
+                .expect("接尾辞なしは別バリアントとして残る")
+                .stats
+                .input_tokens,
+            50
+        );
+        assert_eq!(
+            agent
+                .buckets
+                .get("anthropic/claude-opus-5[1m]/max")
+                .expect("1M バケット")
+                .stats
+                .input_tokens,
+            100
+        );
+    }
+
+    /// 実ログの `codex.turn.token_usage` には `cache_write_input=0` の data point が混ざる。
+    /// 0 の点で token source を Metrics へ固定すると、以降その model の SSE 完了ログを
+    /// 恒久的に取り込めなくなる (histogram の `sum` 省略でも同じ形になる)。
+    #[test]
+    fn codex_zero_value_token_metric_does_not_latch_source() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("reasoning_effort", "medium"),
+            ],
+        ));
+        let hits = agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_EXEC,
+            vec![codex_token_metric("gpt-6-astra", "cache_write_input", 0.0)],
+        ));
+        assert_eq!(hits, 0, "0 の data point は usage として数えない");
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-6-astra"),
+                kv_int("input_token_count", 1000),
+                kv_int("output_token_count", 200),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let bucket = snap
+            .agents
+            .get(AGENT_CODEX)
+            .and_then(|agent| {
+                agent
+                    .buckets
+                    .get(&format!("{PROVIDER_OPENAI}/gpt-6-astra/medium"))
+            })
+            .expect("SSE を token source として採用できる");
+        assert_eq!(bucket.stats.input_tokens, 1000);
+        assert_eq!(bucket.stats.output_tokens, 200);
+    }
+
+    /// `handle_responses` span が `codex.conversation_starts` より先に届くと、span から
+    /// 合成した session の provider は暫定値 (OpenAI) になる。これを確定扱いにすると
+    /// SSE usage が pending に積まれず、後から非既定 provider の session が届いても
+    /// 確定バケットへ移せない。span 先着でも provider 未確定なら pending を維持する。
+    #[test]
+    fn codex_span_before_conversation_starts_moves_pending_to_real_provider() {
+        let agg = Aggregator::new();
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("codex.request.reasoning_effort", "high"),
+                kv_str("conversation.id", "conv-1"),
+                kv_str("model", "gpt-6-astra"),
+            ])],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("conversation.id", "conv-1"),
+                kv_int("input_token_count", 1000),
+                kv_int("output_token_count", 200),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", "azure"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("conversation.id", "conv-1"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get("azure/gpt-6-astra/high")
+            .expect("確定した provider のバケットへ移る");
+        assert_eq!(bucket.stats.input_tokens, 1000);
+        assert_eq!(bucket.stats.output_tokens, 200);
+        assert!(
+            agent
+                .buckets
+                .get(&format!("{PROVIDER_OPENAI}/gpt-6-astra/high"))
+                .is_none_or(|b| !b.stats.has_any_value()),
+            "暫定 provider のバケットに usage を残してはいけない: {:?}",
+            agent.buckets
+        );
     }
 }

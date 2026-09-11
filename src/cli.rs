@@ -608,7 +608,12 @@ fn merge_cli_headers(
         if key.is_empty() {
             anyhow::bail!("proxy header `{entry}` has empty key");
         }
-        dest.insert(key.to_string(), value.to_string());
+        // HTTP / gRPC の header 名は大小文字を区別しない。表記違い (config の
+        // `authorization` と CLI の `Authorization`) が別 key として両方残ると、
+        // BTreeMap のバイト順反復と client 側の case-insensitive な insert によって
+        // 後着した config 値が CLI 値を上書きし、CLI > config の優先順位が逆転する。
+        dest.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        dest.insert(key.to_ascii_lowercase(), value.to_string());
     }
     Ok(())
 }
@@ -619,9 +624,18 @@ fn resolve_headers(
     raw: BTreeMap<String, String>,
     route_name: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let mut resolved = Vec::with_capacity(raw.len());
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(raw.len());
     for (key, value) in raw {
         validate_header_key(&key, route_name)?;
+        // HTTP/2 (gRPC) は header 名を lowercase で送る必要があり、HTTP/1.1 でも
+        // 大小文字を区別しない。表記を揃えないと同じ header を指す 2 つの key が
+        // 残り、client 側の case-insensitive な insert でどちらが送られるかが不定になる。
+        let key = key.to_ascii_lowercase();
+        if resolved.iter().any(|(existing, _)| *existing == key) {
+            anyhow::bail!(
+                "proxy route `{route_name}` has duplicate header `{key}` (header names are case-insensitive)"
+            );
+        }
         let final_value = if let Some(var) = value.strip_prefix("env:") {
             std::env::var(var).with_context(|| {
                 format!(
@@ -1013,10 +1027,10 @@ mod tests {
         let route = &proxy.routes[0];
         let headers: BTreeMap<_, _> = route.headers.iter().cloned().collect();
         assert_eq!(
-            headers.get("Authorization"),
+            headers.get("authorization"),
             Some(&"s3cret-value".to_string())
         );
-        assert_eq!(headers.get("X-Tenant"), Some(&"corp".to_string()));
+        assert_eq!(headers.get("x-tenant"), Some(&"corp".to_string()));
     }
 
     #[test]
@@ -1116,8 +1130,9 @@ mod tests {
         let headers: BTreeMap<_, _> = route.headers.iter().cloned().collect();
         assert_eq!(route.endpoint, "https://config.example");
         assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
-        assert_eq!(headers.get("X-Keep"), Some(&"config".to_string()));
-        assert_eq!(headers.get("X-Source"), Some(&"cli".to_string()));
+        // header 名は大小文字を区別しないため lowercase に正規化して保持する。
+        assert_eq!(headers.get("x-keep"), Some(&"config".to_string()));
+        assert_eq!(headers.get("x-source"), Some(&"cli".to_string()));
     }
 
     #[test]
@@ -1276,5 +1291,42 @@ mod tests {
         };
         let err = Settings::merge_with_home(cli, config, None).unwrap_err();
         assert!(err.to_string().contains("claude-code"), "got: {err}");
+    }
+
+    /// header 名は大小文字を区別しない。config が `authorization`、CLI が `Authorization`
+    /// のように表記だけ違う場合、別 key として両方残すと client 側の case-insensitive な
+    /// insert で後着 (config) が CLI を上書きし、`CLI > config` の優先順位が逆転する。
+    #[test]
+    fn merge_proxy_cli_header_overrides_config_header_with_different_case() {
+        use crate::config::ProxyConfig;
+
+        let mut cli = cli_with_log_file();
+        cli.proxy_openai_headers = vec!["Authorization=Bearer cli-token".to_string()];
+        let config = Config {
+            proxy: Some(ProxyConfig {
+                routes: vec![ProxyRouteConfig {
+                    name: "openai".to_string(),
+                    service_names: Vec::new(),
+                    signal_types: Vec::new(),
+                    transport: Some(ProxyTransport::Grpc),
+                    endpoint: "https://config.example".to_string(),
+                    // CLI と表記だけが違う同じ header。
+                    headers: BTreeMap::from([(
+                        "authorization".to_string(),
+                        "Bearer config-token".to_string(),
+                    )]),
+                }],
+                ..ProxyConfig::default()
+            }),
+            ..Config::default()
+        };
+
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        let route = &settings.proxy.unwrap().routes[0];
+        assert_eq!(
+            route.headers,
+            vec![("authorization".to_string(), "Bearer cli-token".to_string())],
+            "CLI 側の値だけが残ること"
+        );
     }
 }

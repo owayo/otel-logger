@@ -1,8 +1,10 @@
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::{self, BufWriter as StdBufWriter, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
+
+use time::OffsetDateTime;
 
 use anyhow::{Context, Result};
 use logroller::{LogRoller, LogRollerBuilder, Rotation, RotationAge, TimeZone};
@@ -12,7 +14,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::aggregator::{Aggregator, UsageSnapshot};
+use crate::aggregator::Aggregator;
 use crate::cli::{LogSink, Settings};
 use crate::format;
 use crate::forward::ProxyRouter;
@@ -43,9 +45,54 @@ impl TelemetryRecord {
 /// どちらも内部は同期的な `std::io::Write` なので、書き込みは `spawn_blocking` 上で行う。
 enum JsonlWriter {
     File(StdMutex<StdBufWriter<std::fs::File>>),
-    Roller(Box<StdMutex<LogRoller>>),
+    Roller(Box<RotatedWriter>),
     #[cfg(test)]
     Fail,
+}
+
+/// 日次ローテーション付き writer。
+///
+/// logroller 本体の保持件数管理 (`max_keep_files`) は**使わない**。あちらの prune は
+/// `otel-logger.\d{4}-\d{2}-\d{2}` に一致するファイル名を辞書順に並べ、古い方から
+/// 「件数 - max_keep」個を消すだけで、日付が実在するかを見ない。そのため
+/// `otel-logger.2026-99-99` のような不正な日付や未来日付のファイルが 1 つあるだけで、
+/// 辞書順ではそれより手前にくる**書き込み中の active file** が削除対象に入る。
+/// Unix では open 済み fd への書き込みと ACK は成功し続けるため、これは
+/// エラーにならないまま prosess 終了時に全データが消える「無音のログ全損」になる。
+/// 保持は mtime と実在暦日を検証する `cleanup_old_rotated_logs` に一本化し、
+/// 日付が変わったタイミングで呼び直す。
+struct RotatedWriter {
+    roller: StdMutex<LogRoller>,
+    dir: PathBuf,
+    keep_days: u32,
+    /// 最後に cleanup を走らせた日 (UTC 基準の Julian day)。
+    last_cleanup_day: StdMutex<i32>,
+}
+
+impl RotatedWriter {
+    /// 日付が変わっていたら古いファイルの掃除を試みる。常駐したままでも保持日数が
+    /// 効くようにするためで、cleanup の失敗で JSONL 書き込みは止めない
+    /// (欠測させないことを優先する)。
+    fn cleanup_if_day_changed(&self) {
+        let today = OffsetDateTime::now_utc().date().to_julian_day();
+        {
+            let mut last = self
+                .last_cleanup_day
+                .lock()
+                .expect("jsonl cleanup day mutex poisoned");
+            if *last == today {
+                return;
+            }
+            *last = today;
+        }
+        if let Err(e) = cleanup_old_rotated_logs(&self.dir, self.keep_days) {
+            tracing::warn!(
+                error = %e,
+                dir = %self.dir.display(),
+                "failed to clean up rotated log files"
+            );
+        }
+    }
 }
 
 impl JsonlWriter {
@@ -60,8 +107,9 @@ impl JsonlWriter {
                 g.flush().context("flush JSONL line")?;
                 Ok(())
             }
-            Self::Roller(m) => {
-                let mut g = m.lock().expect("jsonl roller mutex poisoned");
+            Self::Roller(w) => {
+                w.cleanup_if_day_changed();
+                let mut g = w.roller.lock().expect("jsonl roller mutex poisoned");
                 g.write_all(line).context("append JSONL line (rotated)")?;
                 g.flush().context("flush JSONL line (rotated)")?;
                 Ok(())
@@ -78,8 +126,8 @@ impl JsonlWriter {
                 g.flush().context("flush JSONL file")?;
                 g.get_mut().sync_all().context("fsync JSONL file")
             }
-            Self::Roller(m) => {
-                let mut g = m.lock().expect("jsonl roller mutex poisoned");
+            Self::Roller(w) => {
+                let mut g = w.roller.lock().expect("jsonl roller mutex poisoned");
                 g.flush().context("flush JSONL roller")
             }
             #[cfg(test)]
@@ -145,7 +193,7 @@ impl Sink {
                     tokio::task::spawn_blocking(move || open_rotated_sync(&dir, keep_days))
                         .await
                         .context("join open_rotated task")??;
-                Some(JsonlWriter::Roller(Box::new(StdMutex::new(roller))))
+                Some(JsonlWriter::Roller(Box::new(roller)))
             }
         };
 
@@ -193,14 +241,10 @@ impl Sink {
             TelemetryRecord::Traces(req) => self.inner.aggregator.ingest_traces(req) > 0,
             TelemetryRecord::Metrics(req) => self.inner.aggregator.ingest_metrics(req) > 0,
         };
-        let summary_snapshot = if samples_present && self.inner.summary_enabled {
-            Some(self.inner.aggregator.snapshot())
-        } else {
-            None
-        };
+        let want_summary = samples_present && self.inner.summary_enabled;
 
         if self.inner.stdout_enabled
-            && let Err(e) = self.write_pretty(&record, summary_snapshot).await
+            && let Err(e) = self.write_pretty(&record, want_summary).await
         {
             tracing::error!(error = %e, kind = record.kind(), "failed to write stdout");
         }
@@ -228,14 +272,14 @@ impl Sink {
         .context("join JSONL write task")?
     }
 
-    async fn write_pretty(
-        &self,
-        record: &TelemetryRecord,
-        summary: Option<UsageSnapshot>,
-    ) -> Result<()> {
+    async fn write_pretty(&self, record: &TelemetryRecord, want_summary: bool) -> Result<()> {
         let _guard = self.inner.stdout_lock.lock().await;
         let rendered = format::render(record, self.inner.color);
-        let summary_rendered = summary.map(|s| format::render_summary(&s, self.inner.color));
+        // 累計は stdout lock を取ってから読む。lock の外で snapshot を取ると、
+        // 並行する batch との間で「snapshot を取った順序」と「stdout へ書く順序」が
+        // 入れ替わり、単調増加のはずの累計が出力上で逆行する。
+        let summary_rendered = want_summary
+            .then(|| format::render_summary(&self.inner.aggregator.snapshot(), self.inner.color));
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             let stdout = io::stdout();
             let mut handle = stdout.lock();
@@ -288,23 +332,26 @@ fn open_log_file_sync(path: &Path) -> Result<StdBufWriter<std::fs::File>> {
     Ok(StdBufWriter::new(file))
 }
 
-fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<LogRoller> {
+fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create log directory {}", dir.display()))?;
-    // cleanup と log roller の保持数を同じ最小 1 日に揃える。
     // `--log-keep-days 0` が来た時に cutoff = now() となり全 rotated file が
-    // 削除されてしまうのを防ぐ。log roller 側も `max_keep_files(0)` だと
-    // 直後の rotation で新規ファイル自身を削除しに行くため最低 1 を要求する。
+    // 削除されてしまうのを防ぐため、最低 1 日は保持する。
     let max_keep = keep_days.max(1);
     cleanup_old_rotated_logs(dir, max_keep)
         .with_context(|| format!("cleanup old log files in {}", dir.display()))?;
+    // `max_keep_files` は意図的に設定しない (理由は `RotatedWriter` の doc comment)。
     let appender = LogRollerBuilder::new(dir, Path::new(ROTATION_PREFIX))
         .rotation(Rotation::AgeBased(RotationAge::Daily))
         .time_zone(TimeZone::Local)
-        .max_keep_files(u64::from(max_keep))
         .build()
         .map_err(|e| anyhow::anyhow!("build log roller: {e}"))?;
-    Ok(appender)
+    Ok(RotatedWriter {
+        roller: StdMutex::new(appender),
+        dir: dir.to_path_buf(),
+        keep_days: max_keep,
+        last_cleanup_day: StdMutex::new(OffsetDateTime::now_utc().date().to_julian_day()),
+    })
 }
 
 /// mtime 基準で `keep_days` より古い `otel-logger.*` ファイルを削除する。
@@ -331,11 +378,25 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
         if !is_rotated_log_filename(filename) {
             continue;
         }
-        if let Ok(metadata) = entry.metadata()
-            && let Ok(modified) = metadata.modified()
-            && modified < cutoff
+        // 失敗を握り潰すと、保持期間が実際には効いていなくても起動が成功してしまい、
+        // ディスクを使い切った時点で JSONL 永続化そのものが止まる。並行削除で
+        // 消えていた場合だけを正常系として扱い、それ以外は呼び出し元へ伝播する。
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat log file {}", path.display())),
+        };
+        // mtime を取得できない環境では保持判定ができないので、消さずに残す。
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
         {
-            let _ = std::fs::remove_file(&path);
+            return Err(e).with_context(|| format!("remove old log file {}", path.display()));
         }
     }
     Ok(())

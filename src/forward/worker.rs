@@ -63,6 +63,26 @@ async fn run(mut cfg: WorkerConfig) {
             }
         }
     }
+
+    // shutdown で抜けた時点で queue に残っている batch は転送されない。
+    // 計上しないと `sent + failed + dropped` が notify 総数と合わなくなり、
+    // 「何件を上流へ渡せなかったか」を運用側から観測できなくなる。
+    // payload 自体は JSONL に残っているので、ここでは drop として数えるだけでよい。
+    cfg.receiver.close();
+    let mut abandoned: u64 = 0;
+    while cfg.receiver.try_recv().is_ok() {
+        abandoned += 1;
+    }
+    if abandoned > 0 {
+        cfg.metrics
+            .dropped_total
+            .fetch_add(abandoned, Ordering::Relaxed);
+        tracing::warn!(
+            route = %cfg.route_name,
+            abandoned,
+            "proxy worker: dropped queued batches at shutdown"
+        );
+    }
     tracing::info!(route = %cfg.route_name, "proxy worker stopped");
 }
 

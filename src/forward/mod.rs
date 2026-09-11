@@ -70,8 +70,18 @@ pub async fn spawn_router(
     let mut lanes: Vec<Arc<RouteLane>> = Vec::with_capacity(settings.routes.len());
     let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(settings.routes.len());
 
+    // `mpsc::channel` は容量が `Semaphore::MAX_PERMITS` を超えると panic する。
+    // 設定ミスを異常終了ではなく設定エラーとして返す。
+    let queue_capacity = settings.queue_capacity.max(1);
+    if queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        anyhow::bail!(
+            "proxy queue capacity {queue_capacity} exceeds the maximum of {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
     for route in &settings.routes {
-        let (tx, rx) = mpsc::channel::<ExportRequest>(settings.queue_capacity.max(1));
+        let (tx, rx) = mpsc::channel::<ExportRequest>(queue_capacity);
         let metrics: RouteMetricsHandle = Arc::new(RouteMetrics::default());
         let client = client::RouteClient::build(route, settings.timeout_ms)?;
         let lane = Arc::new(RouteLane {

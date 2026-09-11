@@ -467,8 +467,14 @@ fn quote_for_pretty(s: &str) -> String {
 fn needs_escape(c: char) -> bool {
     // C0 制御文字 (0x00..=0x1F) と DEL (0x7F)、および C1 制御文字 (0x80..=0x9F) を escape。
     // 改行/復帰/tab も含むが、これらは `quote_for_pretty` 側で読みやすい表現に置換する。
+    // Unicode の双方向制御文字も escape する。これらは表示順だけを入れ替えるため、
+    // `report\u{202e}txt.exe` を `report.exe...` のように見せかけられる。信頼できない
+    // telemetry を端末へ出す以上、C0/C1 と同じ扱いにする。
     let code = c as u32;
-    code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code)
+    code < 0x20
+        || code == 0x7f
+        || (0x80..=0x9f).contains(&code)
+        || matches!(code, 0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069)
 }
 
 #[cfg(test)]
@@ -691,5 +697,26 @@ mod tests {
         assert!(rendered.contains("provider=\"provider\\u{001b}[31m\""));
         assert!(rendered.contains("model=\"model\\u{001b}[2J\""));
         assert!(rendered.contains("effort=\"effort\\u{001b}]0;bad\""));
+    }
+
+    /// Unicode の双方向制御文字は表示順だけを入れ替えるため、`report\u{202e}txt.exe` を
+    /// `report.exe` 側が末尾に見えるよう偽装できる。ANSI escape と同じく、信頼できない
+    /// telemetry を端末へ出す以上 escape する。
+    #[test]
+    fn quote_for_pretty_escapes_bidi_control_characters() {
+        for (raw, expected) in [
+            ("safe\u{202e}txt.exe", "\\u{202e}"),
+            ("a\u{2066}b", "\\u{2066}"),
+            ("a\u{200f}b", "\\u{200f}"),
+            ("a\u{061c}b", "\\u{061c}"),
+        ] {
+            let quoted = quote_for_pretty(raw);
+            assert!(
+                quoted.contains(expected),
+                "{raw:?} の bidi 制御文字が escape されていない: {quoted}"
+            );
+        }
+        // 通常の文字は quote されないままにする (既存の見た目を壊さない)。
+        assert_eq!(quote_for_pretty("plain-value"), "plain-value");
     }
 }

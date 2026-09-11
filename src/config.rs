@@ -212,8 +212,20 @@ impl Config {
                 Self::load_from(&path)
             }
             None => match default_config_path() {
-                Some(path) if path.exists() => Self::load_from(&path),
-                _ => Ok(Self::default()),
+                // `exists()` は権限エラーや I/O エラーも `false` に潰す。既定設定が実在する
+                // のに読めなかった場合、`log-file` / `log-dir` 設定ごと失って「JSONL 永続化
+                // なしで OTLP を受理して 200 を返す」状態で起動してしまうため区別する。
+                Some(path) => {
+                    if path
+                        .try_exists()
+                        .with_context(|| format!("inspect config file {}", path.display()))?
+                    {
+                        Self::load_from(&path)
+                    } else {
+                        Ok(Self::default())
+                    }
+                }
+                None => Ok(Self::default()),
             },
         }
     }
@@ -221,8 +233,15 @@ impl Config {
     fn load_from(path: &Path) -> Result<Self> {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("read config file {}", path.display()))?;
-        let config: Self =
-            toml::from_str(&body).with_context(|| format!("parse TOML in {}", path.display()))?;
+        let config = toml::from_str::<Self>(&body)
+            .map_err(|mut e| {
+                // toml crate は元テキストを添付してエラー箇所の行を描画する。設定に
+                // `Authorization = "Bearer ..."` のような秘密が書かれていると、構文エラー
+                // ひとつで stderr / journal に平文で残るため、入力の添付を外す。
+                e.set_input(None);
+                e
+            })
+            .with_context(|| format!("parse TOML in {}", path.display()))?;
         Ok(config)
     }
 }

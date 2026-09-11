@@ -157,7 +157,8 @@ fn warn_partial_logs(
     {
         tracing::warn!(
             rejected = ps.rejected_log_records,
-            reason = %ps.error_message,
+            // 上流が自由に設定できる文字列なので、Debug で制御文字を escape して出す。
+            reason = ?ps.error_message,
             "proxy: upstream partially rejected logs"
         );
     }
@@ -171,7 +172,8 @@ fn warn_partial_traces(
     {
         tracing::warn!(
             rejected = ps.rejected_spans,
-            reason = %ps.error_message,
+            // 上流が自由に設定できる文字列なので、Debug で制御文字を escape して出す。
+            reason = ?ps.error_message,
             "proxy: upstream partially rejected spans"
         );
     }
@@ -185,7 +187,8 @@ fn warn_partial_metrics(
     {
         tracing::warn!(
             rejected = ps.rejected_data_points,
-            reason = %ps.error_message,
+            // 上流が自由に設定できる文字列なので、Debug で制御文字を escape して出す。
+            reason = ?ps.error_message,
             "proxy: upstream partially rejected data points"
         );
     }
@@ -212,25 +215,31 @@ impl HttpClient {
             .timeout(timeout)
             .connect_timeout(timeout)
             .tcp_keepalive(Some(Duration::from_secs(60)))
+            // OTLP endpoint は明示指定なので redirect を追う正当性がない。既定 (最大 10 回)
+            // のままだと、`api-key` のようなカスタム認証ヘッダは cross-host でも除去されず、
+            // 307/308 では body ごと別 origin へ再送される。3xx は送信失敗として retry させる。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build reqwest client")?;
-        let endpoint = reqwest::Url::parse(&route.endpoint).with_context(|| {
-            format!(
-                "parse HTTP endpoint `{}` for route `{}`",
-                route.endpoint, route.name
-            )
-        })?;
+        // endpoint 自体はエラーに載せない。query や userinfo に資格情報を書かれていると、
+        // 起動時のエラーメッセージがそのまま秘密の露出経路になる。route 名だけで特定できる。
+        let endpoint = reqwest::Url::parse(&route.endpoint)
+            .with_context(|| format!("parse HTTP endpoint for route `{}`", route.name))?;
         if !matches!(endpoint.scheme(), "http" | "https") || !endpoint.has_host() {
             bail!(
-                "HTTP endpoint `{}` for route `{}` must be an absolute HTTP(S) URL",
-                route.endpoint,
+                "HTTP endpoint for route `{}` must be an absolute HTTP(S) URL",
                 route.name
             );
         }
         if endpoint.query().is_some() || endpoint.fragment().is_some() {
             bail!(
-                "HTTP endpoint `{}` for route `{}` must not contain a query or fragment",
-                route.endpoint,
+                "HTTP endpoint for route `{}` must not contain a query or fragment",
+                route.name
+            );
+        }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            bail!(
+                "HTTP endpoint for route `{}` must not embed credentials; use a proxy header with `env:VAR` instead",
                 route.name
             );
         }
@@ -287,20 +296,15 @@ impl HttpClient {
             .body(Bytes::from(body))
             .send()
             .await
-            .with_context(|| format!("HTTP POST {url}"))?;
+            // URL 全体は出さない。endpoint に userinfo (`https://user:pass@host`) が
+            // 入っていると、送信失敗のたびに資格情報が stderr に残る。
+            .with_context(|| format!("HTTP POST to upstream (signal path {})", url.path()))?;
         let status = response.status();
         if !status.is_success() {
-            let body_snippet = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(400)
-                .collect::<String>();
-            bail!(
-                "upstream returned HTTP {status} for {url}: {snippet}",
-                snippet = body_snippet
-            );
+            // 本文は読まない。`text()` は全量をメモリに展開する (gzip なら展開後のサイズ) ため、
+            // 読んでから切り詰めても上限にならず、中身も上流が自由に決められる文字列なので
+            // そのまま stderr に出すと terminal escape injection の経路になる。
+            bail!("upstream returned HTTP {status}");
         }
         // 2xx かつ body 全体を discard。partial success の解析は今のところ省略 (Phase B で追加)。
         drop(response);

@@ -21,9 +21,20 @@ pub const OTLP_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
     let (trace_srv, metrics_srv, logs_srv) = OtlpService::new(sink).into_servers();
     // 既定 (4MiB) では大きな batch が decode 前に拒否されるため、上限を明示的に引き上げる。
-    let trace_srv = trace_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
-    let metrics_srv = metrics_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
-    let logs_srv = logs_srv.max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    // gzip も受け付ける。`OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter が gRPC で
+    // 送ると、対応していなければ handler 到達前に `Unimplemented` が返る。これは
+    // 非 retryable なので、OTLP/HTTP の 400 と同じく batch が恒久的に失われる。
+    // size 上限は展開後に効くため 32MiB 制限は維持される。
+    let gzip = tonic::codec::CompressionEncoding::Gzip;
+    let trace_srv = trace_srv
+        .accept_compressed(gzip)
+        .max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    let metrics_srv = metrics_srv
+        .accept_compressed(gzip)
+        .max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
+    let logs_srv = logs_srv
+        .accept_compressed(gzip)
+        .max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
     tracing::info!(%addr, max_request_bytes = OTLP_MAX_REQUEST_BYTES, "OTLP/gRPC server listening");
     tonic::transport::Server::builder()
         .add_service(trace_srv)
