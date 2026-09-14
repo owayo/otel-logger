@@ -52,15 +52,20 @@ pub struct Cli {
     pub log_dir: Option<PathBuf>,
 
     /// Number of rotated daily JSONL files to retain when `--log-dir` is used.
+    /// Applies to JSONL only; the stdout stream is never rotated.
     /// `--log-dir` 利用時に保持する日次 JSONL ファイル数。
     /// 古いファイルは起動時に削除し、ローテーション時にも上限を適用する。
+    /// 保持期間が効くのは JSONL だけで、stdout はローテーションされない。
     /// 既定値は 10。
     #[arg(long, env = "OTEL_LOGGER_LOG_KEEP_DAYS", value_name = "DAYS")]
     pub log_keep_days: Option<u32>,
 
     /// Suppress the human-readable stdout stream.
+    /// Required for unattended runs: stdout is never rotated.
     /// 人が読める stdout 出力を抑止する。
     /// JSONL ファイルだけを書き出したい場合に使う。
+    /// otel-logger は stdout をローテーションしないため、常駐運用 (launchd / systemd /
+    /// container) では必ず指定する。累計集計と `GET /stats` はこのフラグの影響を受けない。
     #[arg(long, env = "OTEL_LOGGER_NO_STDOUT")]
     pub no_stdout: bool,
 

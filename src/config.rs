@@ -537,8 +537,11 @@ color = "never"
             assert!(template.contains("# [[proxy.routes]]"));
             assert!(template.contains("# grpc-addr = \"0.0.0.0:4317\""));
         }
-        assert!(daemon.contains("otel-logger init --daemon"));
-        assert!(!default.contains("otel-logger init --daemon\n# stdout"));
+        // 差し替える断片だけが profile ごとに違う。
+        assert!(default.contains("\nno-stdout = false\n"));
+        assert!(daemon.contains("\nno-stdout = true\n"));
+        assert!(daemon.contains("常駐運用向けの設定です"));
+        assert!(!default.contains("常駐運用向けの設定です"));
     }
 
     #[test]
