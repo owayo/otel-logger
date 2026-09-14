@@ -143,6 +143,62 @@ pub struct Sink {
     inner: Arc<SinkInner>,
 }
 
+/// stdout writer の状態。
+///
+/// stdout 出力はベストエフォートだが、読み手が消えた後 (`otel-logger | head` の終了、
+/// pager の終了など) も batch ごとに書き込みを試すと、失敗のたびに stderr へ error を
+/// 積み上げることになる。stdout の肥大化を止めた先で stderr が同じ問題を起こさないよう、
+/// 最初の `BrokenPipe` で以後の pretty / summary 出力を止める。
+#[derive(Debug, Default)]
+struct StdoutState {
+    /// stdout の読み手が消えた (EPIPE) かどうか。
+    broken_pipe: bool,
+}
+
+impl StdoutState {
+    /// この batch を stdout へ書くべきか。pipe が閉じた後は書かない。
+    fn should_write(&self) -> bool {
+        !self.broken_pipe
+    }
+}
+
+/// stdout 書き込みの結果を state に反映し、呼び出し元へ返す結果へ変換する。
+///
+/// `BrokenPipe` は「読み手が居なくなった」だけで telemetry の欠落ではないため、
+/// 以後の stdout 出力を止めたうえで `Ok` を返す。JSONL 永続化・累計集計・proxy 転送は
+/// 続行し、OTLP 側のエラーにも変換しない。それ以外の I/O error は一時的な可能性が
+/// あるため、停止させずそのまま呼び出し元 (= tracing への記録) に返す。
+fn classify_stdout_result(state: &mut StdoutState, result: io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            state.broken_pipe = true;
+            tracing::warn!(
+                "stdout closed (broken pipe); disabling human-readable output. \
+                 JSONL persistence, usage aggregation and proxy forwarding continue. \
+                 / stdout が閉じられた (broken pipe) ため、人が読める出力を停止します。\
+                 JSONL 永続化・累計集計・proxy 転送は継続します。"
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::Error::new(e)).context("write to stdout"),
+    }
+}
+
+/// pretty 出力と (必要なら) 累計サマリーを 1 つの writer へ書き出す。
+/// stdout handle を直接触らないので、error 経路を単体テストできる。
+fn write_pretty_to<W: io::Write>(
+    writer: &mut W,
+    rendered: &str,
+    summary: Option<&str>,
+) -> io::Result<()> {
+    writer.write_all(rendered.as_bytes())?;
+    if let Some(summary) = summary {
+        writer.write_all(summary.as_bytes())?;
+    }
+    writer.flush()
+}
+
 struct SinkInner {
     stdout_enabled: bool,
     color: bool,
@@ -150,7 +206,8 @@ struct SinkInner {
     file: Option<JsonlWriter>,
     /// stdout 全体を守る粗い mutex。telemetry payload は 1 record で多くの行に展開されるため、
     /// 別 writer と interleave すると人が読める stream として壊れる。
-    stdout_lock: Mutex<()>,
+    /// pipe が閉じたかどうかも同じ lock の下で持ち、並行 batch から一貫して見えるようにする。
+    stdout_lock: Mutex<StdoutState>,
     aggregator: Aggregator,
     /// OTLP proxy 転送ルーター (未設定なら `None`)。JSONL 永続化が成功した後で
     /// service.name で振り分けて `try_send` する。
@@ -203,7 +260,7 @@ impl Sink {
                 color,
                 summary_enabled: settings.summary,
                 file,
-                stdout_lock: Mutex::new(()),
+                stdout_lock: Mutex::new(StdoutState::default()),
                 aggregator: Aggregator::new(),
                 proxy,
             }),
@@ -273,27 +330,24 @@ impl Sink {
     }
 
     async fn write_pretty(&self, record: &TelemetryRecord, want_summary: bool) -> Result<()> {
-        let _guard = self.inner.stdout_lock.lock().await;
+        let mut state = self.inner.stdout_lock.lock().await;
+        if !state.should_write() {
+            return Ok(());
+        }
         let rendered = format::render(record, self.inner.color);
         // 累計は stdout lock を取ってから読む。lock の外で snapshot を取ると、
         // 並行する batch との間で「snapshot を取った順序」と「stdout へ書く順序」が
         // 入れ替わり、単調増加のはずの累計が出力上で逆行する。
         let summary_rendered = want_summary
             .then(|| format::render_summary(&self.inner.aggregator.snapshot(), self.inner.color));
-        tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            handle.write_all(rendered.as_bytes())?;
-            if let Some(s) = summary_rendered {
-                handle.write_all(s.as_bytes())?;
-            }
-            handle.flush()?;
-            Ok(())
+            write_pretty_to(&mut handle, &rendered, summary_rendered.as_deref())
         })
         .await
-        .context("join stdout write task")?
-        .context("write to stdout")?;
-        Ok(())
+        .context("join stdout write task")?;
+        classify_stdout_result(&mut state, result)
     }
 
     /// buffer 済み書き込みを flush する。SIGTERM でも末尾 batch を失わないよう、
@@ -506,7 +560,7 @@ mod tests {
                 color: false,
                 summary_enabled: true,
                 file: Some(JsonlWriter::Fail),
-                stdout_lock: Mutex::new(()),
+                stdout_lock: Mutex::new(StdoutState::default()),
                 aggregator: Aggregator::new(),
                 proxy: None,
             }),
@@ -605,6 +659,64 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&link).is_ok(),
             "LogRoller が生成しない symlink は削除対象外"
+        );
+    }
+
+    #[test]
+    fn write_pretty_to_appends_summary_after_the_record() {
+        let mut buf: Vec<u8> = Vec::new();
+
+        write_pretty_to(&mut buf, "record\n", Some("summary\n")).unwrap();
+
+        assert_eq!(String::from_utf8(buf).unwrap(), "record\nsummary\n");
+    }
+
+    #[test]
+    fn stdout_broken_pipe_disables_further_pretty_output() {
+        let mut state = StdoutState::default();
+        assert!(state.should_write());
+
+        classify_stdout_result(
+            &mut state,
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
+        )
+        .expect("EPIPE は telemetry の欠落ではないので Ok を返す");
+
+        assert!(
+            !state.should_write(),
+            "読み手が消えた後に書き続けると、失敗のたびに stderr へ error を積み上げてしまう"
+        );
+    }
+
+    #[test]
+    fn stdout_transient_error_keeps_pretty_output_enabled() {
+        let mut state = StdoutState::default();
+
+        let err = classify_stdout_result(
+            &mut state,
+            Err(io::Error::new(io::ErrorKind::Interrupted, "eintr")),
+        )
+        .expect_err("EPIPE 以外の I/O error は呼び出し元へ返す");
+
+        assert!(err.to_string().contains("write to stdout"));
+        assert!(
+            state.should_write(),
+            "一時的な error で人が読める出力を恒久停止しない"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_stdout_settings_disable_pretty_and_summary_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = settings_with_log_file(dir.path().join("out.jsonl"));
+        // `--summary` を併用しても `--no-stdout` が勝つ (summary も stdout へ書くため)。
+        settings.summary = true;
+
+        let sink = Sink::from_settings(&settings).await.unwrap();
+
+        assert!(
+            !sink.inner.stdout_enabled,
+            "no-stdout 指定時は summary も含め stdout へ書かない"
         );
     }
 

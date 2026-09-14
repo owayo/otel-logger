@@ -178,6 +178,13 @@ pub enum Commands {
         /// 既存ファイルを上書きする。未指定の場合、init は上書きを拒否する。
         #[arg(long, short = 'f')]
         force: bool,
+
+        /// Generate a configuration tuned for unattended (daemon) operation.
+        /// 常駐運用向けの設定を生成する。stdout はローテーションされないため
+        /// `no-stdout = true` にし、JSONL は日次ローテーション付きの `log-dir` に書く。
+        /// 設定ファイルを生成するだけで、サービス登録やバックグラウンド化は行わない。
+        #[arg(long)]
+        daemon: bool,
     },
 }
 
@@ -285,6 +292,22 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// stdout がローテーションされないまま増え続ける構成かを判定する。
+    ///
+    /// 人が読める stdout 出力が有効で、かつ stdout が端末を指していないときに真。
+    /// otel-logger は JSONL 側にしか保持期間を持たず、stdout は launchd の
+    /// `StandardOutPath` や systemd のファイルリダイレクトへ渡されると誰もローテーション
+    /// しないため、常駐運用では際限なく肥大化する (実例: 37 日で 7.6GB)。
+    ///
+    /// 判定を「stdout が通常ファイルか」ではなく「端末でないか」にしているのは、
+    /// `docker run` の log driver のように pipe 経由でも保持管理を持たない経路が
+    /// あるため。`| less` のような一時的な pipe では偽陽性になるが、出すのは
+    /// stderr へ 1 行の warning だけで、内容 (stdout はローテーションされない) 自体は
+    /// その場合も正しい。
+    pub fn warns_unrotated_stdout(&self, stdout_is_terminal: bool) -> bool {
+        !self.no_stdout && !stdout_is_terminal
+    }
+
     /// merge 優先順位: CLI flag > env (clap が処理) > config > default。
     pub fn merge(cli: Cli, config: Config) -> anyhow::Result<Self> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -895,6 +918,63 @@ mod tests {
         let settings = Settings::merge_with_home(cli, config, None).unwrap();
         assert!(settings.no_stdout);
         assert!(settings.summary);
+    }
+
+    #[test]
+    fn warns_unrotated_stdout_only_when_output_is_enabled_and_redirected() {
+        // 既定 (pretty 出力あり) で stdout が端末でない = launchd の StandardOutPath や
+        // systemd のファイルリダイレクト。ここだけ警告する。
+        let noisy = Settings::merge_with_home(empty_cli(), Config::default(), None).unwrap();
+        assert!(noisy.warns_unrotated_stdout(false));
+        assert!(
+            !noisy.warns_unrotated_stdout(true),
+            "端末に出している間は無制限に溜まらないので警告しない"
+        );
+
+        let mut cli = empty_cli();
+        cli.no_stdout = true;
+        let quiet = Settings::merge_with_home(cli, Config::default(), None).unwrap();
+        assert!(!quiet.warns_unrotated_stdout(false));
+        assert!(!quiet.warns_unrotated_stdout(true));
+    }
+
+    #[test]
+    fn daemon_profile_config_does_not_warn_about_unrotated_stdout() {
+        // `otel-logger init --daemon` の生成物をそのまま常駐に載せても警告が出ないこと。
+        // 警告文が勧める設定が、実際に警告を止められることの回帰テスト。
+        let path = std::path::PathBuf::from("daemon-config.toml");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(path);
+        crate::config::write_with_profile(&path, false, crate::config::InitProfile::Daemon)
+            .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let settings = Settings::merge_with_home(empty_cli(), config, None).unwrap();
+
+        assert!(settings.no_stdout);
+        assert!(!settings.warns_unrotated_stdout(false));
+        match settings.log_sink {
+            Some(LogSink::Directory { keep_days, .. }) => assert_eq!(keep_days, 10),
+            other => panic!("常駐 profile は日次ローテーションを使う: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_daemon_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["otel-logger", "init", "--daemon"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { daemon, force, .. }) => {
+                assert!(daemon);
+                assert!(!force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["otel-logger", "init"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { daemon, .. }) => assert!(!daemon),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

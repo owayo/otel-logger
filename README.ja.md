@@ -110,7 +110,7 @@ otel-logger [OPTIONS]
 | `--log-file`   |       | (なし)           | `OTEL_LOGGER_LOG_FILE`    | 受信内容を JSON Lines で追記出力 (`--log-dir` と排他)        |
 | `--log-dir`    |       | (なし)           | `OTEL_LOGGER_LOG_DIR`     | 指定ディレクトリに日次ローテーションで JSONL を出力 (`otel-logger.YYYY-MM-DD`、ローカルタイム) |
 | `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | `--log-dir` 利用時に保持する日数 (`0` を渡しても最低 1 日は残す) |
-| `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止                                    |
+| `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止 (常駐時は必須。[常駐運用](#常駐運用) 節を参照) |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に累計サマリーを stdout に追記       |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (`NO_COLOR` を尊重)            |
 | `--dry-run`    | `-n`  | `false`          |                           | 両 listener の同時 bind を含む起動チェックを実施して終了     |
@@ -150,6 +150,7 @@ otel-logger [OPTIONS]
 otel-logger init                    # → ~/.config/otel-logger/config.toml
 otel-logger init -p /etc/foo.toml   # → 任意のパス
 otel-logger init -f                 # 既存ファイルを上書き
+otel-logger init --daemon           # 常駐運用向けのプリセット
 ```
 
 生成されるファイルの中身:
@@ -166,6 +167,9 @@ color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
 ```
+
+`--daemon` は常駐運用向けに調整した別のテンプレートを生成します (`no-stdout = true` と、
+保持設定付きの日次ローテーション JSONL)。詳細は [常駐運用](#常駐運用) 節を参照してください。
 
 注意: TOML 内のパスは一般的なシェル展開を行いません。上記のパス設定では先頭の
 `~` / `~/` だけを展開しますが、`$HOME/logs` のような埋め込み環境変数は展開しません。
@@ -244,6 +248,167 @@ docker compose run --rm codex-sample
 ```
 
 サーバ側のログは `docker compose logs otel-logger`、JSONL は `./data/otel-logger.jsonl` に出力されます。
+
+## 常駐運用
+
+`otel-logger` を常駐させるときは、必ず `--no-stdout` を付けてください。人間向けの
+stdout 出力にはローテーションも上限もありません。`--log-keep-days` の保持設定が効くのは
+`--log-dir` が書く JSONL **だけ**で、リダイレクトした stdout には一切適用されません。
+launchd の `StandardOutPath` も単純なシェルリダイレクトも出力先をローテーションしないため、
+実例では launchd で常駐させたインスタンスの stdout ファイルが 37 日で 7.6 GB
+(1 日あたり約 200 MB) まで膨らみ、誰も気づかないままディスクを消費していました。
+
+launchd / systemd / Docker の下では stdout が端末になりません。`otel-logger` は起動時に
+これを検出し、人間向け出力が有効なままなら stderr へ 1 回だけ警告を出して
+`--no-stdout` (または設定ファイルの `no-stdout = true`) を促します。
+
+`--no-stdout` は整形出力と `--summary` ブロックの両方を抑止しますが、累計集計そのものは
+動き続けます。常駐中の状況確認はログを読むのではなく `GET /stats` を叩いてください
+(詳細は [累計トークン統計](#累計トークン統計) 節)。
+
+常駐向けの既定値が入った設定ファイルは `--daemon` プリセットで生成できます。生成するのは
+設定ファイルだけで、サービス登録もバックグラウンド化も行いません:
+
+```bash
+otel-logger init --daemon                             # → ~/.config/otel-logger/config.toml
+otel-logger init --daemon -p /etc/otel-logger/config.toml
+```
+
+```toml
+# ~/.config/otel-logger/config.toml
+log-dir = "/var/log/otel-logger"
+log-keep-days = 10                 # 既定: 10
+# 代わりに単一ファイルへ追記する場合 (`log-dir` と排他。ローテーションはされない):
+# log-file = "/var/log/otel-logger/otel-logger.jsonl"
+no-stdout = true
+summary = false
+color = "auto"  # "auto" | "always" | "never"
+# grpc-addr = "0.0.0.0:4317"
+# http-addr = "0.0.0.0:4318"
+```
+
+### macOS (launchd)
+
+`~/Library/LaunchAgents/io.github.owayo.otel-logger.plist` として保存します
+(`YOUR_USER` はログディレクトリを所有するアカウント名に置き換えてください):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.owayo.otel-logger</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/otel-logger</string>
+    <string>--no-stdout</string>
+    <string>--log-dir</string>
+    <string>/Users/YOUR_USER/Library/Logs/otel-logger</string>
+    <string>--log-keep-days</string>
+    <string>10</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.owayo.otel-logger.plist
+launchctl print gui/$(id -u)/io.github.owayo.otel-logger          # 状態確認
+launchctl kickstart -k gui/$(id -u)/io.github.owayo.otel-logger   # 再起動
+launchctl bootout gui/$(id -u)/io.github.owayo.otel-logger        # 停止してアンロード
+```
+
+`StandardOutPath` を `/dev/null` にしているのは、launchd がストリームをリダイレクトするだけで
+出力先ファイルをローテーションしないためです。`StandardErrorPath` も同じで、サーバ自身の
+診断ログを残すために実ファイルを指定した場合、そのファイルのローテーションと削除は
+launchd ではなく利用者側の責任になります。
+
+### Linux (systemd)
+
+`/etc/systemd/system/otel-logger.service` として保存します:
+
+```ini
+[Unit]
+Description=otel-logger OTLP receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=otel-logger
+ExecStart=/usr/local/bin/otel-logger --no-stdout --log-dir /var/log/otel-logger --log-keep-days 10
+Restart=on-failure
+RestartSec=5s
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now otel-logger.service
+sudo systemctl status otel-logger.service
+journalctl -u otel-logger.service -f
+```
+
+`/var/log/otel-logger` は unit の `User=` から書き込める必要があります。その中の JSONL は
+日次でローテーションされ、`--log-keep-days` を過ぎたものは削除されます。
+
+2 つの出力ストリームは上限のかかり方が違うので、区別して考えてください。
+`StandardError=journal` はサーバの診断ログを journald に渡すため、ホスト側の保持設定
+(`journald.conf` の `SystemMaxUse=` や `MaxRetentionSec=` など) で管理され、それ自体で
+上限が付きます。一方 `StandardOutput=append:/var/log/otel-logger/stdout.log` のように
+ファイルへ直接追記する指定は何もローテーションしないため、際限なく増えるのはこちらです。
+
+### Docker のログドライバ
+
+既定の `json-file` ログドライバはローテーションしないため、常駐させたコンテナは stdout も
+stderr もコンテナの寿命の分だけ溜め続けます。`--no-stdout` で大半は消えますが、サーバ自身の
+診断ログは stderr に残ります。コンテナログを残すなら上限を明示してください。既定で
+ローテーションする `local` ドライバを使うか、`json-file` に同じオプションを与えます:
+
+```yaml
+services:
+  otel-logger:
+    image: ghcr.io/owayo/otel-logger:latest
+    command: ["--no-stdout", "--log-dir", "/var/log/otel-logger", "--log-keep-days", "10"]
+    volumes:
+      - ./data:/var/log/otel-logger
+    logging:
+      driver: local        # json-file に同じ 2 つのオプションを与えてもよい
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+同梱の [`compose.yaml`](compose.yaml) は、短時間のサンプル実行で
+`docker compose logs otel-logger` が読めるように、あえて stdout を残しています。
+常駐させる場合は `--no-stdout` と `logging:` ブロックを足してください。
+
+### 外部ローテータ (newsyslog / logrotate)
+
+`otel-logger` は `SIGHUP` による出力ファイルの再オープンに対応していません。そのため
+「rename してシグナル」という一般的なローテーション方式は使えません。`logrotate` や
+`newsyslog` がファイルを rename した後もプロセスは古い fd に書き続けるため、新しいファイルは
+空のままで、ディスク容量も解放されません。`copytruncate` は rename を避けられますが、
+コピーと truncate の間に書かれた分を失いうるので、JSONL の出力先に指定してはいけません。
+
+推奨は `otel-logger` 自身にファイルを管理させることです。`--log-dir` が日次で
+ローテーションし、`--log-keep-days` が古いファイルを削除します。そのうえで
+`--no-stdout` で人間向けストリームを落とします。常駐インスタンスでどうしても stdout を
+残したい場合は、rename 方式のローテータではなく、自前でローテーションする consumer
+(`multilog`、`rotatelogs`、journald など) にパイプしてください。
 
 ## CI での利用例
 

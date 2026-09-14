@@ -8,9 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::cli::ColorMode;
 use crate::path::expand_user_path;
 
-/// `otel-logger init` が出力する参照用設定。source tree なしで新しい設定を
+/// `otel-logger init` が出力する参照用設定の共通ヘッダー。source tree なしで新しい設定を
 /// 生成できるよう、binary に直接埋め込む。
-const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger 設定ファイル
+///
+/// テンプレートは「共通部分」と「profile (既定 / `--daemon`) で差し替える断片」に分けて
+/// 持つ。全文を profile ごとに 2 本持つと proxy の説明のような無関係な箇所まで同期が
+/// 必要になり、生成時に `no-stdout = false` を文字列置換する方式は表記を変えた瞬間に
+/// 無音で壊れるため。
+const CONFIG_HEADER: &str = r#"# otel-logger 設定ファイル
 #
 # 既定の場所: $XDG_CONFIG_HOME/otel-logger/config.toml
 #             (XDG_CONFIG_HOME 未設定時は ~/.config/otel-logger/config.toml)
@@ -19,7 +24,18 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# otel-logger 設定ファイル
 #
 # 優先順位: CLI flag > 環境変数 > 設定ファイル > 組み込み既定値。
 # 以下の key はすべて任意です。コメントアウトすると既定値に戻ります。
+"#;
 
+/// `--daemon` で生成したときにヘッダーへ続けて入れる注記。
+const DAEMON_HEADER_NOTE: &str = r#"#
+# このファイルは `otel-logger init --daemon` が生成した常駐運用向けの設定です。
+# otel-logger は stdout をローテーションしないため、人が読める出力は止めて、記録は
+# 日次ローテーション付きの JSONL に任せます。累計は停止せず、HTTP endpoint
+# `GET /stats` から取得できます。
+"#;
+
+/// 既定 profile の JSONL 出力先。手元で試す用途を想定し、単一ファイルへの追記を既定にする。
+const DEFAULT_STORAGE_SECTION: &str = r#"
 # 受信した OTLP telemetry を欠落のない JSON Lines として保存します。親ディレクトリは
 # 起動時に作成され、ファイルは追記モードで開かれ、graceful shutdown 時に fsync されます。
 # `log-dir` とは同時に指定できません。
@@ -33,15 +49,53 @@ log-file = "/var/log/otel-logger/otel-logger.jsonl"
 # CLI や環境変数で `log-file` を指定した場合は、そちらが優先されます。
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10
+"#;
 
+/// 常駐 profile の JSONL 出力先。ローテーションと保持日数が効く `log-dir` を既定にする。
+/// 単一ファイルを既定のままにすると、stdout の肥大化を止めた先で JSONL が
+/// 無制限に伸びる経路へ誘導してしまうため。
+const DAEMON_STORAGE_SECTION: &str = r#"
+# 受信した OTLP telemetry を、日次ローテーション付きの JSON Lines として保存します
+# (ローカル時刻で日ごとの `otel-logger.YYYY-MM-DD`)。古いファイルは起動時と日付の
+# 変わり目に整理され、`log-keep-days` (既定値 10) 日分を保持します。
+# `log-file` とは同時に指定できません。
+log-dir = "/var/log/otel-logger"
+log-keep-days = 10
+
+# 代替: 単一ファイルへ追記します。こちらはローテーションも保持上限も持たないため、
+# 常駐運用では外部のログローテーションが別途必要になります。
+# CLI や環境変数で `log-dir` を指定した場合は、そちらが優先されます。
+# log-file = "/var/log/otel-logger/otel-logger.jsonl"
+"#;
+
+/// 既定 profile の stdout 出力設定。対話実行を想定して pretty 出力を有効のままにする。
+const DEFAULT_OUTPUT_SECTION: &str = r#"
 # 人が読める stdout 出力を抑止します。JSONL ファイルだけを書き出したい場合に使います。
+# otel-logger は stdout をローテーションしないため、常駐させて stdout をファイルへ
+# リダイレクトする構成では必ず `true` にしてください (`otel-logger init --daemon` が
+# 生成する設定は最初から `true` です)。
 no-stdout = false
 
 # Claude/Codex の使用量更新時に、累計サマリー (input/output/cache tokens、cost、
 # provider/model/effort 別内訳) を stdout へ追記します。HTTP endpoint `GET /stats` は
 # このフラグに関係なく常に有効です。
 summary = false
+"#;
 
+/// 常駐 profile の stdout 出力設定。stdout はローテーションされないので既定で止める。
+const DAEMON_OUTPUT_SECTION: &str = r#"
+# 人が読める stdout 出力を抑止します。otel-logger は stdout をローテーションしないため、
+# 常駐運用では `true` のままにしてください。集計と HTTP endpoint `GET /stats` は
+# この設定に関係なく動き続けます。
+no-stdout = true
+
+# Claude/Codex の使用量更新時に、累計サマリーを stdout へ追記します。
+# `no-stdout = true` の間は出力されません (`GET /stats` は常に有効です)。
+summary = false
+"#;
+
+/// profile によらず共通の末尾 (色設定、bind address、proxy 転送)。
+const COMMON_CONFIG_TAIL: &str = r#"
 # stdout の色設定: "auto" | "always" | "never"。`auto` は NO_COLOR を尊重し、
 # stdout が TTY でない場合は ANSI code を出しません。
 color = "auto"
@@ -88,6 +142,40 @@ color = "auto"
 # [proxy.routes.headers]
 # Authorization = "env:OPENAI_PROXY_TOKEN"
 "#;
+
+/// `otel-logger init` が生成する設定の profile。
+///
+/// `Daemon` は「常駐運用向けの設定ファイルを書く」だけで、サービス登録や
+/// バックグラウンド化は行わない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InitProfile {
+    /// 対話実行を想定した既定の設定 (pretty 出力あり、単一ファイルへの JSONL 追記)。
+    #[default]
+    Default,
+    /// 常駐運用 (launchd / systemd / container) を想定した設定。
+    /// stdout 出力を止め、JSONL を日次ローテーション付きの directory sink に書く。
+    Daemon,
+}
+
+/// profile に対応する設定ファイル本文を組み立てる。
+pub fn render_config_template(profile: InitProfile) -> String {
+    let (header_note, storage, output) = match profile {
+        InitProfile::Default => ("", DEFAULT_STORAGE_SECTION, DEFAULT_OUTPUT_SECTION),
+        InitProfile::Daemon => (
+            DAEMON_HEADER_NOTE,
+            DAEMON_STORAGE_SECTION,
+            DAEMON_OUTPUT_SECTION,
+        ),
+    };
+    [
+        CONFIG_HEADER,
+        header_note,
+        storage,
+        output,
+        COMMON_CONFIG_TAIL,
+    ]
+    .concat()
+}
 
 /// `~/.config/otel-logger/config.toml` から読む永続設定。
 /// すべての field は任意なので、部分的な config でも CLI flags や環境変数と
@@ -269,11 +357,16 @@ pub enum InitOutcome {
     Overwrote,
 }
 
-/// 同梱している `DEFAULT_CONFIG_TEMPLATE` を `path` へ書き出す。
+/// 既定 profile の設定を `path` へ書き出す。`write_with_profile` の互換ラッパー。
+pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
+    write_with_profile(path, force, InitProfile::Default)
+}
+
+/// `profile` に対応する設定を `path` へ書き出す。
 /// 必要に応じて親ディレクトリを作成し、`force` 未指定なら既存ファイルの上書きを拒否する。
 /// `force=false` の場合は `create_new` で atomic に open するため、`exists()` 後に
 /// 別 process が同名ファイルを作っても上書き拒否の約束を破らない。
-pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
+pub fn write_with_profile(path: &Path, force: bool, profile: InitProfile) -> Result<InitOutcome> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -305,7 +398,7 @@ pub fn write_default(path: &Path, force: bool) -> Result<InitOutcome> {
         }
     };
     use std::io::Write as _;
-    file.write_all(DEFAULT_CONFIG_TEMPLATE.as_bytes())
+    file.write_all(render_config_template(profile).as_bytes())
         .with_context(|| format!("write config file {}", path.display()))?;
     Ok(if force && pre_existed {
         InitOutcome::Overwrote
@@ -389,6 +482,63 @@ color = "never"
         // force ありなら overwrite を返す。
         let outcome = write_default(&path, true).unwrap();
         assert_eq!(outcome, InitOutcome::Overwrote);
+    }
+
+    #[test]
+    fn default_profile_template_keeps_stdout_and_single_file_sink() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        write_with_profile(&path, false, InitProfile::Default).unwrap();
+
+        let config = Config::load(Some(&path)).unwrap();
+
+        assert_eq!(config.no_stdout, Some(false));
+        assert_eq!(
+            config.log_file,
+            Some(PathBuf::from("/var/log/otel-logger/otel-logger.jsonl"))
+        );
+        assert!(
+            config.log_dir.is_none(),
+            "log-file と log-dir は同時指定できないので、既定 profile では log-dir をコメントのままにする"
+        );
+    }
+
+    #[test]
+    fn daemon_profile_template_disables_stdout_and_rotates_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+
+        let outcome = write_with_profile(&path, false, InitProfile::Daemon).unwrap();
+        assert_eq!(outcome, InitOutcome::Created);
+        // 上書き拒否と --force は profile によらず同じ経路を通る。
+        let err = write_with_profile(&path, false, InitProfile::Daemon).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let outcome = write_with_profile(&path, true, InitProfile::Daemon).unwrap();
+        assert_eq!(outcome, InitOutcome::Overwrote);
+
+        let config = Config::load(Some(&path)).unwrap();
+
+        // stdout はローテーションされないため、常駐 profile では最初から止めておく。
+        assert_eq!(config.no_stdout, Some(true));
+        // stdout を止めた先で JSONL が無制限に伸びないよう、日次ローテーション側を既定にする。
+        assert_eq!(config.log_dir, Some(PathBuf::from("/var/log/otel-logger")));
+        assert_eq!(config.log_keep_days, Some(10));
+        assert!(config.log_file.is_none());
+    }
+
+    #[test]
+    fn both_profiles_share_the_common_template_tail() {
+        // 共通部分を 2 本に分裂させると、片方だけ古くなる。
+        let default = render_config_template(InitProfile::Default);
+        let daemon = render_config_template(InitProfile::Daemon);
+
+        for template in [&default, &daemon] {
+            assert!(template.contains("color = \"auto\""));
+            assert!(template.contains("# [[proxy.routes]]"));
+            assert!(template.contains("# grpc-addr = \"0.0.0.0:4317\""));
+        }
+        assert!(daemon.contains("otel-logger init --daemon"));
+        assert!(!default.contains("otel-logger init --daemon\n# stdout"));
     }
 
     #[test]
