@@ -60,7 +60,7 @@ http = "1.5.0"
 # OTLP/HTTP client は body を gzip して送ってよい (`Content-Encoding: gzip`)。
 # 解凍しないと protobuf decode に失敗して 400 を返し、OTLP 仕様上 400 は retry 禁止
 # なので batch がそのまま失われる。
-tower-http = { version = "0.7.0", default-features = false, features = [
+tower-http = { version = "0.7.1", default-features = false, features = [
     "decompression-gzip",
 ] }
 # OTLP/HTTP protobuf での proxy 転送で使う HTTP client。
@@ -80,6 +80,10 @@ tokio = { version = "1.53.1", features = [
     "fs",
     "io-util",
     "net",
+    # proxy worker の retry backoff と shutdown の grace period で `tokio::time` を使う。
+    # 依存経由 (reqwest 等) でしか有効になっていないと、その構成が変わった瞬間に
+    # ビルドできなくなる。
+    "time",
 ] }
 tokio-util = "0.7.19"
 
@@ -89,7 +93,7 @@ clap = { version = "4.6.6", features = ["derive", "env"] }
 # シリアライズ / 出力
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-toml = "1.1.4"
+toml = "1.1.5"
 
 # その他
 anyhow = "1.0.104"
@@ -105,7 +109,7 @@ logroller = "0.1.12"
 [dev-dependencies]
 tempfile = "3.27.0"
 # gzip した OTLP/HTTP request を受け付けられることの回帰テストで使う。
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 # HTTP router の body size 制限テストで `ServiceExt::oneshot` を使う。
 tower = { version = "0.5.3", features = ["util"] }
 
