@@ -589,6 +589,13 @@ Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送
 
 ### `GET /stats` (常時有効)
 
+> **Note**
+> `/stats` は OTLP/HTTP と同じ listener で提供され、認証はありません。累計
+> トークン数・USD コスト・provider/model/effort の内訳・proxy 転送の件数が
+> そのまま取得できます。既定の bind は `0.0.0.0:4318` なので、これらの数値を
+> 秘匿したい場合は `127.0.0.1` に bind するか、ファイアウォールで信頼できない
+> ネットワークから遮断してください。
+
 ```bash
 $ curl -s http://localhost:4318/stats | jq
 {

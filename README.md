@@ -690,6 +690,13 @@ one process's provider/effort metadata to the other's metrics.
 
 ### `GET /stats` (always on)
 
+> **Note**
+> `/stats` is served from the same listener as OTLP/HTTP and requires no
+> authentication. It exposes cumulative token counts, USD cost, the
+> provider/model/effort breakdown and proxy forwarding counters. Since the
+> default bind is `0.0.0.0:4318`, keep the port off untrusted networks (bind to
+> `127.0.0.1`, or restrict it at the firewall) if those numbers are sensitive.
+
 ```bash
 $ curl -s http://localhost:4318/stats | jq
 {
