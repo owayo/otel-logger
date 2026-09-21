@@ -1,6 +1,7 @@
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::{self, BufWriter as StdBufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
@@ -12,7 +13,6 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 use crate::aggregator::Aggregator;
 use crate::cli::{LogSink, Settings};
@@ -20,6 +20,16 @@ use crate::format;
 use crate::forward::ProxyRouter;
 
 const ROTATION_PREFIX: &str = "otel-logger";
+
+/// poison した mutex から回復して guard を返す。
+///
+/// poison は「以前どこかで panic した」という記録でしかなく、JSONL の中身自体は
+/// 壊れていない。ここで panic を再生産すると `spawn_blocking` が `JoinError` を返し、
+/// 以後すべての batch が恒久的に 503 になる。503 は retryable なので exporter は
+/// 無限に再送し続け、1 件も保存されないまま欠測が止まらなくなる。
+fn lock_recovering<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// 内部で扱う正規化済み record。内部の OTLP protobuf 型をそのまま保持するため、
 /// JSONL serialization は欠落しない。pretty rendering では注目すべき field だけを抜き出す。
@@ -76,10 +86,7 @@ impl RotatedWriter {
     fn cleanup_if_day_changed(&self) {
         let today = OffsetDateTime::now_utc().date().to_julian_day();
         {
-            let mut last = self
-                .last_cleanup_day
-                .lock()
-                .expect("jsonl cleanup day mutex poisoned");
+            let mut last = lock_recovering(&self.last_cleanup_day);
             if *last == today {
                 return;
             }
@@ -93,6 +100,61 @@ impl RotatedWriter {
             );
         }
     }
+
+    /// 日次ファイルを disk へ確定させる。
+    ///
+    /// logroller の `LogRoller::flush` は内部の `std::fs::File` を flush するだけで
+    /// fsync しない (crate 内に `sync_all` / `sync_data` が 1 箇所も存在しない)。
+    /// `--log-file` 経路は graceful shutdown で `sync_all` するのに `--log-dir` だけ
+    /// 何も保証されない状態になり、`init --daemon` が勧める常駐構成の方が
+    /// マシンクラッシュに弱いという逆転が起きていた。
+    ///
+    /// どのファイルが書き込み中かを logroller が公開しないため、保持対象の日次
+    /// ファイルをまとめて fsync する。shutdown 時の 1 回だけなのでコストは無視できる。
+    fn sync_rotated_files(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            // ディレクトリごと消えているなら同期するものは無い。
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("read log directory {}", self.dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            // symlink を辿って無関係なファイルを同期しない (cleanup 側と揃える)。
+            // `d_type` が `DT_UNKNOWN` の FS (NFS / 一部 FUSE) では `lstat` に落ちるため、
+            // readdir との間に並行削除が入ると `NotFound` になる。正常系として飛ばす。
+            match entry.file_type() {
+                Ok(ft) if ft.is_file() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("stat log file {}", path.display()));
+                }
+            }
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_rotated_log_filename(filename) {
+                continue;
+            }
+            let file = match StdOpenOptions::new().write(true).open(&path) {
+                Ok(file) => file,
+                // 並行して rotation / cleanup が走った場合は同期対象から外れただけ。
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("reopen rotated JSONL {}", path.display()));
+                }
+            };
+            file.sync_all()
+                .with_context(|| format!("fsync rotated JSONL {}", path.display()))?;
+        }
+        Ok(())
+    }
 }
 
 impl JsonlWriter {
@@ -102,14 +164,14 @@ impl JsonlWriter {
         // ここでは flush のみ呼び、disk への確定は graceful shutdown 時の sync_all に任せる。
         match self {
             Self::File(m) => {
-                let mut g = m.lock().expect("jsonl file mutex poisoned");
+                let mut g = lock_recovering(m);
                 g.write_all(line).context("append JSONL line")?;
                 g.flush().context("flush JSONL line")?;
                 Ok(())
             }
             Self::Roller(w) => {
                 w.cleanup_if_day_changed();
-                let mut g = w.roller.lock().expect("jsonl roller mutex poisoned");
+                let mut g = lock_recovering(&w.roller);
                 g.write_all(line).context("append JSONL line (rotated)")?;
                 g.flush().context("flush JSONL line (rotated)")?;
                 Ok(())
@@ -122,13 +184,16 @@ impl JsonlWriter {
     fn flush(&self) -> Result<()> {
         match self {
             Self::File(m) => {
-                let mut g = m.lock().expect("jsonl file mutex poisoned");
+                let mut g = lock_recovering(m);
                 g.flush().context("flush JSONL file")?;
                 g.get_mut().sync_all().context("fsync JSONL file")
             }
             Self::Roller(w) => {
-                let mut g = w.roller.lock().expect("jsonl roller mutex poisoned");
-                g.flush().context("flush JSONL roller")
+                let mut g = lock_recovering(&w.roller);
+                g.flush().context("flush JSONL roller")?;
+                // lock を持ったまま fsync する。先に解放すると、並行 batch の書き込みが
+                // fsync の後ろに挟まって同期されないまま残る。
+                w.sync_rotated_files()
             }
             #[cfg(test)]
             Self::Fail => Ok(()),
@@ -185,6 +250,68 @@ fn classify_stdout_result(state: &mut StdoutState, result: io::Result<()>) -> Re
     }
 }
 
+/// stdout pretty 出力キューの深さ。
+///
+/// stdout の読み手が遅い場合 (`| less` でスクロールを止める、launchd / systemd /
+/// Docker log driver の読み出しが一時的に詰まる等) でも、OTLP の ACK を止めないための
+/// 緩衝。溢れた分は捨てる。
+const PRETTY_QUEUE_CAPACITY: usize = 256;
+
+/// `flush()` が pretty writer の追いつきを待つ上限。
+/// stdout が完全に詰まっている場合に shutdown を人質に取られないようにする。
+const PRETTY_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// pretty 出力の 1 単位。
+///
+/// stdout への書き込みを OTLP の ACK 経路から切り離すために、専用 writer task へ渡す。
+/// ACK 経路で待つと、読み手が遅いだけで全 batch の応答が止まり、exporter の timeout →
+/// retry によって同じ payload が JSONL へ二重に書かれ、累計も二重計上される。
+struct PrettyJob {
+    rendered: String,
+    want_summary: bool,
+    /// `flush()` が使う同期点。channel は FIFO なので、この job が処理された時点で
+    /// 先行する job はすべて出力済み。
+    sync: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// pretty 出力を直列に書き出す専用 task。
+///
+/// writer が 1 本なので record 同士が interleave せず、`stdout_lock` のような
+/// 粗い排他も要らない。累計 snapshot も「書く直前」に取るため、snapshot 順と
+/// 出力順が一致し、出力上で累計が逆行しない。
+async fn run_pretty_writer(
+    mut rx: tokio::sync::mpsc::Receiver<PrettyJob>,
+    aggregator: Arc<Aggregator>,
+    color: bool,
+) {
+    let mut state = StdoutState::default();
+    while let Some(job) = rx.recv().await {
+        if state.should_write() && !job.rendered.is_empty() {
+            let summary = job
+                .want_summary
+                .then(|| format::render_summary(&aggregator.snapshot(), color));
+            let rendered = job.rendered;
+            let joined = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                let stdout = io::stdout();
+                let mut handle = stdout.lock();
+                write_pretty_to(&mut handle, &rendered, summary.as_deref())
+            })
+            .await;
+            match joined {
+                Ok(result) => {
+                    if let Err(e) = classify_stdout_result(&mut state, result) {
+                        tracing::error!(error = %e, "failed to write stdout");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "stdout writer task failed"),
+            }
+        }
+        if let Some(sync) = job.sync {
+            let _ = sync.send(());
+        }
+    }
+}
+
 /// pretty 出力と (必要なら) 累計サマリーを 1 つの writer へ書き出す。
 /// stdout handle を直接触らないので、error 経路を単体テストできる。
 fn write_pretty_to<W: io::Write>(
@@ -204,11 +331,13 @@ struct SinkInner {
     color: bool,
     summary_enabled: bool,
     file: Option<JsonlWriter>,
-    /// stdout 全体を守る粗い mutex。telemetry payload は 1 record で多くの行に展開されるため、
-    /// 別 writer と interleave すると人が読める stream として壊れる。
-    /// pipe が閉じたかどうかも同じ lock の下で持ち、並行 batch から一貫して見えるようにする。
-    stdout_lock: Mutex<StdoutState>,
-    aggregator: Aggregator,
+    /// pretty 出力の受け渡し口 (stdout 無効なら `None`)。実際の書き込みは
+    /// `run_pretty_writer` が直列に行うため、telemetry payload が 1 record で多くの行に
+    /// 展開されても interleave しない。
+    pretty_tx: Option<tokio::sync::mpsc::Sender<PrettyJob>>,
+    /// stdout が追いつかず捨てた pretty 出力の件数。
+    pretty_dropped: AtomicU64,
+    aggregator: Arc<Aggregator>,
     /// OTLP proxy 転送ルーター (未設定なら `None`)。JSONL 永続化が成功した後で
     /// service.name で振り分けて `try_send` する。
     proxy: Option<ProxyRouter>,
@@ -254,14 +383,22 @@ impl Sink {
             }
         };
 
+        let aggregator = Arc::new(Aggregator::new());
+        let pretty_tx = stdout_enabled.then(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<PrettyJob>(PRETTY_QUEUE_CAPACITY);
+            tokio::spawn(run_pretty_writer(rx, Arc::clone(&aggregator), color));
+            tx
+        });
+
         Ok(Self {
             inner: Arc::new(SinkInner {
                 stdout_enabled,
                 color,
                 summary_enabled: settings.summary,
                 file,
-                stdout_lock: Mutex::new(StdoutState::default()),
-                aggregator: Aggregator::new(),
+                pretty_tx,
+                pretty_dropped: AtomicU64::new(0),
+                aggregator,
                 proxy,
             }),
         })
@@ -300,10 +437,11 @@ impl Sink {
         };
         let want_summary = samples_present && self.inner.summary_enabled;
 
-        if self.inner.stdout_enabled
-            && let Err(e) = self.write_pretty(&record, want_summary).await
-        {
-            tracing::error!(error = %e, kind = record.kind(), "failed to write stdout");
+        // stdout への書き込みは ACK 経路から切り離す (fire-and-forget)。ここで待つと、
+        // 読み手が遅いだけで全 batch の応答が止まり、exporter の timeout → retry で
+        // 同じ payload が JSONL へ二重に書かれ、累計も二重計上される。
+        if self.inner.stdout_enabled {
+            self.queue_pretty(&record, want_summary);
         }
 
         // JSONL 永続化と集計が成功した batch だけを proxy に流す。
@@ -329,25 +467,36 @@ impl Sink {
         .context("join JSONL write task")?
     }
 
-    async fn write_pretty(&self, record: &TelemetryRecord, want_summary: bool) -> Result<()> {
-        let mut state = self.inner.stdout_lock.lock().await;
-        if !state.should_write() {
-            return Ok(());
+    /// pretty 出力を writer task へ渡す。累計 snapshot は writer 側で取るので、
+    /// ここでは render だけ行う (CPU バウンドでブロックしない)。
+    fn queue_pretty(&self, record: &TelemetryRecord, want_summary: bool) {
+        let Some(tx) = self.inner.pretty_tx.as_ref() else {
+            return;
+        };
+        let job = PrettyJob {
+            rendered: format::render(record, self.inner.color),
+            want_summary,
+            sync: None,
+        };
+        if tx.try_send(job).is_err() {
+            // queue が詰まっている = stdout の読み手が遅い、または writer が停止した。
+            // stdout はベストエフォートなので捨てる。JSONL 永続化・累計集計・proxy 転送は
+            // 既に完了しているため、telemetry の欠測にはならない。
+            let dropped = self
+                .inner
+                .pretty_dropped
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = dropped,
+                    "stdout writer is behind; dropping human-readable output. \
+                     JSONL persistence, usage aggregation and proxy forwarding are unaffected. \
+                     / stdout の書き出しが追いつかないため、人が読める出力を捨てています。\
+                     JSONL 永続化・累計集計・proxy 転送には影響しません。"
+                );
+            }
         }
-        let rendered = format::render(record, self.inner.color);
-        // 累計は stdout lock を取ってから読む。lock の外で snapshot を取ると、
-        // 並行する batch との間で「snapshot を取った順序」と「stdout へ書く順序」が
-        // 入れ替わり、単調増加のはずの累計が出力上で逆行する。
-        let summary_rendered = want_summary
-            .then(|| format::render_summary(&self.inner.aggregator.snapshot(), self.inner.color));
-        let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            write_pretty_to(&mut handle, &rendered, summary_rendered.as_deref())
-        })
-        .await
-        .context("join stdout write task")?;
-        classify_stdout_result(&mut state, result)
     }
 
     /// buffer 済み書き込みを flush する。SIGTERM でも末尾 batch を失わないよう、
@@ -362,6 +511,7 @@ impl Sink {
         })
         .await
         .context("join JSONL flush task")??;
+        self.drain_pretty().await;
         // terminal 接続時の stdout は line-buffered なので、spawn_blocking で best-effort flush する。
         let _ = tokio::task::spawn_blocking(|| {
             let _ = io::stdout().flush();
@@ -369,25 +519,55 @@ impl Sink {
         .await;
         Ok(())
     }
+
+    /// pretty writer が queue 済みの出力を書き終えるのを待つ。
+    ///
+    /// channel は FIFO なので、同期 job が処理された時点で末尾の summary まで出力済み。
+    /// stdout が完全に詰まっている場合に shutdown を人質に取られないよう、待ちには
+    /// 上限を設ける (stdout はベストエフォートで、JSONL 側に payload は残っている)。
+    async fn drain_pretty(&self) {
+        let Some(tx) = self.inner.pretty_tx.as_ref() else {
+            return;
+        };
+        let (sync_tx, sync_rx) = tokio::sync::oneshot::channel();
+        let job = PrettyJob {
+            rendered: String::new(),
+            want_summary: false,
+            sync: Some(sync_tx),
+        };
+        let sent = tokio::time::timeout(PRETTY_FLUSH_TIMEOUT, tx.send(job)).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            return;
+        }
+        if tokio::time::timeout(PRETTY_FLUSH_TIMEOUT, sync_rx)
+            .await
+            .is_err()
+        {
+            tracing::warn!("stdout writer did not drain before shutdown; some output was lost");
+        }
+    }
 }
 
 fn open_log_file_sync(path: &Path) -> Result<StdBufWriter<std::fs::File>> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
+        crate::path::create_private_dir(parent)
             .with_context(|| format!("create parent directory of {}", path.display()))?;
     }
-    let file = StdOpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = StdOpenOptions::new();
+    options.create(true).append(true);
+    crate::path::restrict_new_file_mode(&mut options);
+    let file = options
         .open(path)
         .with_context(|| format!("open log file {}", path.display()))?;
     Ok(StdBufWriter::new(file))
 }
 
 fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
-    std::fs::create_dir_all(dir)
+    // logroller が作る日次ファイルの mode は指定できないため、ディレクトリ側を
+    // 0700 にして他ユーザーから辿れないようにする。
+    crate::path::create_private_dir(dir)
         .with_context(|| format!("create log directory {}", dir.display()))?;
     // `--log-keep-days 0` が来た時に cutoff = now() となり全 rotated file が
     // 削除されてしまうのを防ぐため、最低 1 日は保持する。
@@ -411,7 +591,12 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
 /// mtime 基準で `keep_days` より古い `otel-logger.*` ファイルを削除する。
 /// claw-hooks の `cleanup_old_logs` と揃え、社内 CLI 間で挙動を一貫させる。
 fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
-    if !dir.exists() {
+    // `exists()` は権限エラーや symlink loop も `false` に潰すため、保持期間が
+    // 実際には効いていないのに起動が成功してしまう。`try_exists()` で区別する。
+    if !dir
+        .try_exists()
+        .with_context(|| format!("inspect log directory {}", dir.display()))?
+    {
         return Ok(());
     }
     let cutoff = SystemTime::now()
@@ -423,8 +608,14 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
         let path = entry.path();
         // LogRoller が生成する通常ファイルだけを対象にする。`Path::is_file()` は
         // symlink を辿るため、同じ名前の symlink まで誤って削除対象にしてしまう。
-        if !entry.file_type()?.is_file() {
-            continue;
+        // 下の `entry.metadata()` と同じく、並行削除による `NotFound` は正常系として
+        // 飛ばす。ここで `?` すると cleanup ごと失敗し、`open_rotated_sync` が
+        // 起動時に Err を返して receiver が上がらない (= 全件欠測) 。
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat log file {}", path.display())),
         }
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -560,8 +751,9 @@ mod tests {
                 color: false,
                 summary_enabled: true,
                 file: Some(JsonlWriter::Fail),
-                stdout_lock: Mutex::new(StdoutState::default()),
-                aggregator: Aggregator::new(),
+                pretty_tx: None,
+                pretty_dropped: AtomicU64::new(0),
+                aggregator: Arc::new(Aggregator::new()),
                 proxy: None,
             }),
         }
@@ -812,6 +1004,34 @@ mod tests {
 
         // ACK 時点の batch flush とは別に、graceful shutdown の最終 flush も成功すること。
         sink.flush().await.unwrap();
+    }
+
+    /// 回帰テスト: `--log-dir` 経路の fsync がローテーション名のファイルだけを対象にする。
+    ///
+    /// logroller の `LogRoller::flush` は内部 `fs::File` の flush (= no-op) なので、
+    /// `--log-file` 経路と durability を揃えるには日次ファイルを開き直して `sync_all`
+    /// する必要がある。その際、同じ prefix の別用途ファイル (`otel-logger.pid` など) を
+    /// 巻き込んで書き込みモードで開かないことを固定する。
+    #[test]
+    fn sync_rotated_files_skips_files_that_are_not_daily_logs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 同じ prefix だがローテーション名ではないファイルを read-only で置く。
+        // 対象に含めてしまうと `write(true)` の open が失敗するので検出できる。
+        let unrelated = dir.path().join("otel-logger.pid");
+        std::fs::write(&unrelated, "4242").unwrap();
+        let mut perms = std::fs::metadata(&unrelated).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&unrelated, perms).unwrap();
+
+        let writer = open_rotated_sync(dir.path(), 7).unwrap();
+        writer
+            .sync_rotated_files()
+            .expect("ローテーション名以外のファイルは fsync 対象に含めない");
+
+        // 日次ファイルを作ってから呼び直しても成功する。
+        let jsonl = JsonlWriter::Roller(Box::new(writer));
+        jsonl.write_line(b"{}\n").unwrap();
+        jsonl.flush().expect("日次ファイルを fsync できる");
     }
 
     #[tokio::test]

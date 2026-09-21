@@ -57,7 +57,12 @@ impl ProxyHandle {
     /// worker が全て停止するのを待つ。shutdown の後で server::run から呼ぶ。
     pub async fn join(self) {
         for w in self.workers {
-            let _ = w.await;
+            // JoinError を捨てると worker の panic が無言になる。worker が死ぬと
+            // receiver ごと drop されて以降の notify が全て Closed で捨てられるため、
+            // 「転送が止まった理由」を残せる唯一の場所になる。
+            if let Err(e) = w.await {
+                tracing::error!(error = %e, "proxy worker task terminated abnormally");
+            }
         }
     }
 }

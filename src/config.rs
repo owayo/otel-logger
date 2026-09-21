@@ -294,7 +294,12 @@ impl Config {
         match explicit {
             Some(path) => {
                 let path = expand_user_path(path.to_path_buf(), home);
-                if !path.exists() {
+                // 既定パス側と同じ理由で `try_exists()` を使う。権限エラーを
+                // 「存在しない」と報告すると、原因の切り分けができなくなる。
+                if !path
+                    .try_exists()
+                    .with_context(|| format!("inspect config file {}", path.display()))?
+                {
                     anyhow::bail!("configuration file does not exist: {}", path.display());
                 }
                 Self::load_from(&path)
@@ -370,7 +375,7 @@ pub fn write_with_profile(path: &Path, force: bool, profile: InitProfile) -> Res
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
+        crate::path::create_private_dir(parent)
             .with_context(|| format!("create parent directory of {}", path.display()))?;
     }
     let mut options = std::fs::OpenOptions::new();
@@ -380,6 +385,8 @@ pub fn write_with_profile(path: &Path, force: bool, profile: InitProfile) -> Res
     } else {
         options.create_new(true);
     }
+    // 設定ファイルには proxy の認証ヘッダを書けるため、新規作成分は 0600 に絞る。
+    crate::path::restrict_new_file_mode(&mut options);
     // open 直前の `exists()` は TOCTOU を抱えるが、`force=false` の上書き拒否は
     // `create_new` 側で保証されている。ここで見たいのは Overwrote / Created の
     // 報告用シグナルだけで、判定が後追いで race してもファイル状態は壊れない。

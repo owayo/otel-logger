@@ -11,6 +11,7 @@ use otel_logger::sink::Sink;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<()> {
+    clear_empty_otel_logger_env();
     let cli = Cli::parse();
     init_tracing();
 
@@ -120,6 +121,28 @@ fn run_init(path: Option<&Path>, force: bool, profile: InitProfile) -> Result<()
     };
     println!("{verb} config file: {}", dest.display());
     Ok(())
+}
+
+/// 空文字の `OTEL_LOGGER_*` 環境変数を未設定として扱う。
+///
+/// clap は空文字でも「指定あり」とみなすため、`OTEL_LOGGER_LOG_FILE=` のような
+/// 空値を並べた docker-compose の `environment:` / systemd の `Environment=` では
+/// `a value is required for '--log-file <PATH>'` になって常駐プロセスが上がらない。
+/// `OTEL_LOGGER_PROXY_*_HEADERS=` に至っては「header を指定した」と誤判定されて
+/// endpoint を要求する。`config.rs` の `XDG_CONFIG_HOME` / `HOME` や `path.rs` の
+/// `~` 展開が空文字を未設定として扱うのと挙動を揃える。
+fn clear_empty_otel_logger_env() {
+    let empty: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter(|(key, value)| {
+            value.is_empty() && key.to_string_lossy().starts_with("OTEL_LOGGER_")
+        })
+        .map(|(key, _)| key)
+        .collect();
+    for key in empty {
+        // SAFETY: main の先頭、tokio runtime も追加スレッドも起こす前に呼んでいるため、
+        // 環境変数を触っている他スレッドは存在しない。
+        unsafe { std::env::remove_var(&key) };
+    }
 }
 
 fn init_tracing() {

@@ -17,6 +17,26 @@ use crate::sink::Sink;
 /// に十分な余裕を取りつつ、`0.0.0.0` 公開 bind 時のメモリ枯渇を避けるため 32MiB を上限とする。
 pub const OTLP_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
+/// graceful shutdown で in-flight request の完了を待つ上限。
+///
+/// この猶予を超えたら listener task を abort して `sink.flush()` へ進む。取りこぼす
+/// のは「猶予内に送り切れなかった batch」だけで、OTLP 的には ACK していないため
+/// exporter 側が retry できる。逆にここで無制限に待つと JSONL の `sync_all` に
+/// 到達せず、確定済みの telemetry まで失う。
+///
+/// 10s なのは launchd の既定停止猶予 (20s) に対して `sync_all` 用の余白を半分残すため。
+/// Kubernetes の既定 `terminationGracePeriodSeconds` (30s) でも十分間に合う。
+/// flush 自体には timeout を掛けない (`spawn_blocking` の `sync_all` は future を
+/// abort しても syscall が止まらず、「成功したことにする」方が危険)。
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 1 接続あたりに許す同時 HTTP/2 ストリーム数 (= 並行 OTLP リクエスト数)。
+///
+/// 1 リクエストの上限 (`OTLP_MAX_REQUEST_BYTES`) だけでは総メモリを抑えられない。
+/// axum (hyper) 側は既定 200 で頭打ちになるが、tonic は `None` を明示して既定を
+/// 打ち消すため、設定しないと gRPC だけが真に無制限になる。
+const MAX_CONCURRENT_STREAMS: u32 = 16;
+
 /// `shutdown` が cancel されるまで、`addr` で OTLP/gRPC server を動かす。
 pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
     let (trace_srv, metrics_srv, logs_srv) = OtlpService::new(sink).into_servers();
@@ -37,6 +57,18 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
         .max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
     tracing::info!(%addr, max_request_bytes = OTLP_MAX_REQUEST_BYTES, "OTLP/gRPC server listening");
     tonic::transport::Server::builder()
+        // tonic は hyper の既定 (200 streams/connection) を `None` で打ち消すため、
+        // 明示しないと 1 本の TCP 接続から無制限にストリームを開ける。1 リクエストの
+        // 上限は 32MiB でも総量が抑えられず、`0.0.0.0` 公開 bind でメモリ枯渇する。
+        // 実測 batch (約 0.6MiB) なら 16 並列でも十分な throughput が出る。
+        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
+        .concurrency_limit_per_connection(MAX_CONCURRENT_STREAMS as usize)
+        // 応答しない peer の接続を掴んだままにしない (shutdown を人質に取られる)。
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        // `timeout()` と `load_shed()` は付けない。前者は JSONL 保存後・ACK 前に
+        // 発火すると exporter の retry で二重計上を招き、後者は `Overloaded` が
+        // `Status` に変換されず接続レベルのエラーとして漏れる。
         .add_service(trace_srv)
         .add_service(metrics_srv)
         .add_service(logs_srv)
@@ -103,12 +135,22 @@ pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     };
     let http_id = http_handle.id();
 
+    // 2 回目のシグナルで in-flight を諦めるための token。tokio の signal handler は
+    // プロセスグローバルに既定動作を置き換えてしまうため、ここで受け直さないと
+    // 2 回目の SIGTERM / SIGINT も無視され、SIGKILL 以外に落とす手段が無くなる。
+    let hard_exit = CancellationToken::new();
     let signal_token = shutdown.clone();
+    let hard_exit_signal = hard_exit.clone();
     let signal_handle = tokio::spawn(async move {
         shutdown_signal().await;
         signal_token.cancel();
+        shutdown_signal().await;
+        tracing::warn!("second shutdown signal received; abandoning in-flight connections");
+        hard_exit_signal.cancel();
     });
 
+    let grpc_abort = grpc_handle.abort_handle();
+    let http_abort = http_handle.abort_handle();
     let mut grpc_done = false;
     let mut http_done = false;
     let mut result = tokio::select! {
@@ -128,20 +170,48 @@ pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
         },
     };
 
+    // 残っている listener task の終了を待つ。axum / tonic の graceful shutdown は
+    // in-flight request の完了を無制限に待つため、body を送り切らない接続が 1 本でも
+    // 残ると SIGTERM で終了できない。既定 bind は `0.0.0.0` なので外部から誘発できる。
+    // ここで止まると末尾の `sink.flush()` (= `--log-file` 経路の `sync_all`) に到達せず、
+    // SIGKILL された時点で未確定分が失われる。
+    let drain = async {
+        let mut drained: Result<()> = Ok(());
+        if !grpc_done {
+            merge_task_result(
+                &mut drained,
+                wait_for(grpc_id, grpc_handle).await.context("gRPC task"),
+            );
+        }
+        if !http_done {
+            merge_task_result(
+                &mut drained,
+                wait_for(http_id, http_handle).await.context("HTTP task"),
+            );
+        }
+        drained
+    };
+    tokio::select! {
+        drained = drain => merge_task_result(&mut result, drained),
+        _ = hard_exit.cancelled() => {
+            grpc_abort.abort();
+            http_abort.abort();
+        }
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {
+            tracing::warn!(
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "graceful shutdown timed out; aborting in-flight connections so the JSONL sink \
+                 can still be flushed"
+            );
+            grpc_abort.abort();
+            http_abort.abort();
+        }
+    }
+
     signal_handle.abort();
-    if !grpc_done {
-        merge_task_result(
-            &mut result,
-            wait_for(grpc_id, grpc_handle).await.context("gRPC task"),
-        );
-    }
-    if !http_done {
-        merge_task_result(
-            &mut result,
-            wait_for(http_id, http_handle).await.context("HTTP task"),
-        );
-    }
-    sink.flush().await?;
+    // flush の失敗で `?` early return すると、gRPC / HTTP task 側のエラー (bind 失敗や
+    // panic) が捨てられて診断の第一報が消える。他の合流と同じく merge する。
+    merge_task_result(&mut result, sink.flush().await.context("flush JSONL sink"));
     result
 }
 

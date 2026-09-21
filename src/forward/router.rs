@@ -108,11 +108,16 @@ impl ProxyRouter {
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     let dropped = lane.metrics.dropped_total.fetch_add(1, Ordering::Relaxed) + 1;
                     // shutdown 済みの route への payload も、実際に転送されないため drop として数える。
-                    tracing::debug!(
-                        route = %lane.name,
-                        dropped_total = dropped,
-                        "proxy queue closed; dropping notify"
-                    );
+                    // `Full` (一時的な背圧) と違い `Closed` は恒久的な転送停止なので warn で出す。
+                    // notify は receiver を止める前に来なくなる設計なので、稼働中に Closed が
+                    // 出るのは worker が死んだときだけである。
+                    if dropped.is_power_of_two() {
+                        tracing::warn!(
+                            route = %lane.name,
+                            dropped_total = dropped,
+                            "proxy queue closed; dropping OTLP batch (worker gone?)"
+                        );
+                    }
                 }
             }
         }

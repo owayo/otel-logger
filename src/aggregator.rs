@@ -329,7 +329,10 @@ impl Aggregator {
     /// SSE 完了ログの token usage を取り込む。
     pub fn ingest_logs(&self, req: &ExportLogsServiceRequest) -> usize {
         let mut count = 0;
-        let mut g = self.inner.write().expect("aggregator lock poisoned");
+        // poison は「以前どこかで panic した」記録でしかない。ここで panic を
+        // 再生産すると、以後すべての batch が handler ごと落ちて受信不能になる。
+        // 集計が多少不正確になるより、受け続けて JSONL を保存する方を優先する。
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
         for resource_logs in &req.resource_logs {
             let service = service_name(resource_logs.resource.as_ref());
             for scope_logs in &resource_logs.scope_logs {
@@ -387,7 +390,19 @@ impl Aggregator {
     /// `codex.conversation_starts` span event としても届くため、ここから
     /// `reasoning_effort` を回収する。token/cost の計上は別経路に寄せる。
     pub fn ingest_traces(&self, req: &ExportTraceServiceRequest) -> usize {
-        let mut g = self.inner.write().expect("aggregator lock poisoned");
+        // Codex 以外の span しか無い batch では排他 lock を取らない。Claude Code は
+        // 2.1.278 以降 `claude_code.llm_request` / `claude_code.tool` などの span を
+        // 大量に送るが、token usage は `claude_code.api_request` ログ側で計上するため
+        // ここでは集計対象外になる。それらで毎 batch write lock を取ると、`/stats` の
+        // snapshot と並行 batch の ingest がその間ずっと待たされる。
+        if !req
+            .resource_spans
+            .iter()
+            .any(|rs| is_codex_service(service_name(rs.resource.as_ref())))
+        {
+            return 0;
+        }
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let mut session_updates = 0;
         for resource_spans in &req.resource_spans {
             let service = service_name(resource_spans.resource.as_ref());
@@ -424,7 +439,7 @@ impl Aggregator {
     /// 状態保持が必要になるため警告して破棄する。
     pub fn ingest_metrics(&self, req: &ExportMetricsServiceRequest) -> usize {
         let mut count = 0;
-        let mut g = self.inner.write().expect("aggregator lock poisoned");
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
         for resource_metrics in &req.resource_metrics {
             let service = service_name(resource_metrics.resource.as_ref()).to_string();
             let service_str = service.as_str();
@@ -457,7 +472,7 @@ impl Aggregator {
     }
 
     pub fn snapshot(&self) -> UsageSnapshot {
-        let g = self.inner.read().expect("aggregator lock poisoned");
+        let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
         UsageSnapshot {
             started_at: format_rfc3339(g.started_at),
             last_updated: g.last_updated.map(format_rfc3339),
@@ -488,8 +503,14 @@ fn subtract_from(g: &mut AggregatorInner, agent: &str, bucket: &Bucket, stats: &
         return;
     };
     agent_stats.total.subtract(stats);
-    if let Some(bucket_stats) = agent_stats.buckets.get_mut(&bucket.key()) {
+    let key = bucket.key();
+    if let Some(bucket_stats) = agent_stats.buckets.get_mut(&key) {
         bucket_stats.stats.subtract(stats);
+        // 全項目 0 になったバケットは残さない。`/stats` と summary に値を持たない
+        // provider/model/effort が並ぶのを避ける (`move_codex_bucket_stats` と揃える)。
+        if !bucket_stats.stats.has_any_value() {
+            agent_stats.buckets.remove(&key);
+        }
     }
 }
 
@@ -950,13 +971,33 @@ fn update_codex_session(g: &mut AggregatorInner, service: &str, session: CodexSe
 fn update_codex_session_with_last(
     g: &mut AggregatorInner,
     service: &str,
-    session: CodexSession,
+    mut session: CodexSession,
     update_last: bool,
 ) {
+    // `extract_session_from_attrs` は欠けた属性を空文字で埋めるため、`conversation.id`
+    // だけを持つ `conversation_starts` (resume や属性欠落時に実在する) が成立する。
+    // それをそのまま insert すると、`handle_responses` span から回収済みの
+    // model / effort や確定済み provider を空文字で消してしまい、以降の usage が
+    // `unknown` バケットへ落ちる。非空の新しい値は従来どおり勝たせる。
+    if !session.conversation_id.is_empty()
+        && let Some(prev) = g.codex_sessions.get(&session.conversation_id)
+    {
+        if session.model.is_empty() {
+            session.model = prev.model.clone();
+        }
+        if session.effort.is_empty() {
+            session.effort = prev.effort.clone();
+        }
+        if !session.provider_confirmed && prev.provider_confirmed {
+            session.provider = prev.provider.clone();
+            session.provider_confirmed = true;
+        }
+    }
     let provider = session.provider.clone();
     let model = session.model.clone();
     let effort = session.effort.clone();
     let conversation_id = session.conversation_id.clone();
+    let provider_confirmed = session.provider_confirmed;
     if !conversation_id.is_empty() {
         g.codex_sessions
             .insert(conversation_id.clone(), session.clone());
@@ -964,7 +1005,14 @@ fn update_codex_session_with_last(
     if update_last {
         g.codex_last_sessions.insert(service.to_string(), session);
     }
-    merge_codex_pending_sse(g, &provider, &model, &conversation_id, &effort);
+    merge_codex_pending_sse(
+        g,
+        &provider,
+        &model,
+        &conversation_id,
+        &effort,
+        provider_confirmed,
+    );
 }
 
 /// `conversation_starts` (または相当する span event) が遅れて届いたとき、
@@ -979,10 +1027,8 @@ fn merge_codex_pending_sse(
     model: &str,
     conversation_id: &str,
     effort: &str,
+    provider_confirmed: bool,
 ) {
-    if model.is_empty() {
-        return;
-    }
     if !conversation_id.is_empty() {
         // SSE が session 未着のまま届いた場合、pending エントリは
         // `codex_provider_from_session(None)` のデフォルト (OpenAI) で keyed され
@@ -993,10 +1039,16 @@ fn merge_codex_pending_sse(
         // そこで `(model, conversation_id)` でマッチするすべての pending を
         // 取得し、各 from バケット (pending エントリが指す provider / effort) から
         // to バケット (session の provider / effort) へ個別に移す。
+        //
+        // マッチは `conversation_id` だけで行う。pending キー自身が model を持つので
+        // session 側の model は不要で、`k.model == model` を要求すると
+        // `handle_responses` span から合成した session (model 属性を持たないことがある)
+        // で pending を解決できず、span から拾えた effort が失われて usage が
+        // `effort=unknown` バケットに取り残される。
         let matching: Vec<(PendingCodexSseKey, ModelStats)> = g
             .codex_pending_sse
             .iter()
-            .filter(|(k, _)| k.model == model && k.conversation_id == conversation_id)
+            .filter(|(k, _)| k.conversation_id == conversation_id)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if matching.is_empty() {
@@ -1019,13 +1071,33 @@ fn merge_codex_pending_sse(
             let actual_to =
                 Bucket::from_parts(provider.to_string(), key.model.clone(), resolved_effort);
             g.codex_pending_sse.remove(&key);
+            // provider が暫定 (`handle_responses` span から合成した session) のうちは
+            // pending を捨てず、確定した effort と暫定 provider で置き直す。ここで
+            // 捨てると、後から本物の `conversation_starts` が非既定 provider (Azure や
+            // openai-compatible endpoint) で届いても usage を移せず、暫定 provider の
+            // バケットに取り残される。
+            if !provider_confirmed {
+                let moved_key = PendingCodexSseKey {
+                    provider: actual_to.provider.clone(),
+                    model: actual_to.model.clone(),
+                    effort: actual_to.effort.clone(),
+                    conversation_id: key.conversation_id.clone(),
+                };
+                g.codex_pending_sse
+                    .entry(moved_key)
+                    .or_default()
+                    .add(&pending);
+            }
             if actual_from != actual_to {
                 move_codex_bucket_stats(g, &actual_from, &actual_to, &pending);
             }
         }
         return;
     }
-    if effort.is_empty() || effort == UNKNOWN {
+    // ここから下は conversation_id を持たない古い telemetry 向けの互換経路。
+    // model が分からないと移動元バケットを特定できない (`non_empty` で "unknown" に
+    // 化けて無関係なバケットを動かす) ため、ここで打ち切る。
+    if model.is_empty() || effort.is_empty() || effort == UNKNOWN {
         return;
     }
     let from = Bucket::from_parts(provider.to_string(), model.to_string(), UNKNOWN.to_string());
@@ -4222,6 +4294,220 @@ mod tests {
                 .get(&format!("{PROVIDER_OPENAI}/gpt-6-astra/high"))
                 .is_none_or(|b| !b.stats.has_any_value()),
             "暫定 provider のバケットに usage を残してはいけない: {:?}",
+            agent.buckets
+        );
+    }
+
+    /// 回帰テスト: SSE が先、`handle_responses` span が次、`conversation_starts` が最後、
+    /// という順序でも pending を確定 provider へ移せること。
+    ///
+    /// span から合成した session は provider が暫定 (OpenAI) にすぎないため、そこで
+    /// pending を消費してしまうと、後から届いた非既定 provider の session で usage を
+    /// 移動できず、暫定バケットに取り残される。
+    #[test]
+    fn codex_span_after_sse_before_conversation_starts_moves_pending_to_real_provider() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("conversation.id", "conv-1"),
+                kv_int("input_token_count", 1000),
+                kv_int("output_token_count", 200),
+            ],
+        ));
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("codex.request.reasoning_effort", "high"),
+                kv_str("conversation.id", "conv-1"),
+                kv_str("model", "gpt-6-astra"),
+            ])],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", "azure"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("reasoning_effort", "high"),
+                kv_str("conversation.id", "conv-1"),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get("azure/gpt-6-astra/high")
+            .expect("確定した provider のバケットへ移る");
+        assert_eq!(bucket.stats.input_tokens, 1000);
+        assert_eq!(bucket.stats.output_tokens, 200);
+        assert!(
+            agent
+                .buckets
+                .get(&format!("{PROVIDER_OPENAI}/gpt-6-astra/high"))
+                .is_none_or(|b| !b.stats.has_any_value()),
+            "暫定 provider のバケットに usage を残してはいけない: {:?}",
+            agent.buckets
+        );
+    }
+
+    /// 回帰テスト: `conversation_starts` が model / effort を持たない場合でも、
+    /// `handle_responses` span から回収済みの値を空文字で消さないこと。
+    ///
+    /// `extract_session_from_attrs` は欠けた属性を空文字で埋めるため、`conversation.id`
+    /// だけの `conversation_starts` (resume や属性欠落) が成立する。これで session を
+    /// 丸ごと置換すると、span から拾えた effort が失われて usage が `unknown` バケットへ
+    /// 落ちる。
+    #[test]
+    fn codex_conversation_starts_without_attrs_keeps_span_model_and_effort() {
+        let agg = Aggregator::new();
+        agg.ingest_traces(&make_trace_req(
+            SERVICE_CODEX_EXEC,
+            vec![handle_responses_span_with_attrs(vec![
+                kv_str("codex.request.reasoning_effort", "high"),
+                kv_str("conversation.id", "conv-1"),
+                kv_str("model", "gpt-6-astra"),
+            ])],
+        ));
+        // provider だけを持つ conversation_starts。model / effort は付いていない。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("provider_name", "azure"),
+                kv_str("conversation.id", "conv-1"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("conversation.id", "conv-1"),
+                kv_int("input_token_count", 100),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CODEX).unwrap();
+        let bucket = agent
+            .buckets
+            .get("azure/gpt-6-astra/high")
+            .unwrap_or_else(|| panic!("span の effort を保持する: {:?}", agent.buckets));
+        assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    /// 回帰テスト: Claude Code 2.1.278 以降は `claude_code.llm_request` span が
+    /// token usage と model / effort を持つ。これは `claude_code.api_request` ログと
+    /// 1:1 で対応する同じ request の別表現なので、trace 側からも集計すると累計が倍になる。
+    /// `ingest_traces` が Codex service だけを対象にする契約を固定する。
+    #[test]
+    fn claude_llm_request_span_is_not_counted_as_usage() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-5[1m]"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 100),
+                kv_int("output_tokens", 200),
+                kv_int("cache_read_tokens", 300),
+                kv_int("cache_creation_tokens", 400),
+            ],
+        ));
+        let before = agg.snapshot();
+
+        // 同じ request を表す span。属性名はログ側と同じで、実ログでも同一値が載る。
+        let llm_request_span = opentelemetry_proto::tonic::trace::v1::Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            trace_state: String::new(),
+            parent_span_id: vec![],
+            flags: 0,
+            name: "claude_code.llm_request".into(),
+            kind: 1,
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            attributes: vec![
+                kv_str("span.type", "llm_request"),
+                kv_str("model", "claude-opus-5[1m]"),
+                kv_str("effort", "max"),
+                kv_int("input_tokens", 100),
+                kv_int("output_tokens", 200),
+                kv_int("cache_read_tokens", 300),
+                kv_int("cache_creation_tokens", 400),
+            ],
+            dropped_attributes_count: 0,
+            events: vec![],
+            dropped_events_count: 0,
+            links: vec![],
+            dropped_links_count: 0,
+            status: None,
+        };
+        assert_eq!(
+            agg.ingest_traces(&make_trace_req(SERVICE_CLAUDE, vec![llm_request_span])),
+            0,
+            "Claude の span はセッション情報を持たないので 0 を返す"
+        );
+
+        let after = agg.snapshot();
+        let before_total = &before.agents.get(AGENT_CLAUDE).unwrap().total;
+        let after_total = &after.agents.get(AGENT_CLAUDE).unwrap().total;
+        assert_eq!(before_total.input_tokens, after_total.input_tokens);
+        assert_eq!(before_total.output_tokens, after_total.output_tokens);
+        assert_eq!(
+            before_total.cache_read_tokens,
+            after_total.cache_read_tokens
+        );
+        assert_eq!(
+            before_total.cache_creation_tokens,
+            after_total.cache_creation_tokens
+        );
+        assert_eq!(after_total.input_tokens, 100);
+    }
+
+    /// 回帰テスト: metrics 分を取り消して全項目が 0 になったバケットは残さない。
+    /// 値を持たない provider/model/effort が `/stats` と summary に並ぶのを避ける。
+    #[test]
+    fn claude_metric_cancellation_removes_emptied_bucket() {
+        let agg = Aggregator::new();
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric("claude-opus-5", "", "input", 500)],
+        ));
+        assert!(
+            agg.snapshot()
+                .agents
+                .get(AGENT_CLAUDE)
+                .is_some_and(|a| a.buckets.contains_key("anthropic/claude-opus-5/unknown")),
+            "metrics 由来のバケットができている"
+        );
+
+        // 同じ model/effort のログが届いたら metrics 分を取り消してログ側を採用する。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![
+                kv_str("model", "claude-opus-5"),
+                kv_int("input_tokens", 700),
+            ],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = snap.agents.get(AGENT_CLAUDE).unwrap();
+        assert_eq!(agent.total.input_tokens, 700);
+        assert_eq!(
+            agent.buckets.len(),
+            1,
+            "空になったバケットを残さない: {:?}",
             agent.buckets
         );
     }

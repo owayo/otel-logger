@@ -62,8 +62,7 @@ pub struct GrpcClient {
 
 impl GrpcClient {
     fn connect(route: &ProxyRoute, timeout: Duration) -> Result<Self> {
-        let endpoint = build_grpc_endpoint(&route.endpoint, timeout)
-            .with_context(|| format!("build gRPC endpoint for route `{}`", route.name))?;
+        let endpoint = build_grpc_endpoint(&route.endpoint, &route.name, timeout)?;
         // `connect_lazy` は最初の RPC まで実際の TCP を確立せず、初回の endpoint down
         // だけで startup を潰さない。
         let channel = endpoint.connect_lazy();
@@ -134,14 +133,43 @@ impl GrpcClient {
     }
 }
 
-fn build_grpc_endpoint(url: &str, timeout: Duration) -> Result<Endpoint> {
+/// proxy endpoint を transport 非依存で検証する。
+///
+/// エラーには endpoint 自体を載せない。userinfo (`https://user:pass@host`) や query に
+/// 資格情報を書かれていると、起動失敗のメッセージそのものが漏洩経路になるため、
+/// 診断には route 名だけを使う。
+fn validate_proxy_endpoint(raw: &str, route: &str) -> Result<()> {
+    let url =
+        reqwest::Url::parse(raw).with_context(|| format!("parse endpoint for route `{route}`"))?;
+    if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+        bail!("endpoint for route `{route}` must be an absolute HTTP(S) URL");
+    }
+    // OTLP の signal 別パスを endpoint 末尾に足す実装なので、query / fragment 付きは
+    // 組み立てた URL が壊れる。起動時に弾く。
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("endpoint for route `{route}` must not contain a query or fragment");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!(
+            "endpoint for route `{route}` must not embed credentials; use a proxy header with `env:VAR` instead"
+        );
+    }
+    Ok(())
+}
+
+fn build_grpc_endpoint(url: &str, route: &str, timeout: Duration) -> Result<Endpoint> {
+    // gRPC は既定の transport なので、HTTP protobuf と同じ検証を必ず通す。
+    // 検証を欠くと userinfo が HTTP/2 の `:authority` に載り (RFC 9113 §8.3.1 違反)、
+    // scheme 無しの endpoint は起動に成功したうえで全送信が恒久的に失敗する。
+    validate_proxy_endpoint(url, route)?;
     let ep = Endpoint::from_shared(url.to_string())
-        .with_context(|| format!("parse gRPC endpoint `{url}`"))?
+        .with_context(|| format!("build gRPC endpoint for route `{route}`"))?
         .timeout(timeout)
         .connect_timeout(timeout)
         .tcp_keepalive(Some(Duration::from_secs(60)));
     // HTTPS ならデフォルト TLS 設定 (webpki-roots ベース) を有効化する。
-    let uri = http::Uri::try_from(url).with_context(|| format!("parse URI `{url}`"))?;
+    let uri =
+        http::Uri::try_from(url).with_context(|| format!("build gRPC URI for route `{route}`"))?;
     let ep = match uri.scheme_str() {
         Some("https") => ep.tls_config(ClientTlsConfig::new().with_webpki_roots())?,
         _ => ep,
@@ -221,28 +249,8 @@ impl HttpClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build reqwest client")?;
-        // endpoint 自体はエラーに載せない。query や userinfo に資格情報を書かれていると、
-        // 起動時のエラーメッセージがそのまま秘密の露出経路になる。route 名だけで特定できる。
-        let endpoint = reqwest::Url::parse(&route.endpoint)
-            .with_context(|| format!("parse HTTP endpoint for route `{}`", route.name))?;
-        if !matches!(endpoint.scheme(), "http" | "https") || !endpoint.has_host() {
-            bail!(
-                "HTTP endpoint for route `{}` must be an absolute HTTP(S) URL",
-                route.name
-            );
-        }
-        if endpoint.query().is_some() || endpoint.fragment().is_some() {
-            bail!(
-                "HTTP endpoint for route `{}` must not contain a query or fragment",
-                route.name
-            );
-        }
-        if !endpoint.username().is_empty() || endpoint.password().is_some() {
-            bail!(
-                "HTTP endpoint for route `{}` must not embed credentials; use a proxy header with `env:VAR` instead",
-                route.name
-            );
-        }
+        // gRPC 経路と同じ検証を通す。エラーに endpoint を載せないのも共通。
+        validate_proxy_endpoint(&route.endpoint, &route.name)?;
 
         // 検証済みのベース URL に OTLP の signal 別パスを追加する。
         let base = route.endpoint.trim_end_matches('/');
@@ -483,31 +491,54 @@ mod tests {
 
     #[test]
     fn http_client_rejects_invalid_endpoint_at_startup() {
-        for endpoint in [
-            "",
-            "collector.example.com",
-            "ftp://collector.example.com",
-            "https://collector.example.com?tenant=example",
-            "https://collector.example.com/#fragment",
-        ] {
-            let route = ProxyRoute {
-                name: "openai".to_string(),
-                service_names: vec!["codex_cli_rs".to_string()],
-                signals: ProxySignal::ALL.to_vec(),
-                transport: ProxyTransport::HttpProtobuf,
-                endpoint: endpoint.to_string(),
-                headers: vec![],
-            };
-
-            let error = match RouteClient::build(&route, 3_000) {
-                Ok(_) => panic!("不正な endpoint `{endpoint}` が受理された"),
-                Err(error) => error,
-            };
-            assert!(
-                error.to_string().contains("openai"),
-                "route 名を含むエラーを返す必要がある: {error:#}"
-            );
+        for endpoint in INVALID_ENDPOINTS {
+            assert_endpoint_rejected(ProxyTransport::HttpProtobuf, endpoint);
         }
+    }
+
+    /// gRPC は既定 transport なので、HTTP protobuf と同じ検証を必ず通す必要がある。
+    /// 検証が無いと userinfo が HTTP/2 の `:authority` に載り (RFC 9113 §8.3.1 違反)、
+    /// scheme 無しの endpoint は起動に成功したうえで全送信が恒久的に失敗する。
+    #[test]
+    fn grpc_client_rejects_invalid_endpoint_at_startup() {
+        for endpoint in INVALID_ENDPOINTS {
+            assert_endpoint_rejected(ProxyTransport::Grpc, endpoint);
+        }
+    }
+
+    const INVALID_ENDPOINTS: &[&str] = &[
+        "",
+        "collector.example.com",
+        "ftp://collector.example.com",
+        "https://collector.example.com?tenant=example",
+        "https://collector.example.com/#fragment",
+        // userinfo は資格情報そのもの。エラーにも出してはいけない。
+        "https://user:s3cr3tPASSWORD@collector.example.com:4317",
+    ];
+
+    fn assert_endpoint_rejected(transport: ProxyTransport, endpoint: &str) {
+        let route = ProxyRoute {
+            name: "openai".to_string(),
+            service_names: vec!["codex_cli_rs".to_string()],
+            signals: ProxySignal::ALL.to_vec(),
+            transport,
+            endpoint: endpoint.to_string(),
+            headers: vec![],
+        };
+
+        let error = match RouteClient::build(&route, 3_000) {
+            Ok(_) => panic!("不正な endpoint `{endpoint}` が {transport:?} で受理された"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("openai"),
+            "route 名を含むエラーを返す必要がある: {rendered}"
+        );
+        assert!(
+            !rendered.contains("s3cr3tPASSWORD") && !rendered.contains("tenant=example"),
+            "endpoint 由来の資格情報や query をエラーへ載せてはいけない: {rendered}"
+        );
     }
 
     #[test]

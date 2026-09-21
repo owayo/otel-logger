@@ -10,6 +10,36 @@ pub fn expand_current_user_path(path: PathBuf) -> PathBuf {
     expand_user_path(path, home.as_deref())
 }
 
+/// 他ユーザーから辿れないディレクトリ (Unix では `0o700`) を作る。
+///
+/// JSONL には受信した telemetry がそのまま入り、`user.email` / `user.id` /
+/// `organization.id` などが含まれる (`OTEL_LOG_USER_PROMPTS` 有効時はプロンプト本文も)。
+/// 設定ファイルには proxy の認証ヘッダを書ける。既定の umask 022 では 0755 / 0644 で
+/// 作られ、共有 CI runner や多人数ログインサーバでは同一ホストの全ユーザーが読めてしまう。
+///
+/// 既存ディレクトリの mode は変更しない。運用中に権限を書き換えると、意図して
+/// group 共有にしている構成を壊すため。
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// 新規作成時の mode を `0o600` に制限する。既存ファイルの mode は変えない。
+#[cfg(unix)]
+pub fn restrict_new_file_mode(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+pub fn restrict_new_file_mode(_options: &mut std::fs::OpenOptions) {}
+
 pub(crate) fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return path;

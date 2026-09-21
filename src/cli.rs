@@ -66,15 +66,35 @@ pub struct Cli {
     /// JSONL ファイルだけを書き出したい場合に使う。
     /// otel-logger は stdout をローテーションしないため、常駐運用 (launchd / systemd /
     /// container) では必ず指定する。累計集計と `GET /stats` はこのフラグの影響を受けない。
-    #[arg(long, env = "OTEL_LOGGER_NO_STDOUT")]
-    pub no_stdout: bool,
+    // `bool` のままだと clap の strict な value parser が使われ、環境変数に `1` を
+    // 入れた systemd / launchd / compose の常駐構成が `invalid value '1'` で起動
+    // できない (README は `=1` を案内している)。`Option<bool>` にすることで
+    // 「未指定」と「明示的な false」も区別でき、環境変数で設定ファイルの `true` を
+    // 打ち消せるようになる。
+    #[arg(
+        long,
+        env = "OTEL_LOGGER_NO_STDOUT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub no_stdout: Option<bool>,
 
     /// Append a cumulative usage summary when Claude/Codex usage changes.
     /// Claude/Codex の使用量を更新したタイミングで、stdout に累計サマリーを追記する。
     /// HTTP endpoint `GET /stats` はこのフラグに関係なく常に有効で、
     /// 同じ累計値を JSON として返す。
-    #[arg(long, env = "OTEL_LOGGER_SUMMARY")]
-    pub summary: bool,
+    // `--no-stdout` と同じ理由で `Option<bool>` + boolish parser にする。
+    #[arg(
+        long,
+        env = "OTEL_LOGGER_SUMMARY",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub summary: Option<bool>,
 
     /// Color mode for the human-readable stdout stream.
     /// 人が読める stdout 出力の色設定。
@@ -90,7 +110,14 @@ pub struct Cli {
     /// Forward Claude Code (`service.name=claude-code`) telemetry to this OTLP endpoint.
     /// `claude-code` の OTLP を JSONL 保存と同時にこの endpoint へ転送する。
     /// `--proxy-anthropic-transport` で `grpc` (既定) / `http-protobuf` を選ぶ。
-    #[arg(long, env = "OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT", value_name = "URL")]
+    // endpoint に userinfo や query を書いた設定は起動時に reject するが、`--help` は
+    // その検証より前に動くため、環境変数の値を描画させない。
+    #[arg(
+        long,
+        env = "OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
     pub proxy_anthropic_endpoint: Option<String>,
 
     /// Transport used for `--proxy-anthropic-endpoint`.
@@ -110,6 +137,9 @@ pub struct Cli {
     #[arg(
         long = "proxy-anthropic-header",
         env = "OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS",
+        // clap は既定で `--help` に環境変数の「現在値」を描画する。header には
+        // token を書くため、`--help` を叩いただけで CI ログや画面共有へ秘密が出る。
+        hide_env_values = true,
         value_name = "KEY=VALUE",
         value_delimiter = ',',
         num_args = 0..
@@ -120,7 +150,13 @@ pub struct Cli {
     /// Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` /
     /// `codex_mcp_server`) の OTLP を、
     /// JSONL 保存と同時にこの endpoint へ転送する。
-    #[arg(long, env = "OTEL_LOGGER_PROXY_OPENAI_ENDPOINT", value_name = "URL")]
+    // Anthropic 側と同じ理由で環境変数の値を `--help` に出さない。
+    #[arg(
+        long,
+        env = "OTEL_LOGGER_PROXY_OPENAI_ENDPOINT",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
     pub proxy_openai_endpoint: Option<String>,
 
     /// Transport used for `--proxy-openai-endpoint`.
@@ -138,6 +174,8 @@ pub struct Cli {
     #[arg(
         long = "proxy-openai-header",
         env = "OTEL_LOGGER_PROXY_OPENAI_HEADERS",
+        // Anthropic 側と同じ理由で環境変数の値を `--help` に出さない。
+        hide_env_values = true,
         value_name = "KEY=VALUE",
         value_delimiter = ',',
         num_args = 0..
@@ -210,7 +248,9 @@ impl ColorMode {
             ColorMode::Always => true,
             ColorMode::Never => false,
             ColorMode::Auto => {
-                if std::env::var_os("NO_COLOR").is_some() {
+                // 仕様は "when present and not an empty string"。空文字を無視するのは
+                // `XDG_CONFIG_HOME` / `HOME` の扱い (config.rs / path.rs) とも揃う。
+                if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
                     return false;
                 }
                 is_terminal::IsTerminal::is_terminal(&std::io::stdout())
@@ -374,8 +414,10 @@ impl Settings {
                 .or(config.http_addr)
                 .unwrap_or_else(|| DEFAULT_HTTP_ADDR.parse().expect("valid default")),
             log_sink,
-            no_stdout: cli.no_stdout || config.no_stdout.unwrap_or(false),
-            summary: cli.summary || config.summary.unwrap_or(false),
+            // CLI / 環境変数 > 設定ファイル > 既定値。`||` で合成すると、環境変数の
+            // 明示的な `false` が設定ファイルの `true` に負けて優先順位が逆転する。
+            no_stdout: cli.no_stdout.or(config.no_stdout).unwrap_or(false),
+            summary: cli.summary.or(config.summary).unwrap_or(false),
             color: cli.color.or(config.color).unwrap_or(ColorMode::Auto),
             dry_run: cli.dry_run,
             proxy,
@@ -628,13 +670,17 @@ fn merge_cli_headers(
     dest: &mut BTreeMap<String, String>,
     entries: &[String],
 ) -> anyhow::Result<()> {
-    for entry in entries {
-        let (key, value) = entry
-            .split_once('=')
-            .with_context(|| format!("proxy header `{entry}` must use KEY=VALUE format"))?;
+    // エラーには entry 本文を載せない。`Authorization=Bearer ...` を直接指定した場合や、
+    // `value_delimiter = ','` でカンマを含む値が分割された断片は、そのまま出すと
+    // token が stderr / journal / CI ログに残る。位置だけで指摘箇所は特定できる。
+    for (idx, entry) in entries.iter().enumerate() {
+        let position = idx + 1;
+        let (key, value) = entry.split_once('=').with_context(|| {
+            format!("proxy header #{position} must use KEY=VALUE format (value not shown)")
+        })?;
         let key = key.trim();
         if key.is_empty() {
-            anyhow::bail!("proxy header `{entry}` has empty key");
+            anyhow::bail!("proxy header #{position} has empty key (value not shown)");
         }
         // HTTP / gRPC の header 名は大小文字を区別しない。表記違い (config の
         // `authorization` と CLI の `Authorization`) が別 key として両方残ると、
@@ -774,8 +820,8 @@ mod tests {
             log_file: None,
             log_dir: None,
             log_keep_days: None,
-            no_stdout: false,
-            summary: false,
+            no_stdout: None,
+            summary: None,
             color: None,
             dry_run: false,
             proxy_anthropic_endpoint: None,
@@ -912,8 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_boolean_flags_or_together() {
-        // CLI=false でも Config=true なら有効化される。
+    fn merge_boolean_flags_fall_back_to_config() {
+        // CLI / 環境変数で未指定なら設定ファイルの値が効く。
         let cli = empty_cli();
         let config = Config {
             no_stdout: Some(true),
@@ -923,6 +969,49 @@ mod tests {
         let settings = Settings::merge_with_home(cli, config, None).unwrap();
         assert!(settings.no_stdout);
         assert!(settings.summary);
+    }
+
+    /// 回帰テスト: 明示的な `false` は設定ファイルの `true` に勝つ。
+    ///
+    /// `bool` のまま `||` で合成すると「未指定」と「明示的な false」を区別できず、
+    /// `OTEL_LOGGER_NO_STDOUT=false` が設定ファイルの `no-stdout = true` に負けて
+    /// README が定める優先順位 (CLI / 環境変数 > 設定ファイル) が逆転する。
+    #[test]
+    fn merge_boolean_flags_let_explicit_false_override_config() {
+        let mut cli = empty_cli();
+        cli.no_stdout = Some(false);
+        cli.summary = Some(false);
+        let config = Config {
+            no_stdout: Some(true),
+            summary: Some(true),
+            ..Config::default()
+        };
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        assert!(!settings.no_stdout);
+        assert!(!settings.summary);
+    }
+
+    /// 回帰テスト: proxy header のパースエラーに値を載せない。
+    ///
+    /// `Authorization=Bearer ...` を直接指定した場合や、`value_delimiter = ','` で
+    /// カンマを含む値が分割された断片は、そのままエラーへ出すと token が
+    /// stderr / journald / CI ログに残る。`env:VAR` で秘密を隠す設計と矛盾させない。
+    #[test]
+    fn merge_cli_headers_error_does_not_leak_the_value() {
+        for entry in [
+            "Bearer sk-ant-SUPERSECRET",
+            "=Bearer sk-ant-SUPERSECRET",
+            " =sk-ant-SUPERSECRET",
+        ] {
+            let mut dest = BTreeMap::new();
+            let error = merge_cli_headers(&mut dest, &[entry.to_string()])
+                .expect_err("KEY=VALUE 形式でない header は拒否する");
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains("SUPERSECRET"),
+                "header の値をエラーへ載せてはいけない: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -937,7 +1026,7 @@ mod tests {
         );
 
         let mut cli = empty_cli();
-        cli.no_stdout = true;
+        cli.no_stdout = Some(true);
         let quiet = Settings::merge_with_home(cli, Config::default(), None).unwrap();
         assert!(!quiet.warns_unrotated_stdout(false));
         assert!(!quiet.warns_unrotated_stdout(true));

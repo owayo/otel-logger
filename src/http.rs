@@ -234,6 +234,22 @@ pub async fn serve(
 mod tests {
     use super::*;
 
+    /// JSONL も stdout も出さない最小構成。router のテストで共有する。
+    fn no_output_settings() -> crate::cli::Settings {
+        use crate::cli::{ColorMode, Settings};
+
+        Settings {
+            grpc_addr: "127.0.0.1:0".parse().unwrap(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            log_sink: None,
+            no_stdout: true,
+            summary: false,
+            color: ColorMode::Never,
+            dry_run: false,
+            proxy: None,
+        }
+    }
+
     fn headers_with_ct(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
@@ -356,6 +372,86 @@ mod tests {
     fn persistence_error_maps_to_retryable_status() {
         let response = HttpError::Persistence(anyhow::anyhow!("disk full")).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// decode 不能な request は非 retryable で返す。415 / 400 を 5xx に化けさせると、
+    /// exporter が壊れた payload を無限に再送し続ける。逆に永続化失敗 (503) を
+    /// 400 に化けさせると batch が恒久的に失われるため、この対応は固定する。
+    #[test]
+    fn decode_errors_map_to_non_retryable_statuses() {
+        assert_eq!(
+            HttpError::UnsupportedContentType("text/plain".to_string())
+                .into_response()
+                .status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        let bad_protobuf =
+            <ExportLogsServiceRequest as prost::Message>::decode(&[0xffu8, 0xff, 0xff][..])
+                .expect_err("不正な protobuf は decode に失敗する");
+        assert_eq!(
+            HttpError::BadProtobuf(bad_protobuf)
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let bad_json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(
+            HttpError::BadJson(bad_json).into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// `OTLP_MAX_REQUEST_BYTES` を超える body は 413 で拒否する。上限側のテストが
+    /// 無いと、定数を過大にしてもメモリ枯渇の防御が外れたことに気づけない。
+    #[tokio::test]
+    async fn router_rejects_body_larger_than_the_otlp_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let app = router(sink);
+        let body = vec![0u8; crate::server::OTLP_MAX_REQUEST_BYTES + 1];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// `/v1/traces` と `/v1/metrics` も実際に配線されていること。logs だけを叩く
+    /// テストしか無いと、handler を取り違えて配線しても気づけない。
+    #[tokio::test]
+    async fn router_accepts_every_otlp_signal_path() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        for (path, body) in [
+            ("/v1/logs", r#"{"resourceLogs":[]}"#),
+            ("/v1/traces", r#"{"resourceSpans":[]}"#),
+            ("/v1/metrics", r#"{"resourceMetrics":[]}"#),
+        ] {
+            let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+            let app = router(sink);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, JSON_CT)
+                .body(Body::from(body))
+                .unwrap();
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{path} が 200 を返さない"
+            );
+        }
     }
 
     /// `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter は body を gzip して送る。

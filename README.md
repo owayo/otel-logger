@@ -44,6 +44,7 @@ upstream collectors.
   - Media types are matched case-insensitively with parameters allowed; malformed non-UTF-8 `Content-Type` values return `415 Unsupported Media Type` instead of silently falling back to protobuf
 - Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
   - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
+  - Written by a dedicated writer task off the OTLP acknowledgement path, so a slow stdout reader (a paused pager, a stalled log driver) cannot stall responses. Blocking the ACK would make exporters time out and resend batches that were already persisted and counted. Overflowing output is dropped and reported; JSONL persistence, usage aggregation and proxy forwarding are unaffected
 - JSON Lines persistence to one append-only file or daily-rotated files, `fsync`'d on graceful shutdown
   - Persistence failures surface as HTTP `503 Service Unavailable` / gRPC `Status::unavailable` so OTLP exporters can retry instead of silently dropping payloads. OTLP treats `500` and `Internal` as non-retryable, so those codes would make exporters drop the batch
   - `Content-Encoding: gzip` requests are accepted (`OTEL_EXPORTER_OTLP_COMPRESSION=gzip`); the size limit applies to the decompressed body
@@ -61,6 +62,9 @@ upstream collectors.
   - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
   - Cumulative counters use saturating arithmetic, so repeated extreme batches cannot wrap token totals or turn cost into `Infinity`
 - Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
+  - Bounded by a 10-second grace period: a client that declares a body and never finishes sending it cannot hold the process hostage and prevent the final `fsync`. A second signal abandons in-flight connections immediately
+  - Queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged
+- JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`); telemetry payloads carry `user.email`, `user.id` and organization identifiers
 - Single static-ish binary (~7 MB stripped) and a distroless container image
 - Examples for Docker Compose, GitHub Actions, and GitLab CI
 
@@ -133,6 +137,17 @@ otel-logger [OPTIONS]
 | `--proxy-checkpoint-dir` | | (next to JSONL) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | Directory for forward checkpoints (reserved for Phase B)  |
 | `--help`       | `-h`  |                  |                           | Show help                                                |
 | `--version`    | `-V`  |                  |                           | Show version                                             |
+
+The boolean flags (`--no-stdout`, `--summary`) accept the usual truthy spellings
+through their environment variables — `1` / `0`, `true` / `false`, `yes` / `no`,
+`on` / `off` — so `OTEL_LOGGER_NO_STDOUT=1` in a systemd unit or a compose file
+works. An explicit `false` also wins over `true` in the config file, matching the
+documented precedence. Empty `OTEL_LOGGER_*` variables are treated as unset
+rather than as an empty value, so leaving a placeholder in `environment:` does
+not prevent startup.
+
+Values coming from `OTEL_LOGGER_PROXY_*` are never printed by `--help`; they can
+hold credentials.
 
 ### Config file (`~/.config/otel-logger/config.toml`)
 

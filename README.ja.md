@@ -39,6 +39,7 @@ OTLP/gRPC を `:4317`、OTLP/HTTP を `:4318` で受け、Traces / Metrics / Log
   - media type は大文字小文字を区別せず parameter 付きも受理する。非 UTF-8 の不正な `Content-Type` は protobuf へ暗黙フォールバックせず `415 Unsupported Media Type` を返す
 - severity 別の色付きで stdout 表示 (リダイレクト時や `NO_COLOR` で自動 OFF)
   - 受信した payload の動的ラベルや属性キーに ANSI escape / C0/C1 制御文字が含まれていても terminal にそのまま出さず escape する (terminal escape injection 対策、JSONL は lossless のまま)
+  - stdout への書き込みは OTLP の ACK 経路から切り離した専用 writer task が行う。読み手が遅い場合 (pager を止めている、log driver が詰まっている等) でも応答が止まらない。ACK を止めると exporter が timeout し、保存・計上済みの batch を再送させてしまうため。溢れた出力は破棄して件数を warn する (JSONL 永続化・累計集計・proxy 転送には影響しない)
 - JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存し、graceful shutdown 時に `fsync`
   - JSONL の永続化に失敗した場合は HTTP `503 Service Unavailable` / gRPC `Status::unavailable` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)。OTLP 仕様上 500 や `Internal` は retry されず破棄されるため、retryable な code を返す
   - `Content-Encoding: gzip` の request も受け付ける (`OTEL_EXPORTER_OTLP_COMPRESSION=gzip` 対応)。サイズ上限は解凍後の body に対して効く
@@ -55,6 +56,9 @@ OTLP/gRPC を `:4317`、OTLP/HTTP を `:4318` で受け、Traces / Metrics / Log
   - token / duration / cost の属性値や metric 値に NaN / Infinity / 範囲外の巨大な double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの `i64::MAX` / `u64::MAX` 飽和値や `cost_usd=inf` の混入を防ぐ)
   - 累計 counter は saturating arithmetic で加算し、極端な batch が繰り返されても token 合計の wrap や `cost_usd=inf` を起こさない
 - SIGINT / SIGTERM 対応 (`docker stop` で末尾バッチが落ちない)
+  - graceful shutdown には 10 秒の猶予を設ける。body を宣言したまま送り切らない client 1 本でプロセスを止められなくなり、最後の `fsync` に到達できない事態を防ぐ。2 回目のシグナルで in-flight を即座に諦める
+  - proxy の queue に残った batch は破棄せず 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
+- JSONL・設定ファイル・`--log-dir` のディレクトリは所有者のみアクセス可能な権限 (`0600` / `0700`) で作成する。telemetry payload には `user.email` / `user.id` / organization ID が含まれるため
 - Stripped で約 7 MB の単一バイナリ。distroless コンテナイメージ同梱
 - Docker Compose / GitHub Actions / GitLab CI の利用例を同梱
 
@@ -123,6 +127,15 @@ otel-logger [OPTIONS]
 | `--proxy-checkpoint-dir` | | (JSONL の隣) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | 転送 checkpoint 用ディレクトリ (Phase B 用に予約)              |
 | `--help`       | `-h`  |                  |                           | ヘルプ表示                                                 |
 | `--version`    | `-V`  |                  |                           | バージョン表示                                             |
+
+真偽値フラグ (`--no-stdout` / `--summary`) は、環境変数経由で `1` / `0`、
+`true` / `false`、`yes` / `no`、`on` / `off` のいずれの表記も受け付けます
+(systemd unit や compose の `OTEL_LOGGER_NO_STDOUT=1` がそのまま動きます)。
+明示的な `false` は設定ファイルの `true` に優先し、ドキュメント通りの優先順位に
+なります。空文字の `OTEL_LOGGER_*` は「値が空」ではなく未設定として扱うため、
+`environment:` にプレースホルダを残しても起動を妨げません。
+
+`OTEL_LOGGER_PROXY_*` の値は `--help` に表示しません (資格情報が入りうるため)。
 
 ### 設定ファイル (`~/.config/otel-logger/config.toml`)
 
