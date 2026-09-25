@@ -5,22 +5,24 @@
 ## 基本
 
 - 回答は日本語で行う。
-- Rust 2024 edition / MSRV 1.88 の CLI + library project として扱う。
+- Rust 2024 edition / MSRV 1.98 の CLI + library project として扱う。Rust の版は `mise.toml` が正で、Cargo.toml の `rust-version` と Dockerfile のベースイメージも同じ版にそろえる。
 - 変更前に `astro-sight context --dir . --git`、変更後に `astro-sight impact --dir . --git` を実行する。
 - code identifier の利用箇所を探す場合は `grep` / `rg` ではなく `astro-sight refs` を使う。
 - `CLAUDE.md` は `AGENTS.md` への symlink なので直接編集しない。
 
 ## よく使う検証
 
+開発コマンドは `make help` (引数なしの `make`) で一覧できる。Makefile は cargo を `mise exec` 経由で呼ぶので、`mise.toml` の版で動く。
+
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
-cargo audit
+make setup     # mise のツールチェーンと依存を取得する
+make fmt       # 整形する (書き換える)
+make ci        # CI と同じ検査 (fmt-check、clippy -D warnings、test)
+make release   # リリース版をビルドする
+cargo audit    # RustSec advisory database で Cargo.lock を検査する (cargo-audit は別に入れる)
 ```
 
-`make install` は release build 後に `/usr/local/bin/otel-logger` へ配置する。macOS では配置後に ad-hoc 署名する。
+`make install` は release build を一時ファイルへコピーし、macOS では ad-hoc 署名してから `mv -f` で `/usr/local/bin/otel-logger` を置き換える (cp で上書きすると macOS で SIGKILL されるため)。
 
 ## 実装上の注意
 

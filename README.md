@@ -1,107 +1,101 @@
 <h1 align="center">otel-logger</h1>
 
 <p align="center">
-  <strong>OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSON Lines</strong>
+  OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSON Lines
+</p>
+
+<!-- standard:badges:start -->
+<h3 align="center">Supported Platforms</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
 </p>
 
 <p align="center">
-  <a href="https://github.com/owayo/otel-logger/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owayo/otel-logger/actions/workflows/ci.yml/badge.svg?branch=main">
-  </a>
-  <a href="https://github.com/owayo/otel-logger/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/otel-logger">
-  </a>
-  <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owayo/otel-logger">
-  </a>
+  <a href="https://github.com/owayo/otel-logger/actions/workflows/ci.yml"><img src="https://github.com/owayo/otel-logger/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/owayo/otel-logger/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/otel-logger" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/otel-logger" alt="License"></a>
 </p>
 
 <p align="center">
-  English | <a href="README.ja.md">日本語</a>
+  <a href="README.md">English</a> |
+  <a href="README.ja.md">日本語</a>
 </p>
+<!-- standard:badges:end -->
 
 ---
 
-## Overview
-
-`otel-logger` is a tiny Rust OTLP receiver designed to sit next to AI coding
-agents — **Claude Code** and **OpenAI Codex CLI** — while they run inside CI
-containers. It accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`, decodes
-traces, metrics, and logs, and writes them in two ways:
+`otel-logger` is a tiny Rust OTLP receiver designed to sit next to AI coding agents — **Claude Code** and **OpenAI Codex CLI** — while they run inside CI containers. It accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`, decodes traces, metrics, and logs, and writes them in two ways:
 
 - **stdout**: human-readable, color-coded one-liner per record (great for CI logs).
 - **JSON Lines** (`--log-file` / `--log-dir`): lossless, schema-preserving for offline analysis, either as one append-only file or daily-rotated files.
 
-By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to
-capture what the agent emits during a CI job and surface it where developers
-already look. Optional OTLP proxy routes can forward the persisted payloads to
-upstream collectors.
+By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to capture what the agent emits during a CI job and surface it where developers already look. Optional OTLP proxy routes can forward the persisted payloads to upstream collectors.
 
 ## Features
 
-- OTLP/gRPC (4317) and OTLP/HTTP (4318) on the same process
-- Accepts both `application/x-protobuf` and `application/json` on HTTP
-  - Media types are matched case-insensitively with parameters allowed; malformed non-UTF-8 `Content-Type` values return `415 Unsupported Media Type` instead of silently falling back to protobuf
-- Pretty stdout output with severity-based color (auto-disabled when redirected or `NO_COLOR` is set)
-  - Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
-  - Written by a dedicated writer task off the OTLP acknowledgement path, so a slow stdout reader (a paused pager, a stalled log driver) cannot stall responses. Blocking the ACK would make exporters time out and resend batches that were already persisted and counted. Overflowing output is dropped and reported; JSONL persistence, usage aggregation and proxy forwarding are unaffected
-- JSON Lines persistence to one append-only file or daily-rotated files, `fsync`'d on graceful shutdown
-  - Persistence failures surface as HTTP `503 Service Unavailable` / gRPC `Status::unavailable` so OTLP exporters can retry instead of silently dropping payloads. OTLP treats `500` and `Internal` as non-retryable, so those codes would make exporters drop the batch
-  - `Content-Encoding: gzip` requests are accepted (`OTEL_EXPORTER_OTLP_COMPRESSION=gzip`); the size limit applies to the decompressed body
-  - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
-  - Each batch is `flush`'d to the kernel before ACK so an unexpected crash never leaves the last write trapped in `BufWriter`'s in-memory buffer
-  - gRPC/HTTP raise their per-request decode limit to 32 MiB (above `tonic`'s 4 MiB / `axum`'s 2 MiB defaults) so large batches are persisted instead of being permanently rejected with `RESOURCE_EXHAUSTED` / `413` that exporter retries cannot recover from
-- Cumulative `/stats` and `--summary` usage totals for Claude/Codex with
-  de-duplication between logs and metrics
-  - Recognises supported Codex processes via `service.name`: TUI (`codex_cli_rs`), Exec (`codex_exec`), Apps Server (`codex-app-server`, Codex 0.140.0+), and MCP Server (`codex_mcp_server`, observed in Codex 0.146.1/0.147.0). Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated
-  - Keeps the last-session fallback for Codex metrics scoped to the same `service.name`, so concurrently running TUI and Exec processes cannot assign each other's provider or reasoning effort
-  - Keeps provider/model/effort values dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free
-  - For Codex, the first SSE `response.completed` log or `codex.turn.token_usage` metric observed for each model becomes that model's token source; WebSocket `response.completed` events without usage and trace-span usage mirrors such as `session_task.turn` / `session_task.review` are not counted as separate usage
-  - Codex 0.144.1+ `model_reasoning_effort` on SSE completions is used directly, preserving observed `gpt-5.6-terra` high/xhigh usage even before its session arrives. Pending usage is tracked by provider/model/effort/conversation, so a delayed `codex.conversation_starts` moves only that conversation to the confirmed provider (Azure or another OpenAI-compatible endpoint), retaining a known SSE effort and using the session effort only when SSE omitted it
-  - `handle_responses` spans also respect `conversation.id` when re-deriving `effort`, so a span for one conversation never overwrites another conversation's session
-  - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
-  - Cumulative counters use saturating arithmetic, so repeated extreme batches cannot wrap token totals or turn cost into `Infinity`
-- Graceful shutdown on SIGINT and SIGTERM (no lost batch under `docker stop`)
-  - Bounded by a 10-second grace period: a client that declares a body and never finishes sending it cannot hold the process hostage and prevent the final `fsync`. A second signal abandons in-flight connections immediately
-  - Queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged
-- JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`); telemetry payloads carry `user.email`, `user.id` and organization identifiers
-- Single static-ish binary (~7 MB stripped) and a distroless container image
-- Examples for Docker Compose, GitHub Actions, and GitLab CI
+- **Both OTLP transports in one process**: OTLP/gRPC (4317) and OTLP/HTTP (4318); HTTP accepts both `application/x-protobuf` and `application/json`, gzip-compressed or not
+- **Readable stdout**: severity-based colors (turned off when redirected or when `NO_COLOR` is set), with control characters in incoming payloads escaped before they reach the terminal
+- **Lossless JSON Lines**: one append-only file or daily-rotated files, `fsync`'d on graceful shutdown; a failed write returns HTTP `503` / gRPC `Unavailable` so exporters retry instead of dropping the batch
+- **Usage totals for Claude Code and Codex**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
+- **OTLP proxy forwarding**: optional routes that forward Claude Code and Codex payloads to separate upstream collectors after they are persisted
+- **Graceful shutdown**: SIGINT and SIGTERM keep the last batch (nothing is lost under `docker stop`), bounded by a 10-second grace period
+- **Private files**: JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`), because telemetry carries `user.email`, `user.id` and organization identifiers
+- **Small footprint**: a single static-ish binary (~7 MB stripped), a static musl build for systems without glibc (distroless, Alpine), and a distroless container image
+- **Ready-made examples**: Docker Compose, GitHub Actions, and GitLab CI
 
-## Requirements
-
-- **Runtime OS**: Linux, macOS, Windows
-- **Rust**: 1.88+ (only when building from source — `tonic 0.14` requires it; uses edition 2024). The bundled Dockerfile uses `rust:1.90` to stay ahead of the floor.
+Design details (request limits, the stdout writer, delivery guarantees): [docs/architecture.md](docs/architecture.md)
 
 ## Installation
 
-### Homebrew (macOS / Linux)
+<!-- standard:install:start -->
+### Homebrew (macOS/Linux)
 
 ```bash
 brew install owayo/otel-logger/otel-logger
 ```
 
-The tap ships pre-built bottles for `arm64_sonoma`, `sonoma`, and
-`x86_64_linux`; other platforms fall back to building from source via
-`cargo install` (Rust 1.88+ is pulled in via `depends_on "rust"`).
+### Cargo
 
-### From source
+Requires Rust 1.98 or later.
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/owayo/otel-logger --locked
 ```
 
-### From a release
+### From GitHub Releases
 
-Download the binary for your platform from
-[Releases](https://github.com/owayo/otel-logger/releases) and place it in
-`$PATH`. Available artifacts:
-`otel-logger-{aarch64,x86_64}-apple-darwin.tar.gz`,
-`otel-logger-{x86_64,aarch64}-unknown-linux-gnu.tar.gz`,
-`otel-logger-x86_64-unknown-linux-musl.tar.gz` (static build for distroless /
-Alpine), and `otel-logger-x86_64-pc-windows-msvc.zip`.
+Download the archive for your platform from [Releases](https://github.com/owayo/otel-logger/releases/latest), extract it, and put `otel-logger` on your `PATH`. Each release also includes `SHA256SUMS` for checking the downloads.
+
+| Platform | Archive |
+|---|---|
+| Linux (x86_64) | `otel-logger-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux (x86_64, musl) | `otel-logger-x86_64-unknown-linux-musl.tar.gz` |
+| Linux (ARM64) | `otel-logger-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel) | `otel-logger-x86_64-apple-darwin.tar.gz` |
+| macOS (Apple Silicon) | `otel-logger-aarch64-apple-darwin.tar.gz` |
+| Windows (x86_64) | `otel-logger-x86_64-pc-windows-msvc.zip` |
+
+On macOS, if you downloaded the archive with a browser, remove the quarantine attribute before running it: `xattr -d com.apple.quarantine otel-logger`.
+
+### From Source
+
+Requires [mise](https://mise.jdx.dev/) (the Rust toolchain is pinned in `mise.toml`).
+
+```bash
+git clone https://github.com/owayo/otel-logger.git
+cd otel-logger
+make install
+```
+
+`make install` installs to `/usr/local/bin`. Set `INSTALL_PATH` to change it (for example `make install INSTALL_PATH="$HOME/.local/bin"`).
+<!-- standard:install:end -->
 
 ### Docker
+
+Build the bundled Dockerfile (a distroless image that runs as a non-root user) and start the receiver on the standard OTLP ports:
 
 ```bash
 docker build -t otel-logger:dev .
@@ -114,100 +108,6 @@ docker run --rm -p 4317:4317 -p 4318:4318 otel-logger:dev
 otel-logger [OPTIONS]
 ```
 
-### Options
-
-| Option         | Short | Default          | Env                       | Description                                              |
-|----------------|-------|------------------|---------------------------|----------------------------------------------------------|
-| `--config`     |       | (auto)           | `OTEL_LOGGER_CONFIG`      | Path to a TOML config file (see below)                   |
-| `--grpc-addr`  |       | `0.0.0.0:4317`   | `OTEL_LOGGER_GRPC_ADDR`   | gRPC bind address (OTLP/gRPC)                            |
-| `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP bind address (OTLP/HTTP, both protobuf and JSON)    |
-| `--log-file`   |       | (none)           | `OTEL_LOGGER_LOG_FILE`    | Append received telemetry as JSON Lines (mutually exclusive with `--log-dir`) |
-| `--log-dir`    |       | (none)           | `OTEL_LOGGER_LOG_DIR`     | Write daily-rotated JSONL into this directory: `otel-logger.YYYY-MM-DD` (local time) |
-| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of rotated JSONL to keep when `--log-dir` is used (`0` is clamped to a 1-day minimum) |
-| `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | Suppress the human-readable stdout stream (required for daemons — see [Running as a daemon](#running-as-a-daemon)) |
-| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | Append cumulative usage summary when usage totals change |
-| `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (honors `NO_COLOR`)          |
-| `--dry-run`    | `-n`  | `false`          |                           | Validate startup, including simultaneous listener bind, then exit |
-| `--proxy-anthropic-endpoint` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | Forward `service.name=claude-code` payloads to this upstream OTLP endpoint (see [OTLP proxy forwarding](#otlp-proxy-forwarding)) |
-| `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` or `http-protobuf`                                 |
-| `--proxy-anthropic-header` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` header (`env:VAR_NAME` resolves from env); repeatable |
-| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server`) payloads |
-| `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | Same as above                                             |
-| `--proxy-openai-header` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | Same as above                                             |
-| `--proxy-checkpoint-dir` | | (next to JSONL) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | Directory for forward checkpoints (reserved for Phase B)  |
-| `--help`       | `-h`  |                  |                           | Show help                                                |
-| `--version`    | `-V`  |                  |                           | Show version                                             |
-
-The boolean flags (`--no-stdout`, `--summary`) accept the usual truthy spellings
-through their environment variables — `1` / `0`, `true` / `false`, `yes` / `no`,
-`on` / `off` — so `OTEL_LOGGER_NO_STDOUT=1` in a systemd unit or a compose file
-works. An explicit `false` also wins over `true` in the config file, matching the
-documented precedence. Empty `OTEL_LOGGER_*` variables are treated as unset
-rather than as an empty value, so leaving a placeholder in `environment:` does
-not prevent startup.
-
-Values coming from `OTEL_LOGGER_PROXY_*` are never printed by `--help`; they can
-hold credentials.
-
-### Config file (`~/.config/otel-logger/config.toml`)
-
-`otel-logger` reads `$XDG_CONFIG_HOME/otel-logger/config.toml` on startup
-(falling back to `~/.config/otel-logger/config.toml`). Use `--config <PATH>`
-to point at a different file. Every key is optional; missing keys fall back
-to the built-in default.
-
-Leading `~` / `~/` is expanded to `$HOME` for `--config`, `otel-logger init
---path`, `log-file`, and `log-dir`, including values supplied through
-environment variables or the config file.
-
-**Precedence** (highest wins): CLI flag > environment variable > config file > default.
-For the mutually exclusive log sinks, this precedence also applies across
-`log-file` and `log-dir`: specifying `--log-file` ignores a configured
-`log-dir`, and specifying `--log-dir` ignores a configured `log-file`.
-
-When `log-dir` is used, retention cleanup only removes daily rotated files
-named `otel-logger.YYYY-MM-DD` whose suffix is a real calendar date. Other files in the same directory, such as
-`otel-logger.pid`, `otel-logger.stderr.log`, or a standalone
-`otel-logger.jsonl`, are left untouched. Date-shaped names containing an
-impossible date and symbolic links are also left untouched.
-
-Generate a fully-commented starter file with the bundled command:
-
-```bash
-otel-logger init                    # → ~/.config/otel-logger/config.toml
-otel-logger init -p /etc/foo.toml   # → custom path
-otel-logger init -f                 # overwrite an existing file
-otel-logger init --daemon           # preset for long-lived services
-```
-
-The generated file looks like:
-
-```toml
-# ~/.config/otel-logger/config.toml
-log-file = "/var/log/otel-logger/otel-logger.jsonl"
-# Or, daily-rotated output (mutually exclusive with `log-file`):
-# log-dir = "/var/log/otel-logger"
-# log-keep-days = 10                 # default: 10
-no-stdout = false
-summary = false
-color = "auto"  # "auto" | "always" | "never"
-# grpc-addr = "0.0.0.0:4317"
-# http-addr = "0.0.0.0:4318"
-```
-
-`--daemon` writes a different starter file, tuned for long-lived instances:
-`no-stdout = true` plus daily-rotated JSONL with retention. See
-[Running as a daemon](#running-as-a-daemon).
-
-Note: TOML paths are not generally shell-expanded. A leading `~` / `~/` is
-expanded for the path settings listed above, but embedded environment variables
-such as `$HOME/logs` are not expanded; write absolute paths for those cases.
-
-Internal logs (the receiver's own diagnostics) go to **stderr** and respect
-`OTEL_LOGGER_LOG=debug` (`tracing-subscriber` env filter syntax).
-
-### Examples
-
 ```bash
 # Listen on the standard OTLP ports and write JSONL to disk
 otel-logger --log-file ./otel.jsonl
@@ -219,21 +119,11 @@ otel-logger --grpc-addr 127.0.0.1:0 --http-addr 0.0.0.0:4318
 otel-logger --dry-run
 ```
 
-### Usage summary
+All options, their environment variables and the `init` subcommand: [docs/cli-reference.md](docs/cli-reference.md)
 
-`--summary` appends cumulative Claude/Codex usage totals to stdout whenever the
-receiver ingests a new usage sample. `GET /stats` always returns the same
-snapshot as JSON. Claude API request logs are treated as the preferred source
-for token/cost usage when both logs and metrics are present, because logs arrive
-per request and can include usage that has not yet been exported as metrics.
-Matching metrics are de-duplicated instead of being added twice.
+### Sending telemetry from Claude Code
 
-## Sending telemetry from Claude Code
-
-Claude Code's telemetry contract is environment-variable driven.
-See [Anthropic monitoring docs](https://code.claude.com/docs/en/monitoring-usage).
-The simplest way to apply the env vars in every session is the `env` block of
-`~/.claude/settings.json` (or `.claude/settings.json` per-project):
+Claude Code's telemetry contract is environment-variable driven. See [Anthropic monitoring docs](https://code.claude.com/docs/en/monitoring-usage). The simplest way to apply the env vars in every session is the `env` block of `~/.claude/settings.json` (or `.claude/settings.json` per-project):
 
 ```jsonc
 {
@@ -251,14 +141,11 @@ The simplest way to apply the env vars in every session is the `env` block of
 }
 ```
 
-When running under Docker Compose / CI alongside the receiver container,
-swap `localhost` for the service name (`otel-logger`). The same variables can
-also be `export`-ed in a shell if you prefer not to use `settings.json`.
+When running under Docker Compose / CI alongside the receiver container, swap `localhost` for the service name (`otel-logger`). The same variables can also be `export`-ed in a shell if you prefer not to use `settings.json`.
 
-## Sending telemetry from OpenAI Codex CLI
+### Sending telemetry from OpenAI Codex CLI
 
-Codex contracts on `config.toml` rather than environment variables.
-See [Codex config reference](https://developers.openai.com/codex/config-reference).
+Codex contracts on `config.toml` rather than environment variables. See [Codex config reference](https://developers.openai.com/codex/config-reference).
 
 ```toml
 # $CODEX_HOME/config.toml
@@ -270,513 +157,32 @@ metrics_exporter = { otlp-http = { endpoint = "http://localhost:4318/v1/metrics"
 trace_exporter = { otlp-http = { endpoint = "http://localhost:4318/v1/traces", protocol = "binary", headers = {} } }
 ```
 
-When running under Docker Compose / CI alongside the receiver container,
-swap `localhost` for the service name (`otel-logger`).
+When running under Docker Compose / CI alongside the receiver container, swap `localhost` for the service name (`otel-logger`). A working sample lives at [`codex-config/config.toml`](codex-config/config.toml).
 
-A working sample lives at [`codex-config/config.toml`](codex-config/config.toml).
+Running the receiver as a sidecar in Docker Compose, GitHub Actions and GitLab CI: [docs/integrations.md](docs/integrations.md)
 
-## Docker Compose
+### Usage totals
 
-The repo ships with a sample [`compose.yaml`](compose.yaml) that runs
-`otel-logger` as a sidecar and shows two consumer containers (Claude Code and
-Codex):
+`GET /stats` always returns the cumulative Claude/Codex usage (tokens, cost, duration) per provider/model/effort as JSON, and `--summary` appends the same totals to stdout whenever a batch changes them. Claude API request logs are preferred over metrics for token/cost usage, and matching metrics are de-duplicated instead of being added twice.
 
 ```bash
-docker compose up otel-logger
-docker compose run --rm claude-code-sample
-docker compose run --rm codex-sample
+curl -s http://localhost:4318/stats | jq
 ```
 
-The receiver logs go to `docker compose logs otel-logger`, and the lossless
-JSONL stream lands in `./data/otel-logger.jsonl`.
+`/stats` is served on the OTLP/HTTP listener without authentication. The default bind is `0.0.0.0:4318`, so bind to `127.0.0.1` or restrict the port at the firewall if the numbers are sensitive. How each agent's usage is counted and the response format: [docs/usage-stats.md](docs/usage-stats.md)
 
-## Running as a daemon
-
-When `otel-logger` runs as a long-lived service, always start it with
-`--no-stdout`. The receiver never rotates or caps its own stdout stream, and
-`--log-keep-days` retention applies **only** to the JSONL files written by
-`--log-dir` — it has no effect on a redirected stdout. Neither launchd's
-`StandardOutPath` nor a plain shell redirect rotates the target either: one
-launchd-managed instance quietly grew a 7.6 GB stdout file in 37 days
-(~200 MB/day) before anyone looked.
-
-Because stdout is never a terminal under launchd, systemd, or Docker,
-`otel-logger` detects that case at startup and prints a one-time warning to
-stderr when the human-readable stream is still enabled, pointing at
-`--no-stdout` (or `no-stdout = true` in the config file).
-
-`--no-stdout` suppresses the pretty stream and the `--summary` blocks, but
-aggregation itself keeps running — query `GET /stats` for the live totals
-instead of reading a log file (see
-[Cumulative usage stats](#cumulative-usage-stats)).
-
-To start from a config file that already carries these defaults, use the
-`--daemon` preset. It only writes the file; it does not register a service or
-put anything in the background:
-
-```bash
-otel-logger init --daemon                             # → ~/.config/otel-logger/config.toml
-otel-logger init --daemon -p /etc/otel-logger/config.toml
-```
-
-```toml
-# ~/.config/otel-logger/config.toml
-log-dir = "/var/log/otel-logger"
-log-keep-days = 10                 # default: 10
-# Or, a single append-only file (mutually exclusive with `log-dir`, never rotated):
-# log-file = "/var/log/otel-logger/otel-logger.jsonl"
-no-stdout = true
-summary = false
-color = "auto"  # "auto" | "always" | "never"
-# grpc-addr = "0.0.0.0:4317"
-# http-addr = "0.0.0.0:4318"
-```
-
-### macOS (launchd)
-
-Save the agent as `~/Library/LaunchAgents/io.github.owayo.otel-logger.plist`
-and replace `YOUR_USER` with the account that owns the log directory:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>io.github.owayo.otel-logger</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/otel-logger</string>
-    <string>--no-stdout</string>
-    <string>--log-dir</string>
-    <string>/Users/YOUR_USER/Library/Logs/otel-logger</string>
-    <string>--log-keep-days</string>
-    <string>10</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/dev/null</string>
-  <key>StandardErrorPath</key>
-  <string>/dev/null</string>
-</dict>
-</plist>
-```
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.owayo.otel-logger.plist
-launchctl print gui/$(id -u)/io.github.owayo.otel-logger          # inspect state
-launchctl kickstart -k gui/$(id -u)/io.github.owayo.otel-logger   # restart
-launchctl bootout gui/$(id -u)/io.github.owayo.otel-logger        # stop and unload
-```
-
-`StandardOutPath` points at `/dev/null` because launchd only redirects the
-stream — it never rotates the target file. The same is true of
-`StandardErrorPath`: if you point it at a real file to keep the receiver's own
-diagnostics, rotating and pruning that file is your responsibility, not
-launchd's.
-
-### Linux (systemd)
-
-Save the unit as `/etc/systemd/system/otel-logger.service`:
-
-```ini
-[Unit]
-Description=otel-logger OTLP receiver
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=otel-logger
-ExecStart=/usr/local/bin/otel-logger --no-stdout --log-dir /var/log/otel-logger --log-keep-days 10
-Restart=on-failure
-RestartSec=5s
-StandardOutput=null
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now otel-logger.service
-sudo systemctl status otel-logger.service
-journalctl -u otel-logger.service -f
-```
-
-`/var/log/otel-logger` has to be writable by the unit's `User=`; the JSONL
-files inside it are rotated daily and pruned by `--log-keep-days`.
-
-The two output streams are bounded in different ways, and the difference
-matters. `StandardError=journal` hands the receiver's diagnostics to journald,
-which enforces the host's own retention (`SystemMaxUse=`, `MaxRetentionSec=`
-and friends in `journald.conf`), so that path stays bounded on its own.
-Appending straight to a file with `StandardOutput=append:/var/log/otel-logger/stdout.log`
-is what grows without bound — nothing rotates that file.
-
-### Docker log drivers
-
-The default `json-file` logging driver does not rotate, so a container left up
-permanently accumulates its stdout **and** stderr for the life of the
-container. `--no-stdout` removes the bulk of that, but the receiver's own
-diagnostics still go to stderr. If you keep container logs at all, bound them
-explicitly — either with the `local` driver, which rotates by default, or by
-giving `json-file` the same options:
-
-```yaml
-services:
-  otel-logger:
-    image: ghcr.io/owayo/otel-logger:latest
-    command: ["--no-stdout", "--log-dir", "/var/log/otel-logger", "--log-keep-days", "10"]
-    volumes:
-      - ./data:/var/log/otel-logger
-    logging:
-      driver: local        # or json-file, with the same two options
-      options:
-        max-size: "10m"
-        max-file: "3"
-```
-
-The bundled [`compose.yaml`](compose.yaml) deliberately keeps stdout on, so
-that `docker compose logs otel-logger` stays useful for a short sample run. Add
-`--no-stdout` and a `logging:` block before leaving that stack up permanently.
-
-### External rotators (newsyslog / logrotate)
-
-`otel-logger` does not re-open its output files on `SIGHUP`, which rules out
-the usual rename-then-signal rotation: once `logrotate` or `newsyslog` renames
-the file, the process keeps writing to the old descriptor, the new file stays
-empty, and the disk space is never reclaimed. `copytruncate` avoids the rename
-but loses whatever is written between the copy and the truncate, so it must
-never be pointed at the JSONL sink.
-
-The supported answer is to let `otel-logger` manage its own files — `--log-dir`
-rotates daily, `--log-keep-days` prunes — and to drop the human-readable stream
-with `--no-stdout`. If a permanent instance really has to keep stdout, pipe it
-into a consumer that rotates on its own (`multilog`, `rotatelogs`, journald)
-rather than into a rename-based rotator.
-
-## CI examples
-
-### GitHub Actions
-
-```yaml
-jobs:
-  ai-job:
-    runs-on: ubuntu-latest
-    services:
-      otel-logger:
-        image: ghcr.io/owayo/otel-logger:latest
-        ports:
-          - 4317:4317
-          - 4318:4318
-        options: >-
-          --health-cmd "/usr/local/bin/otel-logger --dry-run --grpc-addr 127.0.0.1:0 --http-addr 127.0.0.1:0 --no-stdout"
-          --health-interval 10s
-          --health-timeout 3s
-          --health-retries 3
-    env:
-      CLAUDE_CODE_ENABLE_TELEMETRY: "1"
-      OTEL_LOGS_EXPORTER: otlp
-      OTEL_METRICS_EXPORTER: otlp
-      OTEL_TRACES_EXPORTER: otlp
-      CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
-      OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code,deployment.environment=gha"
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm install -g @anthropic-ai/claude-code
-      - run: claude --print "your prompt here"
-```
-
-### GitLab CI
-
-```yaml
-ai-job:
-  image: node:20-bookworm-slim
-  services:
-    - name: ghcr.io/owayo/otel-logger:latest
-      alias: otel-logger
-  variables:
-    CLAUDE_CODE_ENABLE_TELEMETRY: "1"
-    OTEL_LOGS_EXPORTER: otlp
-    OTEL_METRICS_EXPORTER: otlp
-    OTEL_TRACES_EXPORTER: otlp
-    CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "1"
-    OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-logger:4318
-    OTEL_RESOURCE_ATTRIBUTES: "service.name=claude-code,deployment.environment=gitlab"
-  script:
-    - npm install -g @anthropic-ai/claude-code
-    - claude --print "your prompt here"
-```
-
-## OTLP proxy forwarding
-
-`otel-logger` can persist received OTLP payloads to JSONL **and** forward them to
-one or more upstream OTLP collectors at the same time. Anthropic (Claude Code)
-and OpenAI (Codex) traffic are split by `service.name` and can target separate
-endpoints.
-
-- **Requirement**: proxy forwarding requires a JSONL sink (`--log-file` or
-  `--log-dir`) so every accepted payload remains durable even when forwarding
-  fails. Automatic replay to the upstream is planned for Phase B.
-- **Routing defaults**: `claude-code` → the Anthropic route,
-  `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → the
-  OpenAI route. Override with a non-empty `service_names` list in the config to
-  add or replace; empty names are rejected at startup so resources without a
-  `service.name` cannot be routed accidentally.
-- **Precedence**: CLI transport and headers override a matching built-in route
-  in the config while reusing its endpoint, following CLI > environment >
-  config precedence without requiring the endpoint to be repeated.
-- **HTTP endpoint validation**: `http-protobuf` routes require an absolute
-  `http://` or `https://` URL. Query strings and fragments are rejected at
-  startup because OTLP signal paths (`/v1/logs`, `/v1/traces`, and
-  `/v1/metrics`) are appended to the configured endpoint.
-- **Failure semantics**: JSONL is persisted first, then the payload is
-  `try_send`'d to the per-route worker. Workers retry with exponential backoff
-  (by default, up to 8 retries after the initial attempt; 200ms → 30s cap).
-  The receive path is never blocked by the upstream, and shutdown cancels both
-  an in-flight request and backoff
-  immediately instead of waiting for the configured request timeout.
-- **Auth**: header values may be written as `env:VAR_NAME` to resolve from an
-  environment variable, so secrets never appear in `ps` output or config files.
-
-### CLI example
-
-```bash
-export ANTHROPIC_PROXY_TOKEN=xxxx
-export OPENAI_PROXY_TOKEN=yyyy
-
-otel-logger \
-  --log-file ./otel.jsonl \
-  --proxy-anthropic-endpoint https://collector.example.com:4317 \
-  --proxy-anthropic-header 'Authorization=env:ANTHROPIC_PROXY_TOKEN' \
-  --proxy-openai-endpoint https://openai-collector.example.com \
-  --proxy-openai-transport http-protobuf \
-  --proxy-openai-header 'Authorization=env:OPENAI_PROXY_TOKEN'
-```
-
-### TOML example
-
-```toml
-log-file = "/var/log/otel-logger/otel-logger.jsonl"
-
-[proxy]
-queue-capacity = 1024
-timeout-ms = 5000
-retry-max = 8
-
-[[proxy.routes]]
-name = "anthropic"
-transport = "grpc"
-endpoint = "https://collector.example.com:4317"
-[proxy.routes.headers]
-Authorization = "env:ANTHROPIC_PROXY_TOKEN"
-
-[[proxy.routes]]
-name = "openai"
-transport = "http-protobuf"
-endpoint = "https://openai-collector.example.com"
-[proxy.routes.headers]
-Authorization = "env:OPENAI_PROXY_TOKEN"
-```
-
-Add more `[[proxy.routes]]` blocks for internal collectors, staging clones, etc.
-A `service.name` claimed by more than one route is rejected at startup to
-prevent duplicate delivery.
-
-Per-route counters are exposed at `GET /stats`:
-
-```json
-{
-  "agents": { ... },
-  "proxy": {
-    "anthropic": { "sent": 42, "failed": 0, "dropped": 0, "queue_depth": 0 },
-    "openai":    { "sent": 17, "failed": 1, "dropped": 0, "queue_depth": 0 }
-  }
-}
-```
-
-`queue_depth` is the route's actual bounded-channel occupancy at snapshot time.
-It is derived directly from Tokio channel capacity, so concurrent receive
-operations cannot make the counter wrap or report a stale manually maintained
-value.
-
-### Phase B — crash-safe outbox (planned)
-
-The current implementation (Phase A) keeps every payload in JSONL, but a crash
-mid-forward can leave in-flight batches un-forwarded. Phase B will track the
-JSONL byte offset per route and catch up on restart, so that no payload is
-lost even across restarts. `--proxy-checkpoint-dir` is reserved for that
-follow-up work.
-
-## Cumulative usage stats
-
-`otel-logger` aggregates token / cost / duration usage from both agents and
-exposes the running totals two ways. Claude metrics provide the initial
-token/cost totals, while a matching API request log supersedes them and also
-provides request count/duration. Codex token usage is
-deduplicated across the two shapes Codex emits: current local and CI logs
-provide the most complete token counters on
-`codex.sse_event` / `response.completed`, and `codex.turn.token_usage`
-metrics remain the fallback when they are the first or only token source
-observed.
-
-| Agent       | tokens & cost                                            | request_count                       | duration                           | metadata                                                         |
-|-------------|----------------------------------------------------------|-------------------------------------|------------------------------------|------------------------------------------------------------------|
-| claude-code | metrics `claude_code.token.usage` + `claude_code.cost.usage` | log `claude_code.api_request`         | log `claude_code.api_request.duration_ms` | —                                                                |
-| codex       | first source per model: log `codex.sse_event` / `response.completed` or metric `codex.turn.token_usage` (Histogram, `total` ignored) | metric `codex.conversation.turn.count` | metric `codex.turn.e2e_duration_ms` | log/span event `codex.conversation_starts` for `provider`/`effort` |
-
-Anthropic logs strip variant suffixes from `model` (e.g. `claude-opus-4-7`)
-while metrics carry the full name (`claude-opus-4-7[1m]`). The aggregator
-canonicalizes log-side bare names to whichever full name was last seen on a
-metric, so 1M and standard variants do not fragment into separate buckets.
-Only `aggregationTemporality=DELTA` is honored; cumulative points are
-dropped with a warning.
-
-Codex emits both SSE completion logs and turn token metrics for the same
-usage. `otel-logger` accepts the first token source observed for each model
-and ignores the other source for that model's token counters to avoid
-double-counting. Real local logs contain both arrival orders; when metrics
-arrived first, their per-class totals exactly matched the later SSE values.
-`tool_token_count` is not added because it overlaps the other token classes.
-`cache_write_token_count` in SSE logs and the metric token type
-`cache_write_input` both contribute to `cache_creation_tokens`.
-Real logs also include tool-only `response.completed` events where
-`input_token_count == tool_token_count` and output/cache-read/cache-write/
-reasoning are all zero; Codex excludes those from turn metrics and
-`handle_responses` span usage, so `otel-logger` does not count them as token
-usage. An otherwise tool-only-shaped completion with positive cache-write
-usage remains counted. This was verified against a real CI log (Codex
-0.150.1, two conversations, 27 SSE completions): the SSE totals minus the
-tool-only events matched `codex.turn.token_usage` exactly for every token
-class (input 1,513,467 / output 17,618 / cached_input 1,316,096 /
-reasoning_output 9,550 / cache_write_input 0), so either arrival order
-produces the same cumulative numbers.
-The 2026-09-06 local capture from Codex 0.153.4 also showed a second
-`gpt-5.6-sol/xhigh` conversation continuing to emit SSE completions after the
-first conversation's turn-metric snapshot. Once Logs is selected for that
-model, it remains selected: the snapshot is skipped as a duplicate, while the
-later conversation's SSE usage continues to be counted.
-`session_task.turn` / `session_task.review` spans can also carry
-`codex.turn.token_usage.*`; those are mirrors of the same usage, so trace
-spans are not used as token sources.
-Depending on the tracing exporter, a span event may use its source location as
-the event name and carry the logical `codex.conversation_starts` name in the
-`event.name` attribute. Both that current shape and the legacy direct event
-name are accepted for provider/effort metadata. For log records, the logical
-name may be in the body, the `event.name` attribute, or the top-level
-`LogRecord.event_name`; all three forms are accepted.
-If Codex token logs arrive before `conversation_starts`, the temporary
-`effort=unknown` bucket is folded into the later provider/model/effort bucket
-when the session metadata arrives.
-When `conversation.id` is present on an SSE completion log, the aggregator
-uses only the matching `codex.conversation_starts` metadata — it never falls
-back to the last observed session of a different `conversation.id`. If the
-matching `conversation_starts` has not been seen yet, the entry lands in an
-`effort=unknown` bucket and is merged into the correct effort bucket once the
-metadata catches up. This keeps interleaved or long-running Codex
-conversations from moving token usage into the wrong effort bucket.
-Codex turn metrics do not carry `conversation.id` or reasoning effort. Their
-last-session fallback is therefore isolated by `service.name`, preventing a
-concurrent TUI (`codex_cli_rs`) and Exec (`codex_exec`) process from assigning
-one process's provider/effort metadata to the other's metrics.
-
-### `GET /stats` (always on)
-
-> **Note**
-> `/stats` is served from the same listener as OTLP/HTTP and requires no
-> authentication. It exposes cumulative token counts, USD cost, the
-> provider/model/effort breakdown and proxy forwarding counters. Since the
-> default bind is `0.0.0.0:4318`, keep the port off untrusted networks (bind to
-> `127.0.0.1`, or restrict it at the firewall) if those numbers are sensitive.
-
-```bash
-$ curl -s http://localhost:4318/stats | jq
-{
-  "started_at": "2026-05-08T...",
-  "last_updated": "2026-05-08T...",
-  "agents": {
-    "claude-code": {
-      "total": {
-        "request_count": 81,
-        "input_tokens": 65509,
-        "output_tokens": 85207,
-        "cache_read_tokens": 8924351,
-        "cache_creation_tokens": 724182,
-        "reasoning_output_tokens": 0,
-        "cost_usd": 10.871609,
-        "duration_ms": 1262136
-      },
-      "buckets": {
-        "anthropic/claude-opus-4-7[1m]/max": {
-          "provider": "anthropic",
-          "model": "claude-opus-4-7[1m]",
-          "effort": "max",
-          "request_count": 74,
-          "input_tokens": 1253,
-          "output_tokens": 82097,
-          "cache_read_tokens": 8924351,
-          "cache_creation_tokens": 671142,
-          "reasoning_output_tokens": 0,
-          "cost_usd": 10.715503,
-          "duration_ms": 1224418
-        }
-      }
-    },
-    "codex": {
-      "total": { "request_count": 8, "input_tokens": 2469774, "reasoning_output_tokens": 12744, ... },
-      "buckets": {
-        "OpenAI/gpt-5.5/xhigh":     { "provider": "OpenAI", "model": "gpt-5.5",     "effort": "xhigh", ... },
-        "OpenAI/gpt-5.4-mini/low":  { "provider": "OpenAI", "model": "gpt-5.4-mini", "effort": "low",   ... }
-      }
-    }
-  }
-}
-```
-
-Bucket keys are formatted as `provider/model/effort`; `/` and `%` inside each
-component are percent-encoded as `%2F` and `%25` so arbitrary telemetry labels
-cannot collide. Codex's `cost_usd` is always `0` because the OpenAI/ChatGPT
-side does not emit cost. This endpoint is always available — no flag required.
-
-### `--summary` (stdout, opt-in)
-
-When `--summary` (or `OTEL_LOGGER_SUMMARY=1` / `summary = true` in the config)
-is enabled, otel-logger appends a `[stats:<agent>]` block right after every
-batch that changes cumulative usage totals:
-
-```
-[stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=1262.400s since=2026-05-08T...
-        breakdown provider=anthropic model=claude-opus-4-7[1m] effort=max: requests=74 input=1253 output=82097 cache_read=8924351 cache_create=671142 reasoning=0 cost=$10.7155 duration=1234.560s
-        breakdown provider=anthropic model=claude-haiku-4-5-20251001 effort=unknown: requests=7 input=64256 output=3110 cache_read=0 cache_create=53040 reasoning=0 cost=$0.1561 duration=27.840s
-```
-
-Counters are process-lifetime cumulative; restarting otel-logger resets them.
-
-## Output format
-
-### stdout (pretty)
+### Output format
 
 Dynamic payload fields such as service names, span names, metric names, severity text, and attribute keys are escaped before printing.
 
-```
+```text
 [trace]  2026-05-07T22:01:14.123Z service=claude-code scope=anthropic.claude_code span=tool.call dur=812ms status=OK trace=4d2... span_id=8ab...
         attrs: {tool.name=Bash, exit_code=0}
 [log]    2026-05-07T22:01:14.456Z service=claude-code scope=anthropic.claude_code severity=INFO body="ran command"
 [metric] service=claude-code scope=anthropic.claude_code name=claude_code.tokens.input sum=[1234 {model=claude-sonnet-4-6}]
 ```
 
-### JSON Lines (`--log-file`)
-
-Each line is a JSON object with the original protobuf payload preserved
-(keys are in OTLP/JSON camelCase):
+In the JSON Lines file, each line is a JSON object with the original protobuf payload preserved (keys are in OTLP/JSON camelCase). Process the file with `jq` or feed it into your warehouse of choice.
 
 ```json
 {"kind":"traces","resourceSpans":[{"resource":{"attributes":[…]},"scopeSpans":[…]}]}
@@ -784,35 +190,83 @@ Each line is a JSON object with the original protobuf payload preserved
 {"kind":"logs","resourceLogs":[…]}
 ```
 
-Process the file with `jq` or feed it into your warehouse of choice.
+## Configuration
+
+`otel-logger` reads `$XDG_CONFIG_HOME/otel-logger/config.toml` on startup (falling back to `~/.config/otel-logger/config.toml`). Use `--config <PATH>` to point at a different file. Every key is optional; missing keys fall back to the built-in default. Precedence (highest wins): CLI flag > environment variable > config file > default.
+
+Generate a fully-commented starter file with `otel-logger init` (`--daemon` writes the preset for long-lived services):
+
+```bash
+otel-logger init
+```
+
+```toml
+# ~/.config/otel-logger/config.toml
+log-file = "/var/log/otel-logger/otel-logger.jsonl"
+# Or, daily-rotated output (mutually exclusive with `log-file`):
+# log-dir = "/var/log/otel-logger"
+# log-keep-days = 10                 # default: 10
+no-stdout = false
+summary = false
+color = "auto"  # "auto" | "always" | "never"
+# grpc-addr = "0.0.0.0:4317"
+# http-addr = "0.0.0.0:4318"
+```
+
+Path expansion, the retention rules of `log-dir` and the daemon preset: [docs/configuration.md](docs/configuration.md)
+
+## Running as a daemon
+
+A long-lived instance must run with `--no-stdout`: the receiver never rotates its stdout stream, and `--log-keep-days` only prunes the JSONL files written by `--log-dir`. One launchd-managed instance grew a 7.6 GB stdout file in 37 days before anyone looked. `otel-logger` warns on stderr at startup when stdout is not a terminal and the human-readable stream is still on.
+
+launchd and systemd units, Docker log drivers, and why rename-based rotators do not work: [docs/daemon.md](docs/daemon.md)
+
+## OTLP proxy forwarding
+
+`otel-logger` can persist received OTLP payloads to JSONL **and** forward them to upstream OTLP collectors at the same time. Claude Code and Codex traffic are split by `service.name` and can target separate endpoints; forwarding requires a JSONL sink (`--log-file` or `--log-dir`), and a slow upstream never blocks the receive path.
+
+```bash
+otel-logger \
+  --log-file ./otel.jsonl \
+  --proxy-anthropic-endpoint https://collector.example.com:4317 \
+  --proxy-anthropic-header 'Authorization=env:ANTHROPIC_PROXY_TOKEN'
+```
+
+Routing, retries, the TOML form and per-route counters: [docs/proxy.md](docs/proxy.md)
 
 ## Development
 
-```bash
-make build      # cargo build
-make test       # cargo test
-make check      # cargo check --all-targets
-make clippy     # cargo clippy --all-targets -- -D warnings
-make fmt        # cargo fmt
-make run        # run with --log-file ./otel-logger.jsonl
-make docker     # build the container image
-cargo audit     # scan Cargo.lock with the RustSec advisory database
+<!-- standard:dev:start -->
+Requires [mise](https://mise.jdx.dev/). Tool versions are pinned in `mise.toml`.
 
-# Replay saved JSONL back through the aggregator and print the resulting totals.
-# Verifies aggregation against real telemetry without starting a server, and
-# preserves arrival order so ordering-dependent double-counting bugs show up.
-cargo run --release --example replay_check -- otel-logger.jsonl
+```bash
+make setup   # Install the toolchain (mise) and dependencies
+make ci      # Run the same checks as CI (no changes)
 ```
 
-## How it works
+| Command | Description |
+|---|---|
+| `make setup` | Install the toolchain (mise) and dependencies |
+| `make build` | Build a debug binary |
+| `make release` | Build a release binary |
+| `make run` | Run the debug binary (arguments via ARGS="...") |
+| `make test` | Run the tests |
+| `make lint` | Run clippy with warnings as errors |
+| `make fmt` | Format the code (rewrites files) |
+| `make fmt-check` | Check the formatting (no changes) |
+| `make check` | Run fmt-check and lint (no changes) |
+| `make ci` | Run the same checks as CI (no changes) |
+| `make install` | Install the release binary to INSTALL_PATH (default /usr/local/bin) |
+| `make uninstall` | Remove the binary from INSTALL_PATH |
+| `make clean` | Remove build artifacts |
 
-- `tonic` exposes the three OTLP gRPC services (`TraceService`, `MetricsService`, `LogsService`) on port 4317.
-- `axum` serves `/v1/traces`, `/v1/metrics`, `/v1/logs` on port 4318 and accepts both `application/x-protobuf` (decoded with `prost`) and `application/json` (decoded via `serde`). The `Content-Type` media type is matched case-insensitively (RFC 9110), so values such as `Application/X-Protobuf; charset=utf-8` are accepted.
-- Both transports raise their per-request decode limit to 32 MiB (`OTLP_MAX_REQUEST_BYTES`) so a large batch is never permanently rejected by the 4 MiB / 2 MiB transport defaults.
-- `Content-Encoding: gzip` bodies are decompressed before decoding, and the 32 MiB limit is enforced on the decompressed body as the OTLP spec requires.
-- Both transports converge on a shared `Sink` that writes pretty stdout and lossless JSONL.
-- `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; gRPC/HTTP tasks are awaited before the final JSONL flush so the trailing batch never disappears.
+Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
+<!-- standard:dev:end -->
+
+Replaying saved JSONL through the aggregator, the dependency audit and the Docker targets: [docs/development.md](docs/development.md)
 
 ## License
 
+<!-- standard:license:start -->
 [MIT](LICENSE)
+<!-- standard:license:end -->
