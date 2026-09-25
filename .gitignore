@@ -28,3 +28,7 @@ otel-logger.jsonl
 
 # Local-only Docker Compose env (per-machine OTEL_LOGGER_DATA_DIR override).
 .env
+
+# Personal mise overrides (the shared tool versions live in mise.toml).
+mise.local.toml
+.mise.local.toml

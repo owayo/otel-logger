@@ -2,7 +2,7 @@
 name = "otel-logger"
 version = "26.7.100"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.98"
 description = "OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSONL"
 license = "MIT"
 repository = "https://github.com/owayo/otel-logger"

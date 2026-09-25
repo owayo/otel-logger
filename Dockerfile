@@ -3,7 +3,9 @@
 # ---------- chef ----------
 # cargo-chef で依存コンパイルをビルド間キャッシュする。tonic / opentelemetry-proto は
 # 初回コンパイルが数分かかるため、アプリ本体の変更と分離する。
-FROM rust:1.90-slim-bookworm AS chef
+# Rust の版は mise.toml の rust と同じにする (Cargo.toml の rust-version もこの版なので、
+# 古いイメージのままでは cargo がビルドを拒む)。
+FROM rust:1.98.1-slim-bookworm AS chef
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config \
