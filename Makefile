@@ -1,114 +1,170 @@
-.PHONY: build release install init init-force run dry-run clean test fmt fmt-check check clippy \
-        up up-d down restart logs stats compose-build compose-build-no-cache \
-        docker docker-run help
+# Development tasks for otel-logger. Run `make` with no arguments to list the targets.
+#
+# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
+# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
+# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
+# instead (the versions are then not guaranteed).
+#
+# The Docker targets (up, down, docker, ...) call docker directly; Docker is not managed by mise.
+#
+# Only GNU Make 3.81 features are used (the make that ships with macOS):
+# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := otel-logger
-INSTALL_PATH := /usr/local/bin
+INSTALL_PATH ?= /usr/local/bin
+# Cargo.lock is committed, so resolve dependencies exactly as CI does
+CARGO_FLAGS ?= --locked
+# Arguments for make run. The default writes JSON Lines next to the Makefile
+ARGS ?= --log-file ./otel-logger.jsonl
+# OTLP/HTTP listener that make stats queries
 HTTP_ADDR := http://localhost:4318
 
-# Cargo
+# ---- Toolchain ------------------------------------------------------------------
+# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
+# inherit the shell's PATH). Override with make MISE=/path/to/mise.
+# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
+ifeq ($(SYSTEM_TOOLS),1)
+RUN :=
+else
+ifndef MISE
+MISE := $(firstword $(shell command -v mise 2>/dev/null) $(wildcard $(MISE_CANDIDATES)))
+endif
+ifeq ($(MISE),)
+ifneq ($(filter-out help,$(or $(MAKECMDGOALS),help)),)
+$(error mise was not found. Install it from https://mise.jdx.dev, or add SYSTEM_TOOLS=1 to use the tools on PATH)
+endif
+endif
+RUN := $(if $(MISE),$(MISE) exec --,)
+endif
 
-build: ## debug build を作成する
-	cargo build
+.PHONY: help setup build release run dry-run init init-force test lint clippy fmt fmt-check check ci \
+        install uninstall clean up up-d down restart logs stats compose-build compose-build-no-cache \
+        docker docker-run
 
-release: ## release build を作成する
-	cargo build --release
+## Setup
 
-install: release ## release build を作成し /usr/local/bin へ install する
-	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
-	@if command -v codesign >/dev/null 2>&1; then \
-		codesign --force --sign - $(INSTALL_PATH)/$(BINARY_NAME); \
-	fi
+setup: ## Install the toolchain (mise) and dependencies
+	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
+	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-init: build ## ~/.config/otel-logger/config.toml を生成する (上書きしない)
+## Build
+
+build: ## Build a debug binary
+	$(RUN) cargo build $(CARGO_FLAGS)
+
+release: ## Build a release binary
+	$(RUN) cargo build --release $(CARGO_FLAGS)
+
+run: ## Run the debug binary (arguments via ARGS="..."). Default: --log-file ./otel-logger.jsonl
+	$(RUN) cargo run $(CARGO_FLAGS) -- $(ARGS)
+
+dry-run: ## Validate startup (config, listener bind) without serving
+	$(RUN) cargo run $(CARGO_FLAGS) -- --dry-run
+
+init: build ## Write ~/.config/otel-logger/config.toml (keeps an existing file)
 	./target/debug/$(BINARY_NAME) init
 
-init-force: build ## init と同じだが既存ファイルを上書きする
+init-force: build ## Same as init, but overwrites an existing file
 	./target/debug/$(BINARY_NAME) init -f
 
-run: ## 既定 port で receiver をローカル実行する
-	cargo run -- --log-file ./otel-logger.jsonl
+## Checks
 
-dry-run: ## port を bind せず起動処理だけ検証する
-	cargo run -- --dry-run
+test: ## Run the tests
+	$(RUN) cargo test $(CARGO_FLAGS)
 
-# 開発
+lint: ## Run clippy with warnings as errors
+	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
-test: ## test を実行する
-	cargo test
+clippy: lint ## Alias of lint
 
-fmt: ## code を format する
-	cargo fmt
+fmt: ## Format the code (rewrites files)
+	$(RUN) cargo fmt --all
 
-fmt-check: ## formatting を検証する
-	cargo fmt -- --check
+fmt-check: ## Check the formatting (no changes)
+	$(RUN) cargo fmt --all -- --check
 
-check: ## cargo check を実行する
-	cargo check --all-targets
+check: fmt-check lint ## Run fmt-check and lint (no changes)
 
-clippy: ## clippy を実行する
-	cargo clippy --all-targets -- -D warnings
+ci: check test ## Run the same checks as CI (no changes)
 
-clean: ## build artifact を削除する
-	cargo clean
+## Install
 
-# Docker Compose (既定 workflow)
+# Replace the binary through a temporary file and a rename instead of copying over it. macOS
+# caches the code signature check per inode, so a binary copied over one that is running (or ran
+# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
+# in the same directory so that the rename swaps the inode. On macOS the copy is ad-hoc signed
+# before the rename, so the installed file never appears without its final signature.
+install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
+	@mkdir -p "$(INSTALL_PATH)"
+	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
+	@if command -v codesign >/dev/null 2>&1; then \
+		codesign --force --sign - --identifier "$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"; \
+	fi
+	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-up: ## image を rebuild し otel-logger を foreground で起動する
+uninstall: ## Remove the binary from INSTALL_PATH
+	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
+
+clean: ## Remove build artifacts
+	$(RUN) cargo clean
+
+## Docker Compose (the default workflow for the sample stack)
+
+up: ## Rebuild the image and start otel-logger in the foreground
 	docker compose up --build otel-logger
 
-up-d: ## image を rebuild し otel-logger を detached で起動する
+up-d: ## Rebuild the image and start otel-logger in the background
 	docker compose up -d --build otel-logger
 
-down: ## compose stack を停止して削除する
+down: ## Stop and remove the compose stack
 	docker compose down
 
-restart: ## down + rebuild + up で全体を reset する (foreground)
+restart: ## Reset everything: down, rebuild and up (foreground)
 	docker compose down
 	docker compose up --build otel-logger
 
-logs: ## otel-logger container log を tail する
+logs: ## Follow the otel-logger container log
 	docker compose logs -f otel-logger
 
-stats: ## 起動中の otel-logger container に GET /stats を送る
+stats: ## Query GET /stats on the running otel-logger
 	curl -s $(HTTP_ADDR)/stats | jq
 
-compose-build: ## 起動せず image だけ build する (cache 使用)
+compose-build: ## Build the image without starting it (uses the cache)
 	docker compose build otel-logger
 
-compose-build-no-cache: ## cache を使わず最初から rebuild する (遅い)
+compose-build-no-cache: ## Rebuild the image from scratch without the cache (slow)
 	docker compose build --no-cache otel-logger
 
-# Docker (compose なしの standalone)
+## Docker (standalone, without compose)
 
-docker: ## standalone Docker image を build する
+docker: ## Build the standalone Docker image
 	docker build -t $(BINARY_NAME):dev .
 
-docker-run: docker ## JSONL directory を mount して standalone container を起動する
+docker-run: docker ## Run the standalone container with the JSONL directory mounted
 	docker run --rm -p 4317:4317 -p 4318:4318 \
 		-v $(CURDIR)/data:/var/log/otel-logger \
 		$(BINARY_NAME):dev \
 		--log-file /var/log/otel-logger/otel-logger.jsonl
 
-# Help
+## Help
 
-help: ## この help message を表示する
-	@echo "$(BINARY_NAME) build commands"
+help: ## Show this help
+	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "Usage: make <target>"
 	@echo ""
-	@echo "Targets:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Common workflows:"
-	@echo "  make init       # ~/.config/otel-logger/config.toml を書き出す"
-	@echo "  make up         # rebuild + start (foreground)"
-	@echo "  make up-d       # rebuild + start (detached)"
-	@echo "  make logs       # log を tail する"
-	@echo "  make stats      # 累計 usage stats を表示する"
-	@echo "  make restart    # full reset (down + rebuild + up)"
+	@echo "  make init       # write ~/.config/otel-logger/config.toml"
+	@echo "  make up         # rebuild and start the compose stack (foreground)"
+	@echo "  make up-d       # rebuild and start the compose stack (background)"
+	@echo "  make logs       # follow the container log"
+	@echo "  make stats      # show the cumulative usage stats"
+	@echo "  make restart    # full reset (down, rebuild, up)"
 	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "Tool versions are pinned in mise.toml. Run make setup first."
+	@echo "Release: GitHub Actions > Release > Run workflow"
