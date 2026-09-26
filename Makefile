@@ -1,30 +1,29 @@
-# Development tasks for otel-logger. Run `make` with no arguments to list the targets.
+# otel-logger の開発タスク。引数なしの `make` でターゲット一覧を表示する。
 #
-# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
-# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
-# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
-# instead (the versions are then not guaranteed).
+# ツールのバージョンは mise.toml に固定する。mise が使える場合、IDE や GUI から
+# 起動して shell で有効化されていなくても `mise exec --` 経由で固定版を使う。
+# SYSTEM_TOOLS=1 では PATH 上のツールを使うため、バージョンは保証されない。
 #
-# The Docker targets (up, down, docker, ...) call docker directly; Docker is not managed by mise.
+# Docker 関連のターゲットは docker を直接呼び、mise では管理しない。
 #
-# Only GNU Make 3.81 features are used (the make that ships with macOS):
-# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
+# macOS 付属の GNU Make 3.81 で使える機能に限る。
+# .ONESHELL、.SHELLFLAGS、$(file ...) と != は使わない。
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := otel-logger
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock is committed, so resolve dependencies exactly as CI does
+# Cargo.lock をコミットし、CI と同じ依存を解決する。
 CARGO_FLAGS ?= --locked
-# Arguments for make run. The default writes JSON Lines next to the Makefile
+# make run の引数。既定では Makefile の隣へ JSON Lines を書く。
 ARGS ?= --log-file ./otel-logger.jsonl
-# OTLP/HTTP listener that make stats queries
+# make stats が問い合わせる OTLP/HTTP の受信先。
 HTTP_ADDR := http://localhost:4318
 
-# ---- Toolchain ------------------------------------------------------------------
-# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
-# inherit the shell's PATH). Override with make MISE=/path/to/mise.
-# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+# ---- ツールチェーン --------------------------------------------------------------
+# mise を PATH と通常のインストール先から探す。GUI 経由では shell の PATH を
+# 継承しない場合がある。make MISE=/path/to/mise で指定できる。
+# mise なしの動作確認では MISE_CANDIDATES= で候補を空にする。
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -44,13 +43,13 @@ endif
         install uninstall clean up up-d down restart logs stats compose-build compose-build-no-cache \
         docker docker-run
 
-## Setup
+## 準備
 
 setup: ## Install the toolchain (mise) and dependencies
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build
+## ビルド
 
 build: ## Build a debug binary
 	$(RUN) cargo build $(CARGO_FLAGS)
@@ -70,7 +69,7 @@ init: build ## Write ~/.config/otel-logger/config.toml (keeps an existing file)
 init-force: build ## Same as init, but overwrites an existing file
 	./target/debug/$(BINARY_NAME) init -f
 
-## Checks
+## 検証
 
 test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
@@ -90,13 +89,13 @@ check: fmt-check lint ## Run fmt-check and lint (no changes)
 
 ci: check test ## Run the same checks as CI (no changes)
 
-## Install
+## インストール
 
-# Replace the binary through a temporary file and a rename instead of copying over it. macOS
-# caches the code signature check per inode, so a binary copied over one that is running (or ran
-# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
-# in the same directory so that the rename swaps the inode. The binary is not re-signed: the linker
-# already signs it ad hoc, and a fixed identifier would not keep permissions across versions.
+# バイナリは直接上書きせず、同じディレクトリの一時ファイルから rename で置き換える。
+# macOS は署名検証を inode ごとにキャッシュするため、直前まで動いていた実行ファイルを
+# 上書きすると起動直後に SIGKILL される場合がある (終了コード 137)。
+# リンカが ad-hoc 署名を付けるため再署名はしない。固定 identifier を付けても
+# バージョン間で権限は引き継がれない。
 install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
@@ -108,7 +107,7 @@ uninstall: ## Remove the binary from INSTALL_PATH
 clean: ## Remove build artifacts
 	$(RUN) cargo clean
 
-## Docker Compose (the default workflow for the sample stack)
+## Docker Compose (サンプル構成の既定の運用手順)
 
 up: ## Rebuild the image and start otel-logger in the foreground
 	docker compose up --build otel-logger
@@ -135,7 +134,7 @@ compose-build: ## Build the image without starting it (uses the cache)
 compose-build-no-cache: ## Rebuild the image from scratch without the cache (slow)
 	docker compose build --no-cache otel-logger
 
-## Docker (standalone, without compose)
+## Docker (Compose を使わない単体起動)
 
 docker: ## Build the standalone Docker image
 	docker build -t $(BINARY_NAME):dev .
@@ -146,7 +145,7 @@ docker-run: docker ## Run the standalone container with the JSONL directory moun
 		$(BINARY_NAME):dev \
 		--log-file /var/log/otel-logger/otel-logger.jsonl
 
-## Help
+## ヘルプ
 
 help: ## Show this help
 	@echo "Development tasks for $(BINARY_NAME)"

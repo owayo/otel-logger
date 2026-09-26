@@ -36,7 +36,7 @@
 
 ## 機能
 
-- **OTLP の 2 経路を 1 プロセスで受信**: OTLP/gRPC (4317) と OTLP/HTTP (4318)。HTTP は `application/x-protobuf` と `application/json` の両方を、gzip 圧縮の有無を問わず受け付ける
+- **OTLP の 2 経路を 1 プロセスで受信**: OTLP/gRPC (4317) と OTLP/HTTP (4318)。HTTP は `application/x-protobuf` と `application/json` の両方を、gzip 圧縮の有無を問わず受け付ける。1 リクエストの上限 32 MiB は解凍後のサイズで判定する
 - **読みやすい stdout**: severity 別に色分けする (リダイレクト時や `NO_COLOR` の設定時は色を付けない)。受信した payload の制御文字は terminal に届く前に escape する
 - **欠落のない JSON Lines**: 単一の追記ファイルか日次ローテーションのファイルに保存し、graceful shutdown 時に `fsync` する。書き込みに失敗したら HTTP `503` / gRPC `Unavailable` を返し、exporter に batch を捨てさせず再送させる
 - **Claude Code と Codex の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない

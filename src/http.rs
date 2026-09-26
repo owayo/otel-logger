@@ -423,6 +423,35 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// 圧縮後のサイズが小さくても、解凍後に上限を超える body は拒否する。
+    #[tokio::test]
+    async fn router_rejects_gzip_body_larger_than_the_otlp_limit_after_decompression() {
+        use std::io::Write as _;
+
+        use axum::body::Body;
+        use axum::http::Request;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let app = router(sink);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&vec![0u8; crate::server::OTLP_MAX_REQUEST_BYTES + 1])
+            .unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(encoder.finish().unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     /// `/v1/traces` と `/v1/metrics` も実際に配線されていること。logs だけを叩く
     /// テストしか無いと、handler を取り違えて配線しても気づけない。
     #[tokio::test]
