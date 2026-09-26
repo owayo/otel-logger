@@ -22,7 +22,7 @@ make release   # リリース版をビルドする
 cargo audit    # RustSec advisory database で Cargo.lock を検査する (cargo-audit は別に入れる)
 ```
 
-`make install` は release build を一時ファイルへコピーし、macOS では ad-hoc 署名してから `mv -f` で `/usr/local/bin/otel-logger` を置き換える (cp で上書きすると macOS で SIGKILL されるため)。
+`make install` は release build を一時ファイルへコピーし、`mv -f` で `/usr/local/bin/otel-logger` を置き換える (cp で上書きすると macOS で SIGKILL されるため。署名はリンカが付けた ad-hoc 署名のままでよい)。
 
 ## 実装上の注意
 
