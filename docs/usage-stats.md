@@ -98,14 +98,16 @@ curl -s http://localhost:4318/stats | jq
 
 Bucket keys are formatted as `provider/model/effort`; `/` and `%` inside each component are percent-encoded as `%2F` and `%25` so arbitrary telemetry labels cannot collide. Codex's `cost_usd` is always `0` because the OpenAI/ChatGPT side does not emit cost. This endpoint is always available — no flag required. With OTLP proxy forwarding enabled, the response also carries per-route counters under `proxy` ([proxy.md](proxy.md)).
 
-## `--summary` (stdout, opt-in)
+## `--summary` (human-readable output, opt-in)
 
-When `--summary` (or `OTEL_LOGGER_SUMMARY=1` / `summary = true` in the config) is enabled, otel-logger appends a `[stats:<agent>]` block right after every batch that changes cumulative usage totals:
+When `--summary` (or `OTEL_LOGGER_SUMMARY=1` / `summary = true` in the config) is enabled, otel-logger appends a `[stats:<agent>]` block right after every batch that changes cumulative usage totals, to every enabled human-readable destination — stdout and/or the `--pretty-log` files:
 
 ```text
 [stats:claude-code] requests=81 input=65509 output=85207 cache_read=8924351 cache_create=724182 reasoning=0 cost=$10.8716 duration=1262.400s since=2026-05-08T...
         breakdown provider=anthropic model=claude-opus-4-7[1m] effort=max: requests=74 input=1253 output=82097 cache_read=8924351 cache_create=671142 reasoning=0 cost=$10.7155 duration=1234.560s
         breakdown provider=anthropic model=claude-haiku-4-5-20251001 effort=unknown: requests=7 input=64256 output=3110 cache_read=0 cache_create=53040 reasoning=0 cost=$0.1561 duration=27.840s
 ```
+
+With both destinations off (`--no-stdout` without `--pretty-log`), the blocks are not written anywhere; `GET /stats` keeps returning the totals.
 
 Counters are process-lifetime cumulative; restarting otel-logger resets them.

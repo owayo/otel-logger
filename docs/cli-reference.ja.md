@@ -20,10 +20,11 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 | `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP バインドアドレス (protobuf / JSON 両対応)             |
 | `--log-file`   |       | (なし)           | `OTEL_LOGGER_LOG_FILE`    | 受信内容を JSON Lines で追記出力 (`--log-dir` と排他)        |
 | `--log-dir`    |       | (なし)           | `OTEL_LOGGER_LOG_DIR`     | 指定ディレクトリに日次ローテーションで JSONL を出力 (`otel-logger.YYYY-MM-DD`、ローカルタイム) |
-| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | `--log-dir` 利用時に保持する日数 (`0` を渡しても最低 1 日は残す) |
-| `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止 (常駐時は必須。[daemon.ja.md](daemon.ja.md) を参照) |
-| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に累計サマリーを stdout に追記       |
-| `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | `auto` / `always` / `never` (`NO_COLOR` を尊重)            |
+| `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | `--log-dir` 利用時に日次ファイル (JSONL と `--pretty-log` のファイル) を保持する日数 (`0` を渡しても最低 1 日は残す) |
+| `--no-stdout`  |       | `false`          | `OTEL_LOGGER_NO_STDOUT`   | 整形 stdout の出力を抑止 (常駐時は必須。[daemon.ja.md](daemon.ja.md) を参照)。`--pretty-log` と併用すると出力をファイルで残せる |
+| `--pretty-log` |       | `false`          | `OTEL_LOGGER_PRETTY_LOG`  | 人が読める出力を `<log-dir>/otel-logger.pretty.YYYY-MM-DD.log` (日次、ローカルタイム) にも書き出す。色は付けない。`--log-dir` が必須 |
+| `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に、累計サマリーを人が読める出力 (stdout と `--pretty-log` のファイルのうち有効なもの) に追記 |
+| `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | stdout の `auto` / `always` / `never` (`NO_COLOR` を尊重)。`--pretty-log` のファイルには色を付けない |
 | `--dry-run`    | `-n`  | `false`          |                           | 両 listener の同時 bind を含む起動チェックを実施して終了     |
 | `--proxy-anthropic-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | `service.name=claude-code` の受信 payload を転送する上流 OTLP endpoint (詳細は [proxy.ja.md](proxy.ja.md)) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` / `http-protobuf`                                    |
@@ -35,7 +36,7 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 | `--help`       | `-h`  |                  |                           | ヘルプ表示                                                 |
 | `--version`    | `-V`  |                  |                           | バージョン表示                                             |
 
-真偽値フラグ (`--no-stdout` / `--summary`) は、環境変数経由で `1` / `0`、`true` / `false`、`yes` / `no`、`on` / `off` のいずれの表記も受け付けます (systemd unit や compose の `OTEL_LOGGER_NO_STDOUT=1` がそのまま動きます)。明示的な `false` は設定ファイルの `true` に優先し、ドキュメント通りの優先順位になります。空文字の `OTEL_LOGGER_*` は「値が空」ではなく未設定として扱うため、`environment:` にプレースホルダを残しても起動を妨げません。
+真偽値フラグ (`--no-stdout` / `--pretty-log` / `--summary`) は、コマンドラインでは `=` の後に値を明示でき (`--pretty-log=false`)、環境変数経由では `1` / `0`、`true` / `false`、`yes` / `no`、`on` / `off` のいずれの表記も受け付けます (systemd unit や compose の `OTEL_LOGGER_NO_STDOUT=1` がそのまま動きます)。CLI や環境変数で明示した `false` は設定ファイルの `true` に優先し、ドキュメント通りの優先順位になります。空文字の `OTEL_LOGGER_*` は「値が空」ではなく未設定として扱うため、`environment:` にプレースホルダを残しても起動を妨げません。
 
 `OTEL_LOGGER_PROXY_*` の値は `--help` に表示しません (資格情報が入りうるため)。
 
@@ -47,7 +48,7 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 |---|---|---|
 | `--path` | `-p` | 出力先のパス (既定は受信サーバが読むパスと同じ `$XDG_CONFIG_HOME/otel-logger/config.toml`、未設定なら `~/.config/otel-logger/config.toml`) |
 | `--force` | `-f` | 既存のファイルを上書きする |
-| `--daemon` | | 常駐運用向けのプリセット (`no-stdout = true` と日次ローテーションの JSONL) を書き出す。書き出すのは設定ファイルだけで、サービス登録もバックグラウンド化も行わない |
+| `--daemon` | | 常駐運用向けのプリセット (`no-stdout = true` と日次ローテーションの JSONL。`pretty-log = true` はコメントアウトした状態で入る) を書き出す。書き出すのは設定ファイルだけで、サービス登録もバックグラウンド化も行わない |
 
 ```bash
 otel-logger init                    # → ~/.config/otel-logger/config.toml

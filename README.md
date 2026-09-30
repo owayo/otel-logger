@@ -29,7 +29,7 @@
 
 `otel-logger` is a tiny Rust OTLP receiver designed to sit next to AI coding agents — **Claude Code** and **OpenAI Codex CLI** — while they run inside CI containers. It accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`, decodes traces, metrics, and logs, and writes them in two ways:
 
-- **stdout**: human-readable, color-coded one-liner per record (great for CI logs).
+- **stdout**: human-readable, color-coded one-liner per record (great for CI logs). With `--pretty-log`, the same stream can also be kept as daily files in `--log-dir`.
 - **JSON Lines** (`--log-file` / `--log-dir`): lossless, schema-preserving for offline analysis, either as one append-only file or daily-rotated files.
 
 By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to capture what the agent emits during a CI job and surface it where developers already look. Optional OTLP proxy routes can forward the persisted payloads to upstream collectors.
@@ -37,7 +37,7 @@ By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to c
 ## Features
 
 - **Both OTLP transports in one process**: OTLP/gRPC (4317) and OTLP/HTTP (4318); HTTP accepts both `application/x-protobuf` and `application/json`, gzip-compressed or not. The 32 MiB request limit applies after decompression.
-- **Readable stdout**: severity-based colors (turned off when redirected or when `NO_COLOR` is set), with control characters in incoming payloads escaped before they reach the terminal
+- **Readable stdout**: severity-based colors (turned off when redirected or when `NO_COLOR` is set), with control characters in incoming payloads escaped before they reach the terminal; `--pretty-log` also keeps the stream as uncolored daily files in `--log-dir`
 - **Lossless JSON Lines**: one append-only file or daily-rotated files, `fsync`'d on graceful shutdown; a failed write returns HTTP `503` / gRPC `Unavailable` so exporters retry instead of dropping the batch
 - **Usage totals for Claude Code and Codex**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
 - **OTLP proxy forwarding**: optional routes that forward Claude Code and Codex payloads to separate upstream collectors after they are persisted
@@ -46,7 +46,7 @@ By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to c
 - **Small footprint**: a single static-ish binary (~7 MB stripped), a static musl build for systems without glibc (distroless, Alpine), and a distroless container image
 - **Ready-made examples**: Docker Compose, GitHub Actions, and GitLab CI
 
-Design details (request limits, the stdout writer, delivery guarantees): [docs/architecture.md](docs/architecture.md)
+Design details (request limits, the human-readable writers, delivery guarantees): [docs/architecture.md](docs/architecture.md)
 
 ## Installation
 
@@ -163,7 +163,7 @@ Running the receiver as a sidecar in Docker Compose, GitHub Actions and GitLab C
 
 ### Usage totals
 
-`GET /stats` always returns the cumulative Claude/Codex usage (tokens, cost, duration) per provider/model/effort as JSON, and `--summary` appends the same totals to stdout whenever a batch changes them. Claude API request logs are preferred over metrics for token/cost usage, and matching metrics are de-duplicated instead of being added twice.
+`GET /stats` always returns the cumulative Claude/Codex usage (tokens, cost, duration) per provider/model/effort as JSON, and `--summary` appends the same totals to the human-readable output (stdout and/or the `--pretty-log` files) whenever a batch changes them. Claude API request logs are preferred over metrics for token/cost usage, and matching metrics are de-duplicated instead of being added twice.
 
 ```bash
 curl -s http://localhost:4318/stats | jq
@@ -207,6 +207,7 @@ log-file = "/var/log/otel-logger/otel-logger.jsonl"
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10                 # default: 10
 no-stdout = false
+# pretty-log = true                  # requires `log-dir`: also write the human-readable stream to daily files
 summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
@@ -217,9 +218,9 @@ Path expansion, the retention rules of `log-dir` and the daemon preset: [docs/co
 
 ## Running as a daemon
 
-A long-lived instance must run with `--no-stdout`: the receiver never rotates its stdout stream, and `--log-keep-days` only prunes the JSONL files written by `--log-dir`. One launchd-managed instance grew a 7.6 GB stdout file in 37 days before anyone looked. `otel-logger` warns on stderr at startup when stdout is not a terminal and the human-readable stream is still on.
+A long-lived instance must run with `--no-stdout`: the receiver never rotates its stdout stream, and `--log-keep-days` only prunes the daily files it writes into `--log-dir`. One launchd-managed instance grew a 7.6 GB stdout file in 37 days before anyone looked. `otel-logger` warns on stderr at startup when stdout is not a terminal and the human-readable stream is still on. To keep that stream, add `--pretty-log`: it writes the same lines as daily files in `--log-dir`, pruned by `--log-keep-days`. It does not stop stdout, so `--no-stdout` is still required.
 
-launchd and systemd units, Docker log drivers, and why rename-based rotators do not work: [docs/daemon.md](docs/daemon.md)
+launchd and systemd units, keeping the human-readable stream as files, Docker log drivers, and why rename-based rotators do not work: [docs/daemon.md](docs/daemon.md)
 
 ## OTLP proxy forwarding
 

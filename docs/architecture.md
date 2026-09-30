@@ -8,7 +8,7 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 - `axum` serves `/v1/traces`, `/v1/metrics`, `/v1/logs` on port 4318 and accepts both `application/x-protobuf` (decoded with `prost`) and `application/json` (decoded via `serde`). The `Content-Type` media type is matched case-insensitively (RFC 9110), so values such as `Application/X-Protobuf; charset=utf-8` are accepted.
 - Both transports raise their per-request decode limit to 32 MiB (`OTLP_MAX_REQUEST_BYTES`) so a large batch is never permanently rejected by the 4 MiB / 2 MiB transport defaults.
 - `Content-Encoding: gzip` bodies are decompressed before decoding, and the 32 MiB limit is enforced on the decompressed body as the OTLP spec requires.
-- Both transports converge on a shared `Sink` that writes pretty stdout and lossless JSONL.
+- Both transports converge on a shared `Sink` that writes pretty stdout, the optional pretty log files (`--pretty-log`) and lossless JSONL.
 - `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; gRPC/HTTP tasks are awaited before the final JSONL flush so the trailing batch never disappears.
 
 ## Receiving
@@ -17,11 +17,18 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 - `Content-Encoding: gzip` requests are accepted (`OTEL_EXPORTER_OTLP_COMPRESSION=gzip`); the size limit applies to the decompressed body
 - gRPC/HTTP raise their per-request decode limit to 32 MiB (above `tonic`'s 4 MiB / `axum`'s 2 MiB defaults) so large batches are persisted instead of being permanently rejected with `RESOURCE_EXHAUSTED` / `413` that exporter retries cannot recover from
 
-## stdout stream
+## Human-readable stream (stdout and `--pretty-log`)
 
-- Color is chosen by severity and turned off automatically when stdout is redirected or `NO_COLOR` is set
-- Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal (JSONL output stays lossless)
-- Written by a dedicated writer task off the OTLP acknowledgement path, so a slow stdout reader (a paused pager, a stalled log driver) cannot stall responses. Blocking the ACK would make exporters time out and resend batches that were already persisted and counted. Overflowing output is dropped and reported; JSONL persistence, usage aggregation and proxy forwarding are unaffected
+- The same per-record lines, plus the `--summary` blocks, go to stdout, to the `--pretty-log` files (`<log-dir>/otel-logger.pretty.YYYY-MM-DD.log`), to both, or to neither; the two destinations are independent of each other ([daemon.md](daemon.md#keeping-the-human-readable-stream))
+- Color is chosen by severity on stdout only, and turned off automatically when stdout is redirected or `NO_COLOR` is set. The pretty log files never contain ANSI color codes, even with `color = "always"`
+- Hardens against terminal escape injection: ANSI escapes and other C0/C1 control characters in incoming payloads, including dynamic labels and attribute keys, are escaped before reaching the terminal or the pretty log files (JSONL output stays lossless)
+- Each destination has its own writer task and its own bounded queue (256 batches and 64 MiB of rendered text), off the OTLP acknowledgement path. A slow stdout reader (a paused pager, a stalled log driver) cannot stall responses or the pretty log, and a stalled pretty log cannot stall responses or stdout. Blocking the ACK would make exporters time out and resend batches that were already persisted and counted
+- Overflowing output is dropped and reported, with a warning at 1, 2, 4, 8, … dropped batches; JSONL persistence, usage aggregation and proxy forwarding are unaffected. A single batch whose rendered text alone exceeds 64 MiB is dropped and counted the same way, even when the queue is empty: escaping can inflate a payload several times (a NUL byte becomes the 8-character `\u{0000}`)
+- Write failures (a full disk, for example) never turn into OTLP errors. For the pretty log, and for stdout errors other than a broken pipe, they are reported once when failures start, with the underlying cause (such as `No space left on device`), then as a reminder at most every 10 minutes while writes keep failing, and once more when writes have stayed healthy for a minute
+- Writes count as recovered only when a write succeeds at least 60 seconds after the last failure. Failures that recur less than a minute apart stay one outage (one start message, then the 10-minute reminders) even if writes succeed in between, so a nearly full disk that alternates between success and failure does not produce a start/recover pair per batch. After a recovery has been reported, the next failure is reported right away as a new outage
+- A broken pipe on stdout (the reader is gone) permanently disables stdout output only; the pretty log keeps being written
+- Each batch is flushed to the kernel, but the pretty log files are not `fsync`'d on shutdown, so a power loss may lose the tail of a pretty file; JSONL remains the lossless record
+- The pretty log files carry the same sensitive attributes as the JSONL and rely on the same protection: the owner-only `--log-dir` directory (`0700` when `otel-logger` creates it)
 
 ## JSON Lines persistence
 
@@ -35,4 +42,5 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 
 - SIGINT and SIGTERM trigger a graceful shutdown, so no batch is lost under `docker stop`
 - The shutdown is bounded by a 10-second grace period: a client that declares a body and never finishes sending it cannot hold the process hostage and prevent the final `fsync`. A second signal abandons in-flight connections immediately
+- JSONL is flushed and `fsync`'d first; the two human-readable writers are then drained concurrently within one shared 5-second deadline, so a stdout stuck in a blocking write (a reader that stopped reading) cannot keep the process from exiting
 - Queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged

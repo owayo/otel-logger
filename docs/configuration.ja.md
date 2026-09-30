@@ -14,9 +14,18 @@
 
 **優先順位** (上が強い): CLI フラグ > 環境変数 > 設定ファイル > 既定値。相互排他のログ出力先にもこの優先順位が適用されます。`--log-file` を指定した場合は設定ファイル側の `log-dir` を無視し、`--log-dir` を指定した場合は設定ファイル側の `log-file` を無視します。
 
+`pretty-log` は、この優先順位で決まった出力先が `log-dir` であることを必要とします。設定ファイルに `log-dir` と `pretty-log = true` を書いていても、CLI で `--log-file` を指定すると起動時にエラーになります。JSONL の出力先が 1 つも無いまま `pretty-log` を有効にした場合も同じです。pretty のファイルを `log-file` の隣などへ暗黙に書き出すことはありません。
+
 ## `log-dir` の保持期間
 
-`log-dir` 利用時の保持期間 cleanup は、`otel-logger.YYYY-MM-DD` 形式かつ実在する暦日の日次ローテーションファイルだけを削除対象にします。同じディレクトリにある `otel-logger.pid`、`otel-logger.stderr.log`、単体の `otel-logger.jsonl` などは削除しません。`otel-logger.2026-99-99` のように日付として成立しない名前やシンボリックリンクも削除対象外です。
+`log-dir` 利用時、`log-keep-days` は次の 2 種類の日次ファイルに効きます。
+
+- JSONL のファイル `otel-logger.YYYY-MM-DD`
+- `pretty-log` のファイル `otel-logger.pretty.YYYY-MM-DD.log`
+
+更新日時 (mtime) が `log-keep-days` 日より古いファイルを、起動時と、稼働中に日付が変わったときに削除します (`0` を渡しても最低 1 日は残します)。`pretty-log` を無効に戻した後も、`log-dir` を使い続けている限り、古い pretty のファイルは引き続き削除されます。
+
+cleanup が削除するのはこの 2 種類の名前だけで、名前の日付が実在する暦日であるものに限ります。同じディレクトリにある `otel-logger.pid`、`otel-logger.stderr.log`、単体の `otel-logger.jsonl` などは削除しません。`otel-logger.2026-99-99` のように日付として成立しない名前、シンボリックリンク、末尾が正確に `.log` でない pretty 形式の名前 (`otel-logger.pretty.2026-09-30` や `otel-logger.pretty.2026-09-30.log.gz` など) も削除対象外です。
 
 ## テンプレート
 
@@ -38,6 +47,7 @@ log-file = "/var/log/otel-logger/otel-logger.jsonl"
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10                 # 既定: 10
 no-stdout = false
+# pretty-log = true                  # `log-dir` が必要: 人が読める出力を日次ファイルにも書き出す
 summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
@@ -53,11 +63,14 @@ log-keep-days = 10                 # 既定: 10
 # 代わりに単一ファイルへ追記する場合 (`log-dir` と排他。ローテーションはされない):
 # log-file = "/var/log/otel-logger/otel-logger.jsonl"
 no-stdout = true
+# pretty-log = true                # 人が読める出力を日次ファイルにも書き出す (ディスクを余分に使う)
 summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
 ```
+
+どちらのファイルにも `pretty-log = true` がコメントアウトした状態で入っています。有効にすると、人が読める出力を `log-dir` の日次ファイルにも書き出します。`no-stdout` とは独立した設定で、2 つの組み合わせは [daemon.ja.md](daemon.ja.md#人が読める出力を残す) にまとめています。
 
 ## proxy の route
 

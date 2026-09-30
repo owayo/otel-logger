@@ -29,7 +29,7 @@
 
 `otel-logger` は CI コンテナ上で動く AI コーディングエージェント (**Claude Code** / **OpenAI Codex CLI**) の隣に置く、Rust 製の小さな OTLP 受信サーバです。OTLP/gRPC を `:4317`、OTLP/HTTP を `:4318` で受け、Traces / Metrics / Logs をデコードして 2 つの経路に出力します。
 
-- **stdout**: 1 件ずつ整形した可読ログ (CI ログでそのまま読める)
+- **stdout**: 1 件ずつ整形した可読ログ (CI ログでそのまま読める)。`--pretty-log` を付けると、同じ出力を `--log-dir` に日次ファイルとしても残せる
 - **JSON Lines** (`--log-file` / `--log-dir`): 元の OTLP 構造を欠落させない永続化先。単一の追記ファイルまたは日次ローテーションファイルとして保存
 
 既定では Jaeger や Honeycomb への転送を行いません。CI 実行中にエージェントが吐くテレメトリを、開発者がいつも見ている場所 (CI ログ / アーティファクト) に出すことが主目的です。任意の OTLP proxy route を設定すると、永続化した payload を上流 collector にも転送できます。
@@ -37,7 +37,7 @@
 ## 機能
 
 - **OTLP の 2 経路を 1 プロセスで受信**: OTLP/gRPC (4317) と OTLP/HTTP (4318)。HTTP は `application/x-protobuf` と `application/json` の両方を、gzip 圧縮の有無を問わず受け付ける。1 リクエストの上限 32 MiB は解凍後のサイズで判定する
-- **読みやすい stdout**: severity 別に色分けする (リダイレクト時や `NO_COLOR` の設定時は色を付けない)。受信した payload の制御文字は terminal に届く前に escape する
+- **読みやすい stdout**: severity 別に色分けする (リダイレクト時や `NO_COLOR` の設定時は色を付けない)。受信した payload の制御文字は terminal に届く前に escape する。`--pretty-log` を付けると、同じ出力を色なしの日次ファイルとして `--log-dir` にも残す
 - **欠落のない JSON Lines**: 単一の追記ファイルか日次ローテーションのファイルに保存し、graceful shutdown 時に `fsync` する。書き込みに失敗したら HTTP `503` / gRPC `Unavailable` を返し、exporter に batch を捨てさせず再送させる
 - **Claude Code と Codex の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない
 - **OTLP proxy 転送**: 保存した Claude Code / Codex の payload を、それぞれ別の上流 collector へ転送できる (任意)
@@ -46,7 +46,7 @@
 - **小さな配布物**: stripped で約 7 MB の単一バイナリ、glibc の無い環境 (distroless、Alpine) 向けの musl 静的ビルド、distroless のコンテナイメージ
 - **すぐ使える利用例**: Docker Compose / GitHub Actions / GitLab CI
 
-設計の詳細 (リクエストの上限、stdout の writer、配送の保証): [docs/architecture.ja.md](docs/architecture.ja.md)
+設計の詳細 (リクエストの上限、人が読める出力の writer、配送の保証): [docs/architecture.ja.md](docs/architecture.ja.md)
 
 ## インストール
 
@@ -163,7 +163,7 @@ Docker Compose・GitHub Actions・GitLab CI で受信サーバをサイドカー
 
 ### 累計使用量
 
-`GET /stats` は、Claude/Codex の累計使用量 (token・コスト・所要時間) を provider/model/effort ごとに JSON で常に返します。`--summary` を付けると、batch で累計が変わるたびに同じ値を stdout にも追記します。token/cost は metrics より Claude の API request ログを優先し、対応する metrics は二重に加算しません。
+`GET /stats` は、Claude/Codex の累計使用量 (token・コスト・所要時間) を provider/model/effort ごとに JSON で常に返します。`--summary` を付けると、batch で累計が変わるたびに同じ値を人が読める出力 (stdout と `--pretty-log` のファイルのうち有効なもの) にも追記します。token/cost は metrics より Claude の API request ログを優先し、対応する metrics は二重に加算しません。
 
 ```bash
 curl -s http://localhost:4318/stats | jq
@@ -207,6 +207,7 @@ log-file = "/var/log/otel-logger/otel-logger.jsonl"
 # log-dir = "/var/log/otel-logger"
 # log-keep-days = 10                 # 既定: 10
 no-stdout = false
+# pretty-log = true                  # `log-dir` が必要: 人が読める出力を日次ファイルにも書き出す
 summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
@@ -217,9 +218,9 @@ color = "auto"  # "auto" | "always" | "never"
 
 ## 常駐運用
 
-常駐させるなら `--no-stdout` は必須です。otel-logger は stdout をローテーションせず、`--log-keep-days` が削除するのは `--log-dir` が書いた JSONL だけです。launchd で常駐させたインスタンスの stdout ファイルが、誰も気づかないまま 37 日で 7.6 GB まで膨らんだ例があります。stdout が端末でないのに人間向けの出力が有効なままなら、起動時に stderr へ警告を出します。
+常駐させるなら `--no-stdout` は必須です。otel-logger は stdout をローテーションせず、`--log-keep-days` が削除するのは `--log-dir` に書いた日次ファイルだけです。launchd で常駐させたインスタンスの stdout ファイルが、誰も気づかないまま 37 日で 7.6 GB まで膨らんだ例があります。stdout が端末でないのに人間向けの出力が有効なままなら、起動時に stderr へ警告を出します。人が読める出力を残したい場合は `--pretty-log` を足してください。同じ内容を `--log-dir` に日次ファイルとして書き出し、`--log-keep-days` で古いものを削除します。ただし stdout は止まらないため、`--no-stdout` はこの場合も必要です。
 
-launchd と systemd の設定例、Docker のログドライバ、rename 方式のローテータが使えない理由: [docs/daemon.ja.md](docs/daemon.ja.md)
+launchd と systemd の設定例、人が読める出力をファイルで残す方法、Docker のログドライバ、rename 方式のローテータが使えない理由: [docs/daemon.ja.md](docs/daemon.ja.md)
 
 ## OTLP proxy 転送
 
