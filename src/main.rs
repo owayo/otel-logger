@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -9,6 +10,14 @@ use otel_logger::path::expand_current_user_path;
 use otel_logger::server;
 use otel_logger::sink::Sink;
 use tokio_util::sync::CancellationToken;
+
+/// 受信処理を終えた後、残っている blocking task の完了を待つ上限。
+///
+/// `Runtime` を drop すると `spawn_blocking` の完了を無期限に待つ。読み手が止まった
+/// stdout の write(2) で人が読める出力の writer が止まっていると、SIGTERM を受けても
+/// プロセスが終わらず、launchd / systemd の SIGKILL まで居座る。JSONL の flush と fsync は
+/// `block_on` の中で完了しているので、ここで打ち切っても永続化は失われない。
+const BLOCKING_TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> Result<()> {
     clear_empty_otel_logger_env();
@@ -37,7 +46,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         // proxy 転送が設定されていれば router + worker を先に起動し、Sink に装着する。
         // shutdown token は server と共有し、Ctrl-C で worker も止める。
         let proxy_shutdown = CancellationToken::new();
@@ -62,6 +71,7 @@ fn main() -> Result<()> {
                 grpc = %grpc,
                 http = %http,
                 log_sink = ?settings.log_sink,
+                pretty_log_dir = ?settings.pretty_log_dir,
                 "dry run: probed both listeners successfully, exiting"
             );
             sink.flush().await?;
@@ -80,7 +90,9 @@ fn main() -> Result<()> {
             handle.join().await;
         }
         run_result
-    })
+    });
+    runtime.shutdown_timeout(BLOCKING_TASK_SHUTDOWN_GRACE);
+    result
 }
 
 /// stdout がローテーションされないまま増え続ける構成なら、起動時に一度だけ警告する。
@@ -96,14 +108,18 @@ fn warn_if_stdout_unrotated(settings: &Settings) {
     tracing::warn!(
         "stdout is not a terminal and human-readable output is enabled. \
          otel-logger never rotates stdout, so the redirect target grows without bound \
-         (`--log-keep-days` only applies to JSONL). \
+         (`--log-keep-days` only applies to the daily files in `--log-dir`). \
          Pass `--no-stdout` (or set `no-stdout = true`) for unattended runs; \
-         `otel-logger init --daemon` generates such a config. \
+         to keep the human-readable output, also pass `--pretty-log` (or set \
+         `pretty-log = true`) to write it as daily-rotated files in `--log-dir`. \
+         `otel-logger init --daemon` generates a config for unattended runs. \
          / stdout が端末ではない状態で、人が読める出力が有効です。\
          otel-logger は stdout をローテーションしないため、リダイレクト先が際限なく\
-         肥大化します (`--log-keep-days` は JSONL にしか適用されません)。\
+         肥大化します (`--log-keep-days` は `--log-dir` 内の日次ファイルにしか適用されません)。\
          常駐運用では `--no-stdout` (または設定ファイルの `no-stdout = true`) を\
-         使ってください。`otel-logger init --daemon` がその設定を生成します。"
+         使ってください。人が読める出力を残したい場合は、`--pretty-log` (または\
+         `pretty-log = true`) も指定すると `--log-dir` に日次ローテーション付きのファイルとして\
+         書き出します。`otel-logger init --daemon` が常駐運用向けの設定を生成します。"
     );
 }
 

@@ -31,7 +31,8 @@ const DAEMON_HEADER_NOTE: &str = r#"#
 # このファイルは `otel-logger init --daemon` が生成した常駐運用向けの設定です。
 # otel-logger は stdout をローテーションしないため、人が読める出力は止めて、記録は
 # 日次ローテーション付きの JSONL に任せます。累計は停止せず、HTTP endpoint
-# `GET /stats` から取得できます。
+# `GET /stats` から取得できます。人が読める出力も残したい場合は、下の `pretty-log` で
+# `log-dir` の日次ファイルへ書き出せます。
 "#;
 
 /// 既定 profile の JSONL 出力先。手元で試す用途を想定し、単一ファイルへの追記を既定にする。
@@ -76,28 +77,46 @@ const DEFAULT_OUTPUT_SECTION: &str = r#"
 # 生成する設定は最初から `true` です)。
 no-stdout = false
 
+# 人が読める出力を `log-dir` にも日次ファイル (ローカル時刻で日ごとの
+# `otel-logger.pretty.YYYY-MM-DD.log`) として書き出します。色は付けず、`log-keep-days` で
+# JSONL と一緒に整理されます。stdout とは独立した出力先なので、stdout を止めるには
+# `no-stdout = true` を併用してください。`log-dir` を使う場合だけ指定できます
+# (`log-file` と組み合わせると起動時にエラーになります)。
+# pretty-log = true
+
 # Claude/Codex の使用量更新時に、累計サマリー (input/output/cache tokens、cost、
-# provider/model/effort 別内訳) を stdout へ追記します。HTTP endpoint `GET /stats` は
-# このフラグに関係なく常に有効です。
+# provider/model/effort 別内訳) を人が読める出力 (stdout と `pretty-log` のファイル) へ
+# 追記します。HTTP endpoint `GET /stats` はこのフラグに関係なく常に有効です。
 summary = false
 "#;
 
 /// 常駐 profile の stdout 出力設定。stdout はローテーションされないので既定で止める。
+///
+/// `pretty-log` は既定で無効にしてコメントで案内する。JSONL が既に lossless な記録を
+/// 残しているので、人が読める出力の保存は容量と書き込みを追加で使う選択機能になるため。
 const DAEMON_OUTPUT_SECTION: &str = r#"
 # 人が読める stdout 出力を抑止します。otel-logger は stdout をローテーションしないため、
 # 常駐運用では `true` のままにしてください。集計と HTTP endpoint `GET /stats` は
 # この設定に関係なく動き続けます。
 no-stdout = true
 
-# Claude/Codex の使用量更新時に、累計サマリーを stdout へ追記します。
-# `no-stdout = true` の間は出力されません (`GET /stats` は常に有効です)。
+# 人が読める出力を、stdout の代わりに `log-dir` の日次ファイル (ローカル時刻で日ごとの
+# `otel-logger.pretty.YYYY-MM-DD.log`) へ書き出します。色は付けず、`log-keep-days` で
+# JSONL と一緒に整理されます。JSONL に加えてディスクを使う (実測で JSONL の 4 分の 1
+# 程度) ため、既定では無効です。
+# pretty-log = true
+
+# Claude/Codex の使用量更新時に、累計サマリーを人が読める出力へ追記します。
+# `no-stdout = true` の間は、`pretty-log = true` のときだけ日次ファイルへ出力されます
+# (`GET /stats` は常に有効です)。
 summary = false
 "#;
 
 /// profile によらず共通の末尾 (色設定、bind address、proxy 転送)。
 const COMMON_CONFIG_TAIL: &str = r#"
 # stdout の色設定: "auto" | "always" | "never"。`auto` は NO_COLOR を尊重し、
-# stdout が TTY でない場合は ANSI code を出しません。
+# stdout が TTY でない場合は ANSI code を出しません。`pretty-log` のファイルには
+# この設定に関係なく色を付けません。
 color = "auto"
 
 # bind address。既定値は 0.0.0.0:4317 (OTLP/gRPC) と 0.0.0.0:4318 (OTLP/HTTP) です。
@@ -200,9 +219,11 @@ pub struct Config {
     pub log_keep_days: Option<u32>,
     /// 人が読める stdout 出力を抑止する。
     pub no_stdout: Option<bool>,
-    /// 使用量更新時に stdout へ累計サマリーを追記する。
+    /// 人が読める出力を `log_dir` にも日次ファイルとして書き出す (`log_dir` 指定時のみ有効)。
+    pub pretty_log: Option<bool>,
+    /// 使用量更新時に、人が読める出力 (stdout / `pretty_log`) へ累計サマリーを追記する。
     pub summary: Option<bool>,
-    /// 人が読める stdout 出力の色設定。
+    /// 人が読める stdout 出力の色設定 (`pretty_log` のファイルには色を付けない)。
     pub color: Option<ColorMode>,
     /// OTLP proxy 転送設定。ここで route を定義すると、受信 payload を JSONL に
     /// 保存しつつ、`service.name` で振り分けた上流 collector にも forward する。
@@ -438,6 +459,7 @@ grpc-addr = "127.0.0.1:14317"
 http-addr = "127.0.0.1:14318"
 log-file = "/tmp/test.jsonl"
 no-stdout = true
+pretty-log = true
 summary = true
 color = "never"
 "#,
@@ -448,6 +470,7 @@ color = "never"
         assert_eq!(config.http_addr.unwrap().to_string(), "127.0.0.1:14318");
         assert_eq!(config.log_file.unwrap(), PathBuf::from("/tmp/test.jsonl"));
         assert_eq!(config.no_stdout, Some(true));
+        assert_eq!(config.pretty_log, Some(true));
         assert_eq!(config.summary, Some(true));
         assert_eq!(config.color, Some(crate::cli::ColorMode::Never));
     }
@@ -549,6 +572,26 @@ color = "never"
         assert!(daemon.contains("\nno-stdout = true\n"));
         assert!(daemon.contains("常駐運用向けの設定です"));
         assert!(!default.contains("常駐運用向けの設定です"));
+    }
+
+    /// どちらの profile も `pretty-log` は既定で無効 (コメント) にし、外せばそのまま使える
+    /// 1 行で案内する。案内の行が壊れていると、コメントを外した利用者が起動時の
+    /// TOML エラーで初めて気づくことになる。
+    #[test]
+    fn both_profiles_offer_pretty_log_as_a_commented_line() {
+        for profile in [InitProfile::Default, InitProfile::Daemon] {
+            let template = render_config_template(profile);
+            assert!(
+                template.contains("\n# pretty-log = true\n"),
+                "{profile:?} はコメントで pretty-log を案内する"
+            );
+            let as_written: Config = toml::from_str(&template).unwrap();
+            assert_eq!(as_written.pretty_log, None, "{profile:?} の既定は無効");
+
+            let enabled = template.replace("\n# pretty-log = true\n", "\npretty-log = true\n");
+            let enabled: Config = toml::from_str(&enabled).unwrap();
+            assert_eq!(enabled.pretty_log, Some(true));
+        }
     }
 
     #[test]

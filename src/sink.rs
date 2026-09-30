@@ -1,11 +1,12 @@
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::{self, BufWriter as StdBufWriter, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use time::OffsetDateTime;
+use tokio::sync::{mpsc, oneshot};
 
 use anyhow::{Context, Result};
 use logroller::{LogRoller, LogRollerBuilder, Rotation, RotationAge, TimeZone};
@@ -19,7 +20,16 @@ use crate::cli::{LogSink, Settings};
 use crate::format;
 use crate::forward::ProxyRouter;
 
+/// 日次 JSONL のファイル名 `otel-logger.YYYY-MM-DD` の前半。
 const ROTATION_PREFIX: &str = "otel-logger";
+
+/// `--pretty-log` の日次ファイル名 `otel-logger.pretty.YYYY-MM-DD.log` の前半と拡張子。
+///
+/// JSONL の `otel-logger.YYYY-MM-DD` と区別できる名前にする。JSONL 側の厳密な名前判定
+/// (日付部分が 10 文字の実在暦日) にも、logroller が JSONL 用に組む
+/// `^otel-logger\.\d{4}-\d{2}-\d{2}$` にも一致しない。
+const PRETTY_LOG_PREFIX: &str = "otel-logger.pretty";
+const PRETTY_LOG_SUFFIX: &str = "log";
 
 /// poison した mutex から回復して guard を返す。
 ///
@@ -71,6 +81,10 @@ enum JsonlWriter {
 /// エラーにならないまま prosess 終了時に全データが消える「無音のログ全損」になる。
 /// 保持は mtime と実在暦日を検証する `cleanup_old_rotated_logs` に一本化し、
 /// 日付が変わったタイミングで呼び直す。
+///
+/// 同じディレクトリに書く `--pretty-log` の日次ファイルの整理もこの writer が受け持つ。
+/// writer ごとにディレクトリを掃除させると 2 者が同じファイルを消し合ううえ、
+/// `--pretty-log` を無効に戻した後に残った古いファイルを誰も整理しなくなるため。
 struct RotatedWriter {
     roller: StdMutex<LogRoller>,
     dir: PathBuf,
@@ -111,6 +125,11 @@ impl RotatedWriter {
     ///
     /// どのファイルが書き込み中かを logroller が公開しないため、保持対象の日次
     /// ファイルをまとめて fsync する。shutdown 時の 1 回だけなのでコストは無視できる。
+    ///
+    /// 対象は JSONL の日次ファイルだけで、`--pretty-log` のファイルは含めない。人が読める
+    /// 出力は best-effort で、lossless な記録は JSONL が持つ。しかも pretty writer は
+    /// この時点で queue を書き終えていない (drain は JSONL の fsync の後) ため、ここで
+    /// 同期しても末尾は保証できない。
     fn sync_rotated_files(&self) -> Result<()> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -208,112 +227,443 @@ pub struct Sink {
     inner: Arc<SinkInner>,
 }
 
-/// stdout writer の状態。
+/// 人が読める出力キューの深さ (batch 数)。出力先ごとに持つ。
 ///
-/// stdout 出力はベストエフォートだが、読み手が消えた後 (`otel-logger | head` の終了、
-/// pager の終了など) も batch ごとに書き込みを試すと、失敗のたびに stderr へ error を
-/// 積み上げることになる。stdout の肥大化を止めた先で stderr が同じ問題を起こさないよう、
-/// 最初の `BrokenPipe` で以後の pretty / summary 出力を止める。
+/// 読み手が遅い場合 (`| less` でスクロールを止める、launchd / systemd / Docker log
+/// driver の読み出しが一時的に詰まる、pretty-log のディスクが遅い等) でも、OTLP の ACK を
+/// 止めないための緩衝。溢れた分は捨てる。
+const PRETTY_QUEUE_CAPACITY: usize = 256;
+
+/// 出力先ごとの queue に積める rendered 文字列の合計バイト数。
+///
+/// 件数の上限だけでは memory の上限にならない。1 リクエストは `OTLP_MAX_REQUEST_BYTES`
+/// (32MiB) まで受け付けるため、大きな batch を展開した文字列が 256 件溜まると、
+/// 出力先 1 つで数 GB に届きうる。超えた分は件数の超過と同じく捨てる
+/// (人が読める出力はベストエフォートで、JSONL 側に payload は残っている)。
+const PRETTY_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// `flush()` が pretty writer の追いつきを待つ上限。全出力先で 1 つの期限を共有する。
+/// 出力先が完全に詰まっている場合に shutdown を人質に取られないようにする。
+const PRETTY_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 書き込みの失敗が続いている間に、状況を再通知する間隔。
+const PRETTY_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// 最後の失敗からこの時間が過ぎた後の成功で、はじめて「回復した」とみなす。
+///
+/// 空き容量がわずかなディスクのように、小さい batch は書けて大きい batch は落ちる状態では
+/// 成功と失敗が交互に来る。成功 1 回で回復とみなすと、batch ごとに「失敗し始めた」
+/// 「回復した」を出して stderr を伸ばすうえ、直後の失敗を間引くと「回復した」が
+/// 最後の通知のまま実際には失敗し続ける、という誤解を招く。
+const PRETTY_RECOVERY_QUIET_PERIOD: Duration = Duration::from_secs(60);
+
+/// 書き込み失敗の通知を、出力先ごとに間引くための状態。
+///
+/// 失敗のたびに error を出すと、ディスクが埋まっている間じゅう batch ごとに stderr が
+/// 伸びる (stderr もローテーションされない)。かといって最初の 1 回だけでは、数日続いて
+/// 回復しない障害の手掛かりが最初の 1 行しか残らない。そこで、失敗し始めた時に 1 回、
+/// 続いている間は `PRETTY_FAILURE_REPORT_INTERVAL` ごとに 1 回、回復した時に 1 回だけ
+/// 知らせる。失敗が `PRETTY_RECOVERY_QUIET_PERIOD` より短い間隔で繰り返す間は、成功が
+/// 挟まっても 1 つの障害として扱う。
 #[derive(Debug, Default)]
-struct StdoutState {
-    /// stdout の読み手が消えた (EPIPE) かどうか。
-    broken_pipe: bool,
+struct WriteHealth {
+    /// 失敗が続いている区間。`None` なら障害は起きていない。
+    failing: Option<FailureStreak>,
 }
 
-impl StdoutState {
-    /// この batch を stdout へ書くべきか。pipe が閉じた後は書かない。
+/// 失敗が続いている 1 区間。
+#[derive(Debug)]
+struct FailureStreak {
+    since: Instant,
+    failures: u64,
+    /// この区間で最後に失敗した時刻。回復の判定に使う。
+    last_failure: Instant,
+    /// この区間で最後に通知した時刻。
+    last_report: Instant,
+}
+
+/// `WriteHealth` が求める通知。
+#[derive(Debug, PartialEq, Eq)]
+enum HealthReport {
+    /// 何も出さない。
+    Silent,
+    /// 失敗し始めた。
+    Started,
+    /// 失敗が続いている。
+    Ongoing { failures: u64, elapsed: Duration },
+    /// 回復した。
+    Recovered { failures: u64, elapsed: Duration },
+}
+
+impl WriteHealth {
+    fn on_failure(&mut self, now: Instant) -> HealthReport {
+        let Some(streak) = self.failing.as_mut() else {
+            self.failing = Some(FailureStreak {
+                since: now,
+                failures: 1,
+                last_failure: now,
+                last_report: now,
+            });
+            return HealthReport::Started;
+        };
+        streak.failures = streak.failures.saturating_add(1);
+        streak.last_failure = now;
+        if now.saturating_duration_since(streak.last_report) < PRETTY_FAILURE_REPORT_INTERVAL {
+            return HealthReport::Silent;
+        }
+        streak.last_report = now;
+        HealthReport::Ongoing {
+            failures: streak.failures,
+            elapsed: now.saturating_duration_since(streak.since),
+        }
+    }
+
+    fn on_success(&mut self, now: Instant) -> HealthReport {
+        match self.failing.as_ref() {
+            Some(streak)
+                if now.saturating_duration_since(streak.last_failure)
+                    >= PRETTY_RECOVERY_QUIET_PERIOD =>
+            {
+                let report = HealthReport::Recovered {
+                    failures: streak.failures,
+                    elapsed: now.saturating_duration_since(streak.since),
+                };
+                self.failing = None;
+                report
+            }
+            // 障害が無い、または直前まで失敗していた (まだ回復とみなさない)。
+            _ => HealthReport::Silent,
+        }
+    }
+
+    /// 障害が続いていれば、失敗件数・障害の経過時間・最後の失敗からの経過時間。
+    fn unresolved(&self, now: Instant) -> Option<(u64, Duration, Duration)> {
+        self.failing.as_ref().map(|streak| {
+            (
+                streak.failures,
+                now.saturating_duration_since(streak.since),
+                now.saturating_duration_since(streak.last_failure),
+            )
+        })
+    }
+}
+
+/// pretty writer 1 本分の状態。
+#[derive(Debug, Default)]
+struct PrettyWriterState {
+    /// stdout の読み手が消えた (EPIPE)。以後この出力先には書かない。
+    ///
+    /// 読み手が消えた後 (`otel-logger | head` の終了、pager の終了など) も batch ごとに
+    /// 書き込みを試すと、失敗のたびに stderr へ error を積み上げることになる。
+    /// EPIPE は telemetry の欠落ではないので、JSONL 永続化・累計集計・proxy 転送は続け、
+    /// OTLP 側のエラーにも変換しない。
+    broken_pipe: bool,
+    health: WriteHealth,
+}
+
+impl PrettyWriterState {
+    /// この batch を書くべきか。stdout の pipe が閉じた後は書かない。
     fn should_write(&self) -> bool {
         !self.broken_pipe
     }
-}
 
-/// stdout 書き込みの結果を state に反映し、呼び出し元へ返す結果へ変換する。
-///
-/// `BrokenPipe` は「読み手が居なくなった」だけで telemetry の欠落ではないため、
-/// 以後の stdout 出力を止めたうえで `Ok` を返す。JSONL 永続化・累計集計・proxy 転送は
-/// 続行し、OTLP 側のエラーにも変換しない。それ以外の I/O error は一時的な可能性が
-/// あるため、停止させずそのまま呼び出し元 (= tracing への記録) に返す。
-fn classify_stdout_result(state: &mut StdoutState, result: io::Result<()>) -> Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-            state.broken_pipe = true;
-            tracing::warn!(
-                "stdout closed (broken pipe); disabling human-readable output. \
-                 JSONL persistence, usage aggregation and proxy forwarding continue. \
-                 / stdout が閉じられた (broken pipe) ため、人が読める出力を停止します。\
-                 JSONL 永続化・累計集計・proxy 転送は継続します。"
-            );
-            Ok(())
+    /// 書き込み結果を状態に反映し、必要な診断ログを出す。返り値はテストで検証する。
+    ///
+    /// EPIPE で止めるのは stdout だけ。pretty-log のファイルが EPIPE を返すことは
+    /// 通常ないが、返しても一時的な失敗として扱い、恒久停止させない。それ以外の
+    /// I/O error も一時的な可能性があるため、止めずに次の batch で書き直す。
+    fn record_result(
+        &mut self,
+        target: &PrettyTarget,
+        result: io::Result<()>,
+        now: Instant,
+    ) -> HealthReport {
+        match result {
+            Ok(()) => {
+                let report = self.health.on_success(now);
+                log_health(target.name(), &report, None);
+                report
+            }
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe && target.is_stdout() => {
+                self.broken_pipe = true;
+                tracing::warn!(
+                    "stdout closed (broken pipe); disabling human-readable output on stdout. \
+                     JSONL persistence, usage aggregation, proxy forwarding and `--pretty-log` \
+                     continue. / stdout が閉じられた (broken pipe) ため、stdout への人が読める\
+                     出力を停止します。JSONL 永続化・累計集計・proxy 転送・`--pretty-log` は\
+                     継続します。"
+                );
+                HealthReport::Silent
+            }
+            Err(e) => {
+                let report = self.health.on_failure(now);
+                let error = anyhow::Error::new(e).context(format!("write to {}", target.name()));
+                log_health(target.name(), &report, Some(&error));
+                report
+            }
         }
-        Err(e) => Err(anyhow::Error::new(e)).context("write to stdout"),
+    }
+
+    /// shutdown 時点でも障害が回復していなければ、最後の状況を 1 回だけ記録する。
+    fn report_unresolved_at_shutdown(&self, target: &PrettyTarget, now: Instant) {
+        if let Some((failures, elapsed, since_last_failure)) = self.health.unresolved(now) {
+            tracing::warn!(
+                destination = target.name(),
+                failed_batches = failures,
+                failing_for_secs = elapsed.as_secs(),
+                last_failure_secs_ago = since_last_failure.as_secs(),
+                "human-readable output had not recovered from write failures at shutdown"
+            );
+        }
     }
 }
 
-/// stdout pretty 出力キューの深さ。
+/// `WriteHealth` の通知を tracing へ出す。
 ///
-/// stdout の読み手が遅い場合 (`| less` でスクロールを止める、launchd / systemd /
-/// Docker log driver の読み出しが一時的に詰まる等) でも、OTLP の ACK を止めないための
-/// 緩衝。溢れた分は捨てる。
-const PRETTY_QUEUE_CAPACITY: usize = 256;
+/// 原因は `{:#}` で chain ごと文字列にしてから Debug で記録する。anyhow の Display は
+/// 最外の context しか出さず、実ログでは `error=write to stdout` だけで原因が
+/// 分からなかった。Debug にするのは、パスなどに紛れた制御文字をそのまま端末へ
+/// 出さないため。
+fn log_health(destination: &str, report: &HealthReport, error: Option<&anyhow::Error>) {
+    let error = error.map(|e| format!("{e:#}"));
+    match report {
+        HealthReport::Silent => {}
+        HealthReport::Started => tracing::error!(
+            destination,
+            error = ?error,
+            "failed to write human-readable output; repeated failures are reported every \
+             {} minutes until it recovers. JSONL persistence is unaffected. \
+             / 人が読める出力の書き込みに失敗しました。回復するまで、続く失敗は {} 分ごとに\
+             まとめて報告します。JSONL 永続化には影響しません。",
+            PRETTY_FAILURE_REPORT_INTERVAL.as_secs() / 60,
+            PRETTY_FAILURE_REPORT_INTERVAL.as_secs() / 60,
+        ),
+        HealthReport::Ongoing { failures, elapsed } => tracing::warn!(
+            destination,
+            error = ?error,
+            failed_batches = failures,
+            failing_for_secs = elapsed.as_secs(),
+            "human-readable output is still failing"
+        ),
+        HealthReport::Recovered { failures, elapsed } => tracing::info!(
+            destination,
+            failed_batches = failures,
+            failing_for_secs = elapsed.as_secs(),
+            "human-readable output recovered"
+        ),
+    }
+}
 
-/// `flush()` が pretty writer の追いつきを待つ上限。
-/// stdout が完全に詰まっている場合に shutdown を人質に取られないようにする。
-const PRETTY_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 人が読める出力の書き出し先。
+#[derive(Clone)]
+enum PrettyTarget {
+    /// プロセスの stdout (fd 1)。所有者は親プロセスなので、otel-logger はローテーションしない。
+    Stdout,
+    /// `--pretty-log`: `log-dir` 内の日次ファイル (`otel-logger.pretty.YYYY-MM-DD.log`)。
+    /// otel-logger 自身が開いたファイルなので、保存先も保持期間も分かっている。
+    File(Arc<StdMutex<LogRoller>>),
+    /// テスト用: 書いた内容を溜める。
+    #[cfg(test)]
+    Capture(Arc<StdMutex<Vec<u8>>>),
+    /// テスト用: gate が開くまで書き込みを止める (読み手が止まった stdout の代わり)。
+    #[cfg(test)]
+    Stall(Arc<(StdMutex<bool>, std::sync::Condvar)>),
+}
 
-/// pretty 出力の 1 単位。
+impl PrettyTarget {
+    /// 診断ログに載せる出力先の名前。
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::File(_) => "pretty-log",
+            #[cfg(test)]
+            Self::Capture(_) | Self::Stall(_) => "test",
+        }
+    }
+
+    fn is_stdout(&self) -> bool {
+        matches!(self, Self::Stdout)
+    }
+
+    /// 1 batch 分を書いて flush する。blocking I/O なので `spawn_blocking` から呼ぶ。
+    fn write_blocking(&self, rendered: &str, summary: Option<&str>) -> io::Result<()> {
+        match self {
+            Self::Stdout => {
+                let stdout = io::stdout();
+                let mut handle = stdout.lock();
+                write_pretty_to(&mut handle, rendered, summary)
+            }
+            Self::File(roller) => {
+                let mut roller = lock_recovering(roller);
+                write_pretty_to(&mut *roller, rendered, summary)
+            }
+            #[cfg(test)]
+            Self::Capture(buf) => write_pretty_to(&mut *lock_recovering(buf), rendered, summary),
+            #[cfg(test)]
+            Self::Stall(gate) => {
+                let (open, opened) = &**gate;
+                let mut open = lock_recovering(open);
+                while !*open {
+                    open = opened.wait(open).unwrap_or_else(|p| p.into_inner());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 人が読める出力の 1 単位。
 ///
-/// stdout への書き込みを OTLP の ACK 経路から切り離すために、専用 writer task へ渡す。
+/// 書き込みを OTLP の ACK 経路から切り離すために、出力先ごとの専用 writer task へ渡す。
 /// ACK 経路で待つと、読み手が遅いだけで全 batch の応答が止まり、exporter の timeout →
 /// retry によって同じ payload が JSONL へ二重に書かれ、累計も二重計上される。
 struct PrettyJob {
-    rendered: String,
+    /// 出力先の色設定で render 済みの文字列。色設定が同じ出力先どうしで共有する。
+    rendered: Arc<str>,
     want_summary: bool,
     /// `flush()` が使う同期点。channel は FIFO なので、この job が処理された時点で
     /// 先行する job はすべて出力済み。
-    sync: Option<tokio::sync::oneshot::Sender<()>>,
+    sync: Option<oneshot::Sender<()>>,
 }
 
-/// pretty 出力を直列に書き出す専用 task。
+/// 人が読める出力先 1 つ分の受け渡し口。
 ///
-/// writer が 1 本なので record 同士が interleave せず、`stdout_lock` のような
-/// 粗い排他も要らない。累計 snapshot も「書く直前」に取るため、snapshot 順と
-/// 出力順が一致し、出力上で累計が逆行しない。
+/// 出力先ごとに queue・writer task・捨てた件数・失敗の状態を分ける。1 本の writer で
+/// 両方へ書くと、止まった stdout が pretty-log まで止め、逆も同様になる。同じ record を
+/// 独立に書き出すので、捨てた batch や summary の時点は出力先ごとに異なりうる。
+struct PrettyOutput {
+    /// 診断ログに載せる出力先の名前。
+    name: &'static str,
+    /// この出力先向けに色付きで render するか。
+    color: bool,
+    tx: mpsc::Sender<PrettyJob>,
+    /// queue に積まれている (処理中を含む) rendered 文字列の合計バイト数。
+    queued_bytes: Arc<AtomicUsize>,
+    /// `queued_bytes` の上限。
+    max_queued_bytes: usize,
+    /// 追いつかずに捨てた batch 数。
+    dropped: AtomicU64,
+}
+
+impl PrettyOutput {
+    /// 出力先の writer task を起動し、受け渡し口を返す。
+    fn spawn(target: PrettyTarget, color: bool, aggregator: Arc<Aggregator>) -> Self {
+        let (tx, rx) = mpsc::channel::<PrettyJob>(PRETTY_QUEUE_CAPACITY);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let name = target.name();
+        tokio::spawn(run_pretty_writer(
+            rx,
+            target,
+            Arc::clone(&queued_bytes),
+            aggregator,
+            color,
+        ));
+        Self {
+            name,
+            color,
+            tx,
+            queued_bytes,
+            max_queued_bytes: PRETTY_QUEUE_MAX_BYTES,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// 1 batch 分を queue に積む。溢れたら待たずに捨てる。
+    fn enqueue(&self, rendered: Arc<str>, want_summary: bool) {
+        let len = rendered.len();
+        let queued = self.queued_bytes.fetch_add(len, AtomicOrdering::Relaxed);
+        // queue が空でも上限を超える batch は通さない。制御文字を多く含む payload は escape で
+        // 数倍に膨らむ (NUL 1 byte → `\u{0000}` 8 byte) ため、32MiB の request 1 つが上限を
+        // 大きく超えうる。出力先が止まっている間それを抱え続けると、上限の意味が無くなる。
+        let over_budget = queued.saturating_add(len) > self.max_queued_bytes;
+        let job = PrettyJob {
+            rendered,
+            want_summary,
+            sync: None,
+        };
+        if over_budget || self.tx.try_send(job).is_err() {
+            // queue が詰まっている = 読み手が遅い、または writer が停止した。
+            // 人が読める出力はベストエフォートなので捨てる。JSONL 永続化・累計集計・
+            // proxy 転送は既に完了しているため、telemetry の欠測にはならない。
+            self.queued_bytes.fetch_sub(len, AtomicOrdering::Relaxed);
+            let dropped = self.dropped.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    destination = self.name,
+                    dropped_total = dropped,
+                    "human-readable output writer is behind; dropping output. \
+                     JSONL persistence, usage aggregation and proxy forwarding are unaffected. \
+                     / 人が読める出力の書き出しが追いつかないため、出力を捨てています。\
+                     JSONL 永続化・累計集計・proxy 転送には影響しません。"
+                );
+            }
+        }
+    }
+
+    /// queue 済みの出力を writer が書き終えるまで待つ。
+    ///
+    /// channel は FIFO なので、同期 job が処理された時点で末尾の summary まで出力済み。
+    /// 同期 job の enqueue と完了待ちの両方を `deadline` で打ち切る (出力先が完全に
+    /// 詰まっていても shutdown を人質に取らせない)。
+    async fn drain(&self, deadline: tokio::time::Instant) {
+        let (sync_tx, sync_rx) = oneshot::channel();
+        let job = PrettyJob {
+            rendered: Arc::from(""),
+            want_summary: false,
+            sync: Some(sync_tx),
+        };
+        let drained = tokio::time::timeout_at(deadline, async move {
+            self.tx.send(job).await.ok()?;
+            sync_rx.await.ok()
+        })
+        .await;
+        if !matches!(drained, Ok(Some(()))) {
+            tracing::warn!(
+                destination = self.name,
+                "human-readable output did not drain before shutdown; some output was lost"
+            );
+        }
+    }
+}
+
+/// 出力先 1 つ分の人が読める出力を直列に書き出す専用 task。
+///
+/// writer が出力先ごとに 1 本なので record 同士が interleave せず、`stdout_lock` のような
+/// 粗い排他も要らない。累計 snapshot も「書く直前」に取るため、出力先ごとに
+/// snapshot 順と出力順が一致し、出力上で累計が逆行しない。
 async fn run_pretty_writer(
-    mut rx: tokio::sync::mpsc::Receiver<PrettyJob>,
+    mut rx: mpsc::Receiver<PrettyJob>,
+    target: PrettyTarget,
+    queued_bytes: Arc<AtomicUsize>,
     aggregator: Arc<Aggregator>,
     color: bool,
 ) {
-    let mut state = StdoutState::default();
+    let mut state = PrettyWriterState::default();
     while let Some(job) = rx.recv().await {
         if state.should_write() && !job.rendered.is_empty() {
             let summary = job
                 .want_summary
                 .then(|| format::render_summary(&aggregator.snapshot(), color));
-            let rendered = job.rendered;
-            let joined = tokio::task::spawn_blocking(move || -> io::Result<()> {
-                let stdout = io::stdout();
-                let mut handle = stdout.lock();
-                write_pretty_to(&mut handle, &rendered, summary.as_deref())
+            let writer = target.clone();
+            let rendered = Arc::clone(&job.rendered);
+            let result = tokio::task::spawn_blocking(move || {
+                writer.write_blocking(&rendered, summary.as_deref())
             })
-            .await;
-            match joined {
-                Ok(result) => {
-                    if let Err(e) = classify_stdout_result(&mut state, result) {
-                        tracing::error!(error = %e, "failed to write stdout");
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "stdout writer task failed"),
-            }
+            .await
+            // writer の panic も書き込みの失敗として数え、次の batch で書き直す。
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+            state.record_result(&target, result, Instant::now());
         }
+        queued_bytes.fetch_sub(job.rendered.len(), AtomicOrdering::Relaxed);
         if let Some(sync) = job.sync {
+            state.report_unresolved_at_shutdown(&target, Instant::now());
             let _ = sync.send(());
         }
     }
 }
 
 /// pretty 出力と (必要なら) 累計サマリーを 1 つの writer へ書き出す。
-/// stdout handle を直接触らないので、error 経路を単体テストできる。
+/// 出力先の handle を直接触らないので、error 経路を単体テストできる。
 fn write_pretty_to<W: io::Write>(
     writer: &mut W,
     rendered: &str,
@@ -327,20 +677,23 @@ fn write_pretty_to<W: io::Write>(
 }
 
 struct SinkInner {
-    stdout_enabled: bool,
-    color: bool,
     summary_enabled: bool,
     file: Option<JsonlWriter>,
-    /// pretty 出力の受け渡し口 (stdout 無効なら `None`)。実際の書き込みは
-    /// `run_pretty_writer` が直列に行うため、telemetry payload が 1 record で多くの行に
-    /// 展開されても interleave しない。
-    pretty_tx: Option<tokio::sync::mpsc::Sender<PrettyJob>>,
-    /// stdout が追いつかず捨てた pretty 出力の件数。
-    pretty_dropped: AtomicU64,
+    /// stdout への人が読める出力 (`--no-stdout` なら `None`)。
+    stdout: Option<PrettyOutput>,
+    /// `--pretty-log` の日次ファイルへの人が読める出力 (無効なら `None`)。
+    pretty_log: Option<PrettyOutput>,
     aggregator: Arc<Aggregator>,
     /// OTLP proxy 転送ルーター (未設定なら `None`)。JSONL 永続化が成功した後で
     /// service.name で振り分けて `try_send` する。
     proxy: Option<ProxyRouter>,
+}
+
+impl SinkInner {
+    /// 有効な人が読める出力先。
+    fn pretty_outputs(&self) -> impl Iterator<Item = &PrettyOutput> {
+        self.stdout.iter().chain(self.pretty_log.iter())
+    }
 }
 
 impl Sink {
@@ -354,9 +707,8 @@ impl Sink {
         settings: &Settings,
         proxy: Option<ProxyRouter>,
     ) -> Result<Self> {
-        let stdout_enabled = !settings.no_stdout;
-        let color = settings.color.enabled_for_stdout() && stdout_enabled;
-
+        // JSONL を先に開く。directory sink の起動時 cleanup を、pretty-log の writer が
+        // 当日のファイルを作るより前に済ませるため。
         let file = match settings.log_sink.as_ref() {
             None => None,
             Some(LogSink::File(path)) => {
@@ -384,20 +736,40 @@ impl Sink {
         };
 
         let aggregator = Arc::new(Aggregator::new());
-        let pretty_tx = stdout_enabled.then(|| {
-            let (tx, rx) = tokio::sync::mpsc::channel::<PrettyJob>(PRETTY_QUEUE_CAPACITY);
-            tokio::spawn(run_pretty_writer(rx, Arc::clone(&aggregator), color));
-            tx
+        let stdout = (!settings.no_stdout).then(|| {
+            PrettyOutput::spawn(
+                PrettyTarget::Stdout,
+                settings.color.enabled_for_stdout(),
+                Arc::clone(&aggregator),
+            )
         });
+        let pretty_log = match settings.pretty_log_dir.as_ref() {
+            None => None,
+            Some(dir) => {
+                let dir = dir.clone();
+                tracing::info!(
+                    dir = %dir.display(),
+                    "pretty log: writing human-readable output as daily files in directory"
+                );
+                let roller = tokio::task::spawn_blocking(move || open_pretty_log_sync(&dir))
+                    .await
+                    .context("join open_pretty_log task")??;
+                // ファイルは検索・共有・長期閲覧用なので、`color = "always"` でも色を付けない。
+                // ANSI を後から取り除くのではなく、最初から色なしで render する。
+                Some(PrettyOutput::spawn(
+                    PrettyTarget::File(Arc::new(StdMutex::new(roller))),
+                    false,
+                    Arc::clone(&aggregator),
+                ))
+            }
+        };
 
         Ok(Self {
             inner: Arc::new(SinkInner {
-                stdout_enabled,
-                color,
                 summary_enabled: settings.summary,
                 file,
-                pretty_tx,
-                pretty_dropped: AtomicU64::new(0),
+                stdout,
+                pretty_log,
                 aggregator,
                 proxy,
             }),
@@ -420,7 +792,8 @@ impl Sink {
     /// JSONL 出力が設定されている場合、永続化に失敗したら `Err` を返す。受信した
     /// payload を欠落なく保存する方針なので、失敗を握りつぶさず呼び出し元 (HTTP / gRPC
     /// handler) に伝え、OTLP exporter 側で retry できるようにする。
-    /// stdout はベストエフォートで、書き込みに失敗しても tracing にだけ記録する。
+    /// 人が読める出力 (stdout / pretty-log) はベストエフォートで、書き込みに失敗しても
+    /// tracing にだけ記録する。
     pub async fn record(&self, record: TelemetryRecord) -> Result<()> {
         if self.inner.file.is_some() {
             self.write_jsonl(&record)
@@ -437,12 +810,10 @@ impl Sink {
         };
         let want_summary = samples_present && self.inner.summary_enabled;
 
-        // stdout への書き込みは ACK 経路から切り離す (fire-and-forget)。ここで待つと、
+        // 人が読める出力は ACK 経路から切り離す (fire-and-forget)。ここで待つと、
         // 読み手が遅いだけで全 batch の応答が止まり、exporter の timeout → retry で
         // 同じ payload が JSONL へ二重に書かれ、累計も二重計上される。
-        if self.inner.stdout_enabled {
-            self.queue_pretty(&record, want_summary);
-        }
+        self.queue_pretty(&record, want_summary);
 
         // JSONL 永続化と集計が成功した batch だけを proxy に流す。
         // ここでは fire-and-forget (bounded channel の try_send)。
@@ -467,40 +838,26 @@ impl Sink {
         .context("join JSONL write task")?
     }
 
-    /// pretty 出力を writer task へ渡す。累計 snapshot は writer 側で取るので、
-    /// ここでは render だけ行う (CPU バウンドでブロックしない)。
+    /// 人が読める出力を出力先ごとの writer task へ渡す。累計 snapshot は writer 側で
+    /// 取るので、ここでは render だけ行う (CPU バウンドでブロックしない)。
     fn queue_pretty(&self, record: &TelemetryRecord, want_summary: bool) {
-        let Some(tx) = self.inner.pretty_tx.as_ref() else {
-            return;
-        };
-        let job = PrettyJob {
-            rendered: format::render(record, self.inner.color),
-            want_summary,
-            sync: None,
-        };
-        if tx.try_send(job).is_err() {
-            // queue が詰まっている = stdout の読み手が遅い、または writer が停止した。
-            // stdout はベストエフォートなので捨てる。JSONL 永続化・累計集計・proxy 転送は
-            // 既に完了しているため、telemetry の欠測にはならない。
-            let dropped = self
-                .inner
-                .pretty_dropped
-                .fetch_add(1, AtomicOrdering::Relaxed)
-                + 1;
-            if dropped.is_power_of_two() {
-                tracing::warn!(
-                    dropped_total = dropped,
-                    "stdout writer is behind; dropping human-readable output. \
-                     JSONL persistence, usage aggregation and proxy forwarding are unaffected. \
-                     / stdout の書き出しが追いつかないため、人が読める出力を捨てています。\
-                     JSONL 永続化・累計集計・proxy 転送には影響しません。"
-                );
-            }
+        // 色設定ごとに 1 回だけ render して出力先の間で共有する。stdout を色なしで
+        // 出している (端末でない、`NO_COLOR`) なら、pretty-log と同じ文字列を使い回せる。
+        let mut rendered: [Option<Arc<str>>; 2] = [None, None];
+        for output in self.inner.pretty_outputs() {
+            let text = rendered[usize::from(output.color)]
+                .get_or_insert_with(|| Arc::from(format::render(record, output.color)));
+            output.enqueue(Arc::clone(text), want_summary);
         }
     }
 
     /// buffer 済み書き込みを flush する。SIGTERM でも末尾 batch を失わないよう、
     /// graceful shutdown から呼び出す。
+    ///
+    /// 人が読める出力は writer が batch ごとに flush しているので、ここでは queue の
+    /// 書き出しを待つだけにする。以前はこの後に `io::stdout().flush()` を待っていたが、
+    /// writer が stdout の write(2) で止まっていると stdout の lock が解けず、
+    /// drain の上限を過ぎても shutdown が無期限に止まっていた。
     pub async fn flush(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -511,40 +868,28 @@ impl Sink {
         })
         .await
         .context("join JSONL flush task")??;
-        self.drain_pretty().await;
-        // terminal 接続時の stdout は line-buffered なので、spawn_blocking で best-effort flush する。
-        let _ = tokio::task::spawn_blocking(|| {
-            let _ = io::stdout().flush();
-        })
-        .await;
+        self.drain_pretty_until(tokio::time::Instant::now() + PRETTY_FLUSH_TIMEOUT)
+            .await;
         Ok(())
     }
 
-    /// pretty writer が queue 済みの出力を書き終えるのを待つ。
+    /// 全出力先の writer が queue 済みの出力を書き終えるのを、共有の期限まで並行に待つ。
     ///
-    /// channel は FIFO なので、同期 job が処理された時点で末尾の summary まで出力済み。
-    /// stdout が完全に詰まっている場合に shutdown を人質に取られないよう、待ちには
-    /// 上限を設ける (stdout はベストエフォートで、JSONL 側に payload は残っている)。
-    async fn drain_pretty(&self) {
-        let Some(tx) = self.inner.pretty_tx.as_ref() else {
-            return;
-        };
-        let (sync_tx, sync_rx) = tokio::sync::oneshot::channel();
-        let job = PrettyJob {
-            rendered: String::new(),
-            want_summary: false,
-            sync: Some(sync_tx),
-        };
-        let sent = tokio::time::timeout(PRETTY_FLUSH_TIMEOUT, tx.send(job)).await;
-        if !matches!(sent, Ok(Ok(()))) {
-            return;
-        }
-        if tokio::time::timeout(PRETTY_FLUSH_TIMEOUT, sync_rx)
-            .await
-            .is_err()
-        {
-            tracing::warn!("stdout writer did not drain before shutdown; some output was lost");
-        }
+    /// 出力先ごとに順番に待つと、止まった stdout が期限を使い切り、後ろの pretty-log は
+    /// 1 件も書き出せないまま打ち切られる。期限を過ぎた分は捨てる (人が読める出力は
+    /// ベストエフォートで、JSONL 側に payload は残っている)。
+    async fn drain_pretty_until(&self, deadline: tokio::time::Instant) {
+        tokio::join!(
+            drain_pretty_output(self.inner.stdout.as_ref(), deadline),
+            drain_pretty_output(self.inner.pretty_log.as_ref(), deadline)
+        );
+    }
+}
+
+/// 出力先が有効なら、その writer の drain を `deadline` まで待つ。
+async fn drain_pretty_output(output: Option<&PrettyOutput>, deadline: tokio::time::Instant) {
+    if let Some(output) = output {
+        output.drain(deadline).await;
     }
 }
 
@@ -588,8 +933,29 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
     })
 }
 
-/// mtime 基準で `keep_days` より古い `otel-logger.*` ファイルを削除する。
-/// claw-hooks の `cleanup_old_logs` と揃え、社内 CLI 間で挙動を一貫させる。
+/// `--pretty-log` の日次ファイル writer を開く。
+///
+/// JSONL と同じく logroller の日次ローテーション (ローカル時刻) を使い、同じ日付境界で
+/// ファイルを切り替える。`max_keep_files` は JSONL と同じ理由で設定しない
+/// (`RotatedWriter` の doc comment)。古いファイルの整理は、同じディレクトリの JSONL
+/// writer が `cleanup_old_rotated_logs` でまとめて行う。
+fn open_pretty_log_sync(dir: &Path) -> Result<LogRoller> {
+    // 通常は JSONL の directory sink が先に作っているが、単独でも 0700 で作る。
+    crate::path::create_private_dir(dir)
+        .with_context(|| format!("create log directory {}", dir.display()))?;
+    LogRollerBuilder::new(dir, Path::new(PRETTY_LOG_PREFIX))
+        .rotation(Rotation::AgeBased(RotationAge::Daily))
+        .time_zone(TimeZone::Local)
+        .suffix(PRETTY_LOG_SUFFIX.to_string())
+        .build()
+        .map_err(|e| anyhow::anyhow!("build pretty log roller: {e}"))
+}
+
+/// mtime 基準で `keep_days` より古い otel-logger の日次ファイル (JSONL と `--pretty-log`) を
+/// 削除する。claw-hooks の `cleanup_old_logs` と揃え、社内 CLI 間で挙動を一貫させる。
+///
+/// `--pretty-log` が無効でも pretty の日次ファイルを対象にする。無効に戻した後に
+/// 残ったファイルを整理する主体が他に無いため。
 fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
     // `exists()` は権限エラーや symlink loop も `false` に潰すため、保持期間が
     // 実際には効いていないのに起動が成功してしまう。`try_exists()` で区別する。
@@ -620,7 +986,7 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
         let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !is_rotated_log_filename(filename) {
+        if daily_log_kind(filename).is_none() {
             continue;
         }
         // 失敗を握り潰すと、保持期間が実際には効いていなくても起動が成功してしまい、
@@ -647,10 +1013,44 @@ fn cleanup_old_rotated_logs(dir: &Path, keep_days: u32) -> Result<()> {
     Ok(())
 }
 
+/// `log-dir` に otel-logger が書く日次ファイルの種類。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DailyLogKind {
+    /// 受信 payload の lossless な JSONL (`otel-logger.YYYY-MM-DD`)。
+    Jsonl,
+    /// `--pretty-log` の人が読める出力 (`otel-logger.pretty.YYYY-MM-DD.log`)。
+    Pretty,
+}
+
+/// ファイル名が otel-logger の日次ファイルなら、その種類を返す。
+///
+/// 受け付けるのは上の 2 形式だけで、日付は実在する暦日に限る。`otel-logger.pid` や
+/// `otel-logger.stderr.log` のような同 prefix の別用途ファイル、拡張子違い
+/// (`otel-logger.pretty.YYYY-MM-DD` / `otel-logger.pretty.YYYY-MM-DD.log.gz`) は `None`。
+/// bool で「どちらかの日次ファイルか」だけを返すと、shutdown の fsync のような JSONL
+/// 専用の処理まで pretty を巻き込むため、種類を返す。
+fn daily_log_kind(filename: &str) -> Option<DailyLogKind> {
+    if let Some(date) = filename
+        .strip_prefix(PRETTY_LOG_PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(PRETTY_LOG_SUFFIX))
+        .and_then(|rest| rest.strip_suffix('.'))
+    {
+        return is_calendar_date(date).then_some(DailyLogKind::Pretty);
+    }
+    let date = filename
+        .strip_prefix(ROTATION_PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))?;
+    is_calendar_date(date).then_some(DailyLogKind::Jsonl)
+}
+
+/// JSONL の日次ファイル名か。
 fn is_rotated_log_filename(filename: &str) -> bool {
-    let Some(date) = filename.strip_prefix(&format!("{ROTATION_PREFIX}.")) else {
-        return false;
-    };
+    daily_log_kind(filename) == Some(DailyLogKind::Jsonl)
+}
+
+/// `YYYY-MM-DD` 形式で、かつ実在する暦日か。
+fn is_calendar_date(date: &str) -> bool {
     let bytes = date.as_bytes();
     if bytes.len() != 10
         || !bytes[0..4].iter().all(u8::is_ascii_digit)
@@ -747,16 +1147,64 @@ mod tests {
     fn failing_jsonl_sink() -> Sink {
         Sink {
             inner: Arc::new(SinkInner {
-                stdout_enabled: false,
-                color: false,
                 summary_enabled: true,
                 file: Some(JsonlWriter::Fail),
-                pretty_tx: None,
-                pretty_dropped: AtomicU64::new(0),
+                stdout: None,
+                pretty_log: None,
                 aggregator: Arc::new(Aggregator::new()),
                 proxy: None,
             }),
         }
+    }
+
+    /// JSONL を持たず、人が読める出力先だけを差し替えた sink。
+    fn sink_with_pretty_targets(
+        stdout: Option<PrettyTarget>,
+        pretty_log: Option<PrettyTarget>,
+        summary_enabled: bool,
+    ) -> Sink {
+        let aggregator = Arc::new(Aggregator::new());
+        let spawn =
+            |target: PrettyTarget| PrettyOutput::spawn(target, false, Arc::clone(&aggregator));
+        Sink {
+            inner: Arc::new(SinkInner {
+                summary_enabled,
+                file: None,
+                stdout: stdout.map(spawn),
+                pretty_log: pretty_log.map(spawn),
+                aggregator: Arc::clone(&aggregator),
+                proxy: None,
+            }),
+        }
+    }
+
+    fn open_gate(gate: &(StdMutex<bool>, std::sync::Condvar)) {
+        *lock_recovering(&gate.0) = true;
+        gate.1.notify_all();
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "5 秒以内に満たされなかった: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn files_of_kind(dir: &Path, kind: DailyLogKind) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(daily_log_kind)
+                    == Some(kind)
+            })
+            .collect()
     }
 
     fn touch_mtime(path: &Path, when: SystemTime) {
@@ -796,6 +1244,11 @@ mod tests {
         let jsonl = dir.path().join("otel-logger.jsonl");
         let unrelated = dir.path().join("other-app.log");
         let invalid_date = dir.path().join("otel-logger.2020-99-99");
+        let old_pretty = dir.path().join("otel-logger.pretty.2020-01-01.log");
+        let recent_pretty = dir.path().join("otel-logger.pretty.2099-01-01.log");
+        let pretty_without_suffix = dir.path().join("otel-logger.pretty.2020-01-01");
+        let pretty_compressed = dir.path().join("otel-logger.pretty.2020-01-01.log.gz");
+        let pretty_invalid_date = dir.path().join("otel-logger.pretty.2020-99-99.log");
         std::fs::write(&old, "old").unwrap();
         std::fs::write(&recent, "recent").unwrap();
         std::fs::write(&pid, "12345").unwrap();
@@ -803,14 +1256,31 @@ mod tests {
         std::fs::write(&jsonl, "jsonl").unwrap();
         std::fs::write(&unrelated, "other").unwrap();
         std::fs::write(&invalid_date, "invalid date").unwrap();
+        for path in [
+            &old_pretty,
+            &recent_pretty,
+            &pretty_without_suffix,
+            &pretty_compressed,
+            &pretty_invalid_date,
+        ] {
+            std::fs::write(path, "pretty").unwrap();
+        }
 
         let three_days_ago = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
-        touch_mtime(&old, three_days_ago);
-        touch_mtime(&pid, three_days_ago);
-        touch_mtime(&stderr, three_days_ago);
-        touch_mtime(&jsonl, three_days_ago);
-        touch_mtime(&unrelated, three_days_ago);
-        touch_mtime(&invalid_date, three_days_ago);
+        for path in [
+            &old,
+            &pid,
+            &stderr,
+            &jsonl,
+            &unrelated,
+            &invalid_date,
+            &old_pretty,
+            &pretty_without_suffix,
+            &pretty_compressed,
+            &pretty_invalid_date,
+        ] {
+            touch_mtime(path, three_days_ago);
+        }
 
         cleanup_old_rotated_logs(dir.path(), 1).unwrap();
 
@@ -824,6 +1294,26 @@ mod tests {
             invalid_date.exists(),
             "実在しない日付のファイルはローテーション出力として削除しない"
         );
+        assert!(
+            !old_pretty.exists(),
+            "pretty-log の古い日次ファイルも同じ保持日数で削除する"
+        );
+        assert!(
+            recent_pretty.exists(),
+            "新しい pretty-log の日次ファイルは残す"
+        );
+        assert!(
+            pretty_without_suffix.exists(),
+            "`.log` の無い名前は pretty-log の出力ではない"
+        );
+        assert!(
+            pretty_compressed.exists(),
+            "拡張子が余分に付いた名前は pretty-log の出力ではない"
+        );
+        assert!(
+            pretty_invalid_date.exists(),
+            "実在しない日付の pretty-log 名は削除しない"
+        );
     }
 
     #[test]
@@ -832,6 +1322,34 @@ mod tests {
         assert!(!is_rotated_log_filename("otel-logger.2023-02-29"));
         assert!(!is_rotated_log_filename("otel-logger.2026-13-01"));
         assert!(!is_rotated_log_filename("otel-logger.2026-04-31"));
+    }
+
+    /// JSONL 専用の処理 (shutdown の fsync) に pretty-log を巻き込まないよう、
+    /// 2 種類の日次ファイルを名前で区別できること。
+    #[test]
+    fn daily_log_kind_distinguishes_jsonl_and_pretty_files() {
+        assert_eq!(
+            daily_log_kind("otel-logger.2026-09-30"),
+            Some(DailyLogKind::Jsonl)
+        );
+        assert_eq!(
+            daily_log_kind("otel-logger.pretty.2026-09-30.log"),
+            Some(DailyLogKind::Pretty)
+        );
+        assert!(!is_rotated_log_filename(
+            "otel-logger.pretty.2026-09-30.log"
+        ));
+        for name in [
+            "otel-logger.pretty.2026-09-30",
+            "otel-logger.pretty.2026-09-30.log.gz",
+            "otel-logger.pretty.2026-02-30.log",
+            "otel-logger.prettyx.2026-09-30.log",
+            "otel-logger.pretty..2026-09-30.log",
+            "otel-logger.stdout.log",
+            "otel-logger.2026-09-30.log",
+        ] {
+            assert_eq!(daily_log_kind(name), None, "{name} は日次ファイルではない");
+        }
     }
 
     #[cfg(unix)]
@@ -865,35 +1383,316 @@ mod tests {
 
     #[test]
     fn stdout_broken_pipe_disables_further_pretty_output() {
-        let mut state = StdoutState::default();
+        let mut state = PrettyWriterState::default();
         assert!(state.should_write());
 
-        classify_stdout_result(
-            &mut state,
+        let report = state.record_result(
+            &PrettyTarget::Stdout,
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")),
-        )
-        .expect("EPIPE は telemetry の欠落ではないので Ok を返す");
+            Instant::now(),
+        );
 
+        assert_eq!(
+            report,
+            HealthReport::Silent,
+            "EPIPE は telemetry の欠落ではないので失敗として報告しない"
+        );
         assert!(
             !state.should_write(),
             "読み手が消えた後に書き続けると、失敗のたびに stderr へ error を積み上げてしまう"
         );
     }
 
+    /// EPIPE で恒久停止させるのは stdout だけ。pretty-log のファイルは読み手の有無と
+    /// 関係ないため、同じ error kind でも一時的な失敗として扱い、書き続ける。
+    #[test]
+    fn broken_pipe_on_a_file_target_does_not_disable_output() {
+        let mut state = PrettyWriterState::default();
+        let target = PrettyTarget::Capture(Arc::default());
+
+        let report = state.record_result(
+            &target,
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "odd filesystem")),
+            Instant::now(),
+        );
+
+        assert_eq!(report, HealthReport::Started);
+        assert!(state.should_write());
+    }
+
     #[test]
     fn stdout_transient_error_keeps_pretty_output_enabled() {
-        let mut state = StdoutState::default();
+        let mut state = PrettyWriterState::default();
 
-        let err = classify_stdout_result(
-            &mut state,
+        let report = state.record_result(
+            &PrettyTarget::Stdout,
             Err(io::Error::new(io::ErrorKind::Interrupted, "eintr")),
-        )
-        .expect_err("EPIPE 以外の I/O error は呼び出し元へ返す");
+            Instant::now(),
+        );
 
-        assert!(err.to_string().contains("write to stdout"));
+        assert_eq!(report, HealthReport::Started, "最初の失敗は報告する");
         assert!(
             state.should_write(),
             "一時的な error で人が読める出力を恒久停止しない"
+        );
+    }
+
+    /// 回帰テスト: 失敗し続ける出力先の通知を間引く。
+    ///
+    /// ディスクが埋まっている間じゅう batch ごとに error を出すと、ローテーションされない
+    /// stderr が伸びる。失敗の開始・継続中の定期報告・回復だけを知らせる。
+    #[test]
+    fn write_health_reports_start_reminders_and_recovery_only() {
+        let t0 = Instant::now();
+        let mut health = WriteHealth::default();
+
+        assert_eq!(health.on_failure(t0), HealthReport::Started);
+        for i in 1..100 {
+            assert_eq!(
+                health.on_failure(t0 + Duration::from_secs(i)),
+                HealthReport::Silent,
+                "続く失敗は報告間隔まで黙る"
+            );
+        }
+        let reminder = t0 + PRETTY_FAILURE_REPORT_INTERVAL;
+        assert_eq!(
+            health.on_failure(reminder),
+            HealthReport::Ongoing {
+                failures: 101,
+                elapsed: PRETTY_FAILURE_REPORT_INTERVAL,
+            },
+            "失敗が続いていれば報告間隔ごとに件数と経過時間を知らせる"
+        );
+        assert_eq!(
+            health.unresolved(reminder),
+            Some((101, PRETTY_FAILURE_REPORT_INTERVAL, Duration::ZERO))
+        );
+
+        assert_eq!(
+            health.on_success(reminder + Duration::from_secs(5)),
+            HealthReport::Silent,
+            "直前まで失敗していたなら、成功 1 回ではまだ回復とみなさない"
+        );
+        let recovered = reminder + PRETTY_RECOVERY_QUIET_PERIOD;
+        assert_eq!(
+            health.on_success(recovered),
+            HealthReport::Recovered {
+                failures: 101,
+                elapsed: PRETTY_FAILURE_REPORT_INTERVAL + PRETTY_RECOVERY_QUIET_PERIOD,
+            }
+        );
+        assert_eq!(health.unresolved(recovered), None);
+        assert_eq!(
+            health.on_success(recovered),
+            HealthReport::Silent,
+            "正常な書き込みは報告しない"
+        );
+    }
+
+    /// 回帰テスト: 成功と失敗が交互に来る (空きの少ないディスクで、小さい batch だけ
+    /// 書ける等) 間は 1 つの障害として扱う。batch ごとに開始と回復を出すと stderr が
+    /// 伸び、直後の失敗を間引くと「回復した」が最後の通知のまま失敗し続けてしまう。
+    #[test]
+    fn write_health_treats_alternating_failures_as_one_outage() {
+        let t0 = Instant::now();
+        let mut health = WriteHealth::default();
+
+        assert_eq!(health.on_failure(t0), HealthReport::Started);
+        for i in 1..50 {
+            let now = t0 + Duration::from_secs(i);
+            let report = if i % 2 == 0 {
+                health.on_failure(now)
+            } else {
+                health.on_success(now)
+            };
+            assert_eq!(
+                report,
+                HealthReport::Silent,
+                "{i} 秒目: 成功が挟まっても同じ障害の続き"
+            );
+        }
+        // 最後の失敗は 48 秒目。静かな期間を過ぎた成功で、回復を 1 回だけ知らせる。
+        let last_failure = t0 + Duration::from_secs(48);
+        assert_eq!(
+            health.on_success(last_failure + PRETTY_RECOVERY_QUIET_PERIOD),
+            HealthReport::Recovered {
+                failures: 25,
+                elapsed: Duration::from_secs(48) + PRETTY_RECOVERY_QUIET_PERIOD,
+            }
+        );
+    }
+
+    /// 回復を知らせた後の失敗は、報告間隔を待たずに新しい障害として知らせる。
+    #[test]
+    fn write_health_reports_a_new_outage_right_after_recovery() {
+        let t0 = Instant::now();
+        let mut health = WriteHealth::default();
+
+        assert_eq!(health.on_failure(t0), HealthReport::Started);
+        let recovered = t0 + PRETTY_RECOVERY_QUIET_PERIOD;
+        assert!(matches!(
+            health.on_success(recovered),
+            HealthReport::Recovered { failures: 1, .. }
+        ));
+        assert_eq!(
+            health.on_failure(recovered + Duration::from_secs(1)),
+            HealthReport::Started
+        );
+    }
+
+    /// 回帰テスト: queue の件数上限だけでは memory を抑えられないので、rendered の
+    /// 合計バイト数でも打ち切る。捨てた batch は計上から巻き戻す。
+    #[tokio::test]
+    async fn enqueue_drops_batches_beyond_the_byte_budget() {
+        // writer を起動せず、queue に積まれた状態を観察する。容量 1 で満杯も再現する。
+        let (tx, mut rx) = mpsc::channel(1);
+        let output = PrettyOutput {
+            name: "test",
+            color: false,
+            tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            max_queued_bytes: 10,
+            dropped: AtomicU64::new(0),
+        };
+        let counters = || {
+            (
+                output.dropped.load(AtomicOrdering::Relaxed),
+                output.queued_bytes.load(AtomicOrdering::Relaxed),
+            )
+        };
+
+        output.enqueue(Arc::from("0123456789A"), false);
+        assert_eq!(
+            counters(),
+            (1, 0),
+            "queue が空でも上限を超える batch は捨て、計上から外す"
+        );
+
+        output.enqueue(Arc::from("0123"), false);
+        assert_eq!(counters(), (1, 4));
+        output.enqueue(Arc::from("45"), false);
+        assert_eq!(
+            counters(),
+            (2, 4),
+            "上限内でも channel が満杯なら捨て、計上を巻き戻す"
+        );
+        output.enqueue(Arc::from("0123456"), false);
+        assert_eq!(
+            counters(),
+            (3, 4),
+            "溜まっている分に足すと上限を超える batch は捨てる"
+        );
+
+        assert_eq!(&*rx.try_recv().unwrap().rendered, "0123");
+        drop(rx);
+        output.enqueue(Arc::from("67"), false);
+        assert_eq!(
+            counters(),
+            (4, 4),
+            "writer が止まった (channel closed) 分も捨てた件数に数え、計上を巻き戻す"
+        );
+    }
+
+    /// writer が書き終えた batch は計上から外れ、queue の予算が戻る。
+    #[tokio::test]
+    async fn writer_releases_the_byte_budget_after_writing() {
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let output = PrettyOutput::spawn(
+            PrettyTarget::Capture(Arc::clone(&captured)),
+            false,
+            Arc::new(Aggregator::new()),
+        );
+
+        for line in ["a\n", "b\n", "c\n"] {
+            output.enqueue(Arc::from(line), false);
+        }
+        output
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+
+        assert_eq!(output.queued_bytes.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(output.dropped.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(&*lock_recovering(&captured), b"a\nb\nc\n");
+    }
+
+    /// 回帰テスト: 止まった出力先が、もう一方の出力先を巻き込まない。
+    ///
+    /// 1 本の writer で両方へ書くと、読み手が止まった stdout が pretty-log まで止める。
+    /// shutdown の drain も共有の期限で打ち切り、止まった側に期限を使い切られない。
+    #[tokio::test]
+    async fn stalled_destination_does_not_block_the_other_destination() {
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let sink = sink_with_pretty_targets(
+            Some(PrettyTarget::Stall(Arc::clone(&gate))),
+            Some(PrettyTarget::Capture(Arc::clone(&captured))),
+            false,
+        );
+
+        for _ in 0..3 {
+            sink.record(TelemetryRecord::Logs(Box::new(claude_api_request_log())))
+                .await
+                .expect("人が読める出力が止まっても OTLP の ACK は止めない");
+        }
+        wait_until("pretty-log 側に 3 batch が書かれる", || {
+            String::from_utf8_lossy(&lock_recovering(&captured))
+                .matches("body=claude_code.api_request")
+                .count()
+                == 3
+        })
+        .await;
+
+        let started = Instant::now();
+        sink.drain_pretty_until(tokio::time::Instant::now() + Duration::from_millis(200))
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "止まった出力先があっても共有の期限で drain を打ち切る: {:?}",
+            started.elapsed()
+        );
+
+        // blocking thread を解放する (runtime の drop が完了を待ち続けないように)。
+        open_gate(&gate);
+    }
+
+    /// `--pretty-log` は log-dir に色なしの日次ファイルを書き、`--summary` の累計も載せる。
+    /// stdout 用の `color = "always"` はファイルに漏らさない。
+    #[tokio::test]
+    async fn pretty_log_writes_uncolored_records_and_summary_to_daily_file() {
+        use crate::cli::ColorMode;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = settings_with_log_dir(dir.path().to_path_buf());
+        settings.pretty_log_dir = Some(dir.path().to_path_buf());
+        settings.color = ColorMode::Always;
+        settings.summary = true;
+        let sink = Sink::from_settings(&settings).await.unwrap();
+        assert!(
+            sink.inner.stdout.is_none(),
+            "no-stdout なので stdout へは書かない"
+        );
+
+        sink.record(TelemetryRecord::Logs(Box::new(claude_api_request_log())))
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+
+        let pretty_files = files_of_kind(dir.path(), DailyLogKind::Pretty);
+        assert_eq!(pretty_files.len(), 1, "当日の pretty-log が 1 つできる");
+        let body = std::fs::read_to_string(&pretty_files[0]).unwrap();
+        assert!(
+            body.contains("body=claude_code.api_request"),
+            "record の行を書く: {body}"
+        );
+        assert!(
+            body.contains("[stats:claude-code]"),
+            "`--summary` の累計も pretty-log へ書く: {body}"
+        );
+        assert!(!body.contains('\x1b'), "ファイルには色を付けない: {body:?}");
+        assert_eq!(
+            files_of_kind(dir.path(), DailyLogKind::Jsonl).len(),
+            1,
+            "JSONL は従来どおり別ファイルに書く"
         );
     }
 
@@ -901,14 +1700,15 @@ mod tests {
     async fn no_stdout_settings_disable_pretty_and_summary_output() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut settings = settings_with_log_file(dir.path().join("out.jsonl"));
-        // `--summary` を併用しても `--no-stdout` が勝つ (summary も stdout へ書くため)。
+        // `--pretty-log` が無ければ、`--summary` を併用しても `--no-stdout` が勝つ
+        // (summary も人が読める出力へ書くため)。
         settings.summary = true;
 
         let sink = Sink::from_settings(&settings).await.unwrap();
 
         assert!(
-            !sink.inner.stdout_enabled,
-            "no-stdout 指定時は summary も含め stdout へ書かない"
+            sink.inner.pretty_outputs().next().is_none(),
+            "no-stdout 指定時は summary も含め人が読める出力を書かない"
         );
     }
 
@@ -919,6 +1719,7 @@ mod tests {
             http_addr: "127.0.0.1:0".parse().unwrap(),
             log_sink: Some(LogSink::File(path)),
             no_stdout: true,
+            pretty_log_dir: None,
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
@@ -933,6 +1734,7 @@ mod tests {
             http_addr: "127.0.0.1:0".parse().unwrap(),
             log_sink: Some(LogSink::Directory { dir, keep_days: 1 }),
             no_stdout: true,
+            pretty_log_dir: None,
             summary: false,
             color: ColorMode::Never,
             dry_run: false,
@@ -1017,16 +1819,19 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         // 同じ prefix だがローテーション名ではないファイルを read-only で置く。
         // 対象に含めてしまうと `write(true)` の open が失敗するので検出できる。
-        let unrelated = dir.path().join("otel-logger.pid");
-        std::fs::write(&unrelated, "4242").unwrap();
-        let mut perms = std::fs::metadata(&unrelated).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&unrelated, perms).unwrap();
+        // pretty-log の日次ファイルも、JSONL 専用の fsync には含めない。
+        for name in ["otel-logger.pid", "otel-logger.pretty.2026-09-30.log"] {
+            let unrelated = dir.path().join(name);
+            std::fs::write(&unrelated, "4242").unwrap();
+            let mut perms = std::fs::metadata(&unrelated).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&unrelated, perms).unwrap();
+        }
 
         let writer = open_rotated_sync(dir.path(), 7).unwrap();
         writer
             .sync_rotated_files()
-            .expect("ローテーション名以外のファイルは fsync 対象に含めない");
+            .expect("JSONL の日次ファイル以外は fsync 対象に含めない");
 
         // 日次ファイルを作ってから呼び直しても成功する。
         let jsonl = JsonlWriter::Roller(Box::new(writer));

@@ -51,21 +51,24 @@ pub struct Cli {
     #[arg(long, env = "OTEL_LOGGER_LOG_DIR", value_name = "DIR")]
     pub log_dir: Option<PathBuf>,
 
-    /// Number of rotated daily JSONL files to retain when `--log-dir` is used.
-    /// Applies to JSONL only; the stdout stream is never rotated.
-    /// `--log-dir` 利用時に保持する日次 JSONL ファイル数。
+    /// Days of rotated daily files to retain when `--log-dir` is used.
+    /// Applies to the daily JSONL and `--pretty-log` files; a redirected stdout is never rotated.
+    /// `--log-dir` 利用時に保持する日次ファイルの日数。
     /// 古いファイルは起動時に削除し、ローテーション時にも上限を適用する。
-    /// 保持期間が効くのは JSONL だけで、stdout はローテーションされない。
+    /// 保持期間が効くのは `--log-dir` 内の日次 JSONL と `--pretty-log` のファイルだけで、
+    /// リダイレクトした stdout はローテーションされない。
     /// 既定値は 10。
     #[arg(long, env = "OTEL_LOGGER_LOG_KEEP_DAYS", value_name = "DAYS")]
     pub log_keep_days: Option<u32>,
 
     /// Suppress the human-readable stdout stream.
     /// Required for unattended runs: stdout is never rotated.
+    /// Combine with `--pretty-log` to keep the stream as daily files instead.
     /// 人が読める stdout 出力を抑止する。
     /// JSONL ファイルだけを書き出したい場合に使う。
     /// otel-logger は stdout をローテーションしないため、常駐運用 (launchd / systemd /
-    /// container) では必ず指定する。累計集計と `GET /stats` はこのフラグの影響を受けない。
+    /// container) では必ず指定する。人が読める出力を残したい場合は `--pretty-log` を併用して
+    /// 日次ファイルへ書き出す。累計集計と `GET /stats` はこのフラグの影響を受けない。
     // `bool` のままだと clap の strict な value parser が使われ、環境変数に `1` を
     // 入れた systemd / launchd / compose の常駐構成が `invalid value '1'` で起動
     // できない (README は `=1` を案内している)。`Option<bool>` にすることで
@@ -81,8 +84,27 @@ pub struct Cli {
     )]
     pub no_stdout: Option<bool>,
 
+    /// Also write the human-readable stream into `--log-dir` as daily files.
+    /// Files are named `otel-logger.pretty.YYYY-MM-DD.log` (local time), pruned by
+    /// `--log-keep-days` and never colored. Requires `--log-dir`.
+    /// 人が読める出力 (record ごとの行と `--summary` の累計) を、`--log-dir` にも
+    /// 日次ファイル `otel-logger.pretty.YYYY-MM-DD.log` (ローカル時刻) として書き出す。
+    /// 保持は `--log-keep-days` を JSONL と共有し、色は付けない。stdout とは独立した
+    /// 出力先なので、stdout を止めるには `--no-stdout` を併用する。`--log-dir` が必須。
+    // `--no-stdout` と同じ理由で `Option<bool>` + boolish parser にする。
+    #[arg(
+        long,
+        env = "OTEL_LOGGER_PRETTY_LOG",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub pretty_log: Option<bool>,
+
     /// Append a cumulative usage summary when Claude/Codex usage changes.
-    /// Claude/Codex の使用量を更新したタイミングで、stdout に累計サマリーを追記する。
+    /// Claude/Codex の使用量を更新したタイミングで、人が読める出力 (stdout と
+    /// `--pretty-log` のファイルのうち有効なもの) に累計サマリーを追記する。
     /// HTTP endpoint `GET /stats` はこのフラグに関係なく常に有効で、
     /// 同じ累計値を JSON として返す。
     // `--no-stdout` と同じ理由で `Option<bool>` + boolish parser にする。
@@ -96,8 +118,8 @@ pub struct Cli {
     )]
     pub summary: Option<bool>,
 
-    /// Color mode for the human-readable stdout stream.
-    /// 人が読める stdout 出力の色設定。
+    /// Color mode for the human-readable stdout stream (`--pretty-log` files are never colored).
+    /// 人が読める stdout 出力の色設定。`--pretty-log` のファイルには常に色を付けない。
     #[arg(long, value_enum, env = "OTEL_LOGGER_COLOR", value_name = "WHEN")]
     pub color: Option<ColorMode>,
 
@@ -329,6 +351,10 @@ pub struct Settings {
     pub http_addr: SocketAddr,
     pub log_sink: Option<LogSink>,
     pub no_stdout: bool,
+    /// `--pretty-log` の書き出し先 (無効なら `None`)。優先順位を解決した後の `log-dir` と
+    /// 同じディレクトリで、保持日数も `LogSink::Directory` の `keep_days` を共有する。
+    /// 古いファイルの整理は JSONL 側の writer がディレクトリ単位でまとめて行う。
+    pub pretty_log_dir: Option<PathBuf>,
     pub summary: bool,
     pub color: ColorMode,
     pub dry_run: bool,
@@ -349,6 +375,9 @@ impl Settings {
     /// あるため。`| less` のような一時的な pipe では偽陽性になるが、出すのは
     /// stderr へ 1 行の warning だけで、内容 (stdout はローテーションされない) 自体は
     /// その場合も正しい。
+    ///
+    /// `--pretty-log` は判定に含めない。stdout とは独立した出力先なので、
+    /// `--no-stdout` を付けない限り stdout 側は伸び続ける。
     pub fn warns_unrotated_stdout(&self, stdout_is_terminal: bool) -> bool {
         !self.no_stdout && !stdout_is_terminal
     }
@@ -389,6 +418,11 @@ impl Settings {
             },
         };
 
+        let pretty_log_dir = resolve_pretty_log_dir(
+            cli.pretty_log.or(config.pretty_log).unwrap_or(false),
+            log_sink.as_ref(),
+        )?;
+
         let proxy = resolve_proxy_settings(
             ProxyCliInputs {
                 anthropic_endpoint: cli.proxy_anthropic_endpoint,
@@ -417,11 +451,38 @@ impl Settings {
             // CLI / 環境変数 > 設定ファイル > 既定値。`||` で合成すると、環境変数の
             // 明示的な `false` が設定ファイルの `true` に負けて優先順位が逆転する。
             no_stdout: cli.no_stdout.or(config.no_stdout).unwrap_or(false),
+            pretty_log_dir,
             summary: cli.summary.or(config.summary).unwrap_or(false),
             color: cli.color.or(config.color).unwrap_or(ColorMode::Auto),
             dry_run: cli.dry_run,
             proxy,
         })
+    }
+}
+
+/// `--pretty-log` の書き出し先を、優先順位を解決した後の JSONL 出力先から決める。
+///
+/// 判定は CLI / 環境変数 / 設定ファイルの合成後に行う。設定ファイルに `log-dir` が
+/// あっても CLI の `--log-file` が勝っていれば、日次ファイルを置くディレクトリは無い。
+/// `log-file` の親ディレクトリへ暗黙に書くと、保持日数で整理されないファイルが
+/// 宣言していない場所に溜まるため、起動時のエラーにする。
+fn resolve_pretty_log_dir(
+    enabled: bool,
+    log_sink: Option<&LogSink>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    match log_sink {
+        Some(LogSink::Directory { dir, .. }) => Ok(Some(dir.clone())),
+        Some(LogSink::File(_)) => anyhow::bail!(
+            "`--pretty-log` writes daily-rotated files into `--log-dir` and cannot be combined \
+             with `--log-file`; use `--log-dir` (or `log-dir` in the config file) instead"
+        ),
+        None => anyhow::bail!(
+            "`--pretty-log` requires `--log-dir` (or `log-dir` in the config file): \
+             the human-readable files are rotated and pruned together with the daily JSONL"
+        ),
     }
 }
 
@@ -821,6 +882,7 @@ mod tests {
             log_dir: None,
             log_keep_days: None,
             no_stdout: None,
+            pretty_log: None,
             summary: None,
             color: None,
             dry_run: false,
@@ -1030,6 +1092,123 @@ mod tests {
         let quiet = Settings::merge_with_home(cli, Config::default(), None).unwrap();
         assert!(!quiet.warns_unrotated_stdout(false));
         assert!(!quiet.warns_unrotated_stdout(true));
+    }
+
+    /// `--pretty-log` は stdout とは独立した出力先なので、stdout の警告条件を変えない。
+    /// `--pretty-log` だけを足しても redirect 先の stdout は伸び続けるため、警告を止めては
+    /// いけない。止めるのは `--no-stdout` だけ。
+    #[test]
+    fn warns_unrotated_stdout_is_not_silenced_by_pretty_log() {
+        let config = Config {
+            log_dir: Some(PathBuf::from("/var/log/otel")),
+            pretty_log: Some(true),
+            ..Config::default()
+        };
+
+        let tee = Settings::merge_with_home(empty_cli(), config.clone(), None).unwrap();
+        assert!(tee.pretty_log_dir.is_some());
+        assert!(tee.warns_unrotated_stdout(false));
+
+        let mut cli = empty_cli();
+        cli.no_stdout = Some(true);
+        let files_only = Settings::merge_with_home(cli, config, None).unwrap();
+        assert!(files_only.pretty_log_dir.is_some());
+        assert!(!files_only.warns_unrotated_stdout(false));
+    }
+
+    #[test]
+    fn merge_pretty_log_uses_the_effective_log_dir() {
+        let config = Config {
+            log_dir: Some(PathBuf::from("~/logs")),
+            pretty_log: Some(true),
+            ..Config::default()
+        };
+        let home = PathBuf::from("/home/alice");
+        let settings = Settings::merge_with_home(empty_cli(), config.clone(), Some(&home)).unwrap();
+        assert_eq!(
+            settings.pretty_log_dir,
+            Some(PathBuf::from("/home/alice/logs")),
+            "`~` 展開済みの log-dir と同じディレクトリに書く"
+        );
+
+        // CLI の `--log-dir` が勝ったら、pretty もそちらへ書く (JSONL と同じ場所で整理するため)。
+        let mut cli = empty_cli();
+        cli.log_dir = Some(PathBuf::from("/cli-dir"));
+        let settings = Settings::merge_with_home(cli, config, Some(&home)).unwrap();
+        assert_eq!(settings.pretty_log_dir, Some(PathBuf::from("/cli-dir")));
+    }
+
+    #[test]
+    fn merge_pretty_log_is_disabled_by_default() {
+        let config = Config {
+            log_dir: Some(PathBuf::from("/var/log/otel")),
+            ..Config::default()
+        };
+        let settings = Settings::merge_with_home(empty_cli(), config, None).unwrap();
+        assert!(settings.pretty_log_dir.is_none());
+    }
+
+    /// 回帰テスト: `--pretty-log` の `log-dir` 必須判定は、優先順位を解決した後の出力先で行う。
+    ///
+    /// 設定ファイルの `log-dir` を CLI の `--log-file` が上書きした場合、日次ファイルを置く
+    /// ディレクトリは存在しない。`log-file` の親へ暗黙に書くと、保持日数で整理されない
+    /// ファイルが宣言していない場所に溜まる。
+    #[test]
+    fn merge_pretty_log_requires_the_effective_sink_to_be_log_dir() {
+        let mut cli = empty_cli();
+        cli.pretty_log = Some(true);
+        let err = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("requires `--log-dir`"),
+            "JSONL 出力が無いなら起動時に弾く: {err}"
+        );
+
+        let mut cli = empty_cli();
+        cli.pretty_log = Some(true);
+        cli.log_file = Some(PathBuf::from("/tmp/a.jsonl"));
+        let err = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with `--log-file`"),
+            "単一ファイルの JSONL とは組み合わせない: {err}"
+        );
+
+        let mut cli = empty_cli();
+        cli.log_file = Some(PathBuf::from("/cli.jsonl"));
+        let config = Config {
+            log_dir: Some(PathBuf::from("/config-dir")),
+            pretty_log: Some(true),
+            ..Config::default()
+        };
+        let err = Settings::merge_with_home(cli, config, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with `--log-file`"),
+            "設定ファイルの log-dir は CLI の --log-file に負けている: {err}"
+        );
+    }
+
+    /// 明示的な `false` は設定ファイルの `true` に勝ち、`log-dir` 必須判定も走らせない。
+    #[test]
+    fn merge_pretty_log_explicit_false_overrides_config() {
+        let mut cli = empty_cli();
+        cli.pretty_log = Some(false);
+        cli.log_file = Some(PathBuf::from("/cli.jsonl"));
+        let config = Config {
+            pretty_log: Some(true),
+            ..Config::default()
+        };
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        assert!(settings.pretty_log_dir.is_none());
+    }
+
+    #[test]
+    fn pretty_log_flag_accepts_boolish_values() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().pretty_log;
+        assert_eq!(parse(&["otel-logger"]), None);
+        assert_eq!(parse(&["otel-logger", "--pretty-log"]), Some(true));
+        assert_eq!(parse(&["otel-logger", "--pretty-log=false"]), Some(false));
+        assert_eq!(parse(&["otel-logger", "--pretty-log=1"]), Some(true));
     }
 
     #[test]
