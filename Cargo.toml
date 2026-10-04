@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # OTLP 型と gRPC service trait (proto drift を避けるため単一の真実として使う)
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
+opentelemetry-proto = { version = "0.33.0", default-features = false, features = [
     "gen-tonic",
     "trace",
     "metrics",
@@ -88,7 +88,7 @@ tokio = { version = "1.53.1", features = [
 tokio-util = "0.7.19"
 
 # CLI
-clap = { version = "4.6.6", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 
 # シリアライズ / 出力
 serde = { version = "1.0.229", features = ["derive"] }

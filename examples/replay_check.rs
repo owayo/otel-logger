@@ -1,4 +1,3 @@
-//! Replay saved JSONL telemetry into the aggregator and print the resulting totals.
 //! 保存済み JSONL テレメトリを集計器へ再生し、累計を出力する検証用ツール。
 //!
 //! JSONL の各行は `{"kind":"logs|metrics|traces", "resourceLogs|resourceMetrics|resourceSpans":[...]}`

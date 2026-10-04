@@ -2564,6 +2564,9 @@ mod tests {
             "claude_code.retention_sweep",
             "claude_code.feedback_survey",
             "claude_code.tool_result",
+            "claude_code.managed_settings_resolved",
+            "claude_code.hook_execution_start",
+            "claude_code.hook_registered",
         ] {
             let count = agg.ingest_logs(&make_log_req(
                 SERVICE_CLAUDE,
@@ -4072,6 +4075,7 @@ mod tests {
             "codex.startup_phase",
             "codex.user_prompt",
             "codex.turn_ttft",
+            "codex.agent_communication",
         ] {
             agg.ingest_logs(&make_log_req(
                 SERVICE_CODEX_EXEC,
@@ -4402,6 +4406,107 @@ mod tests {
             .get("azure/gpt-6-astra/high")
             .unwrap_or_else(|| panic!("span の effort を保持する: {:?}", agent.buckets));
         assert_eq!(bucket.stats.input_tokens, 100);
+    }
+
+    /// 再開時に provider が省略されても、既に確定している同じ conversation の値を消さない。
+    #[test]
+    fn codex_partial_conversation_start_preserves_confirmed_provider() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-1"),
+                kv_str("provider_name", "azure"),
+                kv_str("model", "gpt-6-astra"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![kv_str("conversation.id", "conv-1")],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-1"),
+                kv_int("input_token_count", 100),
+            ],
+        ));
+
+        let snapshot = agg.snapshot();
+        let agent = snapshot.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 100);
+        assert_eq!(agent.buckets.len(), 1);
+        assert_eq!(
+            agent.buckets["azure/gpt-6-astra/high"].stats.input_tokens,
+            100
+        );
+    }
+
+    /// effort が未確定でも、先に確定した provider へ pending 使用量を移す。
+    #[test]
+    fn codex_late_provider_without_effort_moves_pending_and_keeps_effort_recoverable() {
+        let agg = Aggregator::new();
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-1"),
+                kv_str("model", "gpt-6-astra"),
+                kv_int("input_token_count", 100),
+            ],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-1"),
+                kv_str("provider_name", "azure"),
+            ],
+        ));
+        let snapshot = agg.snapshot();
+        let agent = snapshot.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 100);
+        assert_eq!(agent.buckets.len(), 1);
+        assert_eq!(
+            agent.buckets["azure/gpt-6-astra/unknown"]
+                .stats
+                .input_tokens,
+            100
+        );
+
+        // provider 確定後に届いた、effort 未確定の SSE も後から補完できる。
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", "conv-1"),
+                kv_str("model", "gpt-6-astra"),
+                kv_int("input_token_count", 50),
+            ],
+        ));
+
+        // provider を先に補完した後も、遅着 span から effort を回収できる。
+        let mut span = handle_responses_span("high");
+        span.attributes.push(kv_str("conversation.id", "conv-1"));
+        agg.ingest_traces(&make_trace_req(SERVICE_CODEX_EXEC, vec![span]));
+        let snapshot = agg.snapshot();
+        let agent = snapshot.agents.get(AGENT_CODEX).unwrap();
+        assert_eq!(agent.total.input_tokens, 150);
+        assert_eq!(agent.buckets.len(), 1);
+        assert_eq!(
+            agent.buckets["azure/gpt-6-astra/high"].stats.input_tokens,
+            150
+        );
     }
 
     /// 回帰テスト: Claude Code 2.1.278 以降は `claude_code.llm_request` span が
