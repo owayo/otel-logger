@@ -42,7 +42,7 @@ enum HttpError {
     BadProtobuf(#[from] prost::DecodeError),
     #[error("failed to decode JSON body: {0}")]
     BadJson(#[from] serde_json::Error),
-    /// JSONL や stdout への永続化に失敗した。受信した payload を欠落させたくないので
+    /// JSONL への永続化に失敗した。受信した payload を欠落させたくないので
     /// クライアントに retry 可能な応答を返し、OTLP exporter 側で再送させる。
     #[error("failed to persist telemetry: {0}")]
     Persistence(#[source] anyhow::Error),
@@ -483,6 +483,104 @@ mod tests {
                 "{path} が 200 を返さない"
             );
         }
+    }
+
+    /// protobuf の既定値を省略した空の JSON request も全 signal で受理・保存する。
+    /// 400 は exporter が再送しないため、依存更新でこの境界が退行すると batch が失われる。
+    #[tokio::test]
+    async fn router_persists_empty_json_requests_with_omitted_resource_fields() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let mut settings = no_output_settings();
+        settings.log_sink = Some(crate::cli::LogSink::File(path.clone()));
+        let sink = Sink::from_settings(&settings).await.unwrap();
+        let app = router(sink);
+        for signal in ["logs", "traces", "metrics"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/v1/{signal}"))
+                .header(header::CONTENT_TYPE, JSON_CT)
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{signal}");
+        }
+
+        // ACK の時点で 3 batch がファイルへ書き渡されていることも確認する。
+        let saved = std::fs::read_to_string(path).unwrap();
+        let records: Vec<serde_json::Value> = saved
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        for (record, (signal, field)) in records.iter().zip([
+            ("logs", "resourceLogs"),
+            ("traces", "resourceSpans"),
+            ("metrics", "resourceMetrics"),
+        ]) {
+            assert_eq!(record["kind"], signal);
+            assert_eq!(record[field], serde_json::json!([]));
+        }
+    }
+
+    /// 空の AnyValue と null の oneof field は未設定値として保存し、batch 全体を拒否しない。
+    #[tokio::test]
+    async fn router_persists_empty_and_null_json_any_values() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let mut settings = no_output_settings();
+        settings.log_sink = Some(crate::cli::LogSink::File(path.clone()));
+        let sink = Sink::from_settings(&settings).await.unwrap();
+        let payload = serde_json::json!({
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "logRecords": [
+                        {"body": {}, "attributes": [{"key": "empty", "value": {}}]},
+                        {"body": {"stringValue": null, "intValue": null}}
+                    ]
+                }]
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, JSON_CT)
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = router(sink).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert_eq!(saved.lines().count(), 1);
+        let mut record: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            record.as_object_mut().unwrap().remove("kind").unwrap(),
+            "logs"
+        );
+        let persisted: ExportLogsServiceRequest = serde_json::from_value(record).unwrap();
+        let logs = &persisted.resource_logs[0].scope_logs[0].log_records;
+        assert_eq!(logs.len(), 2);
+        assert!(
+            logs.iter()
+                .all(|log| log.body.as_ref().unwrap().value.is_none())
+        );
+        assert_eq!(logs[0].attributes[0].key, "empty");
+        assert!(
+            logs[0].attributes[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .value
+                .is_none()
+        );
     }
 
     /// `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter は body を gzip して送る。

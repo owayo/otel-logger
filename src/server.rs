@@ -211,7 +211,10 @@ pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     signal_handle.abort();
     // flush の失敗で `?` early return すると、gRPC / HTTP task 側のエラー (bind 失敗や
     // panic) が捨てられて診断の第一報が消える。他の合流と同じく merge する。
-    merge_task_result(&mut result, sink.flush().await.context("flush JSONL sink"));
+    merge_task_result(
+        &mut result,
+        sink.shutdown().await.context("shutdown JSONL sink"),
+    );
     result
 }
 

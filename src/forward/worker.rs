@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::client::RouteClient;
+use super::client::{RouteClient, retry_delay};
 use super::{ExportRequest, RouteMetricsHandle};
 
 /// shutdown 後に queue を送り切るために与える猶予。
@@ -36,6 +36,7 @@ pub(super) fn spawn(cfg: WorkerConfig) -> JoinHandle<()> {
 
 async fn run(mut cfg: WorkerConfig) {
     tracing::info!(route = %cfg.route_name, "proxy worker started");
+    let mut interrupted = None;
     loop {
         tokio::select! {
             biased;
@@ -63,6 +64,10 @@ async fn run(mut cfg: WorkerConfig) {
                     Ok(()) => {
                         cfg.metrics.sent_total.fetch_add(1, Ordering::Relaxed);
                     }
+                    Err(e) if e.is::<SendCancelled>() => {
+                        interrupted = Some(request);
+                        break;
+                    }
                     Err(e) => {
                         cfg.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(route = %cfg.route_name, error = %e, "proxy send failed after retries");
@@ -74,7 +79,7 @@ async fn run(mut cfg: WorkerConfig) {
 
     // 新規 notify は Closed として drop 計上させ、既に queue にある分だけを対象にする。
     cfg.receiver.close();
-    drain_remaining(&mut cfg).await;
+    drain_remaining(&mut cfg, interrupted).await;
     tracing::info!(route = %cfg.route_name, "proxy worker stopped");
 }
 
@@ -83,7 +88,7 @@ async fn run(mut cfg: WorkerConfig) {
 /// 期限を過ぎた分は `dropped_total` に計上する。計上しないと
 /// `sent + failed + dropped` が notify 総数と合わなくなり、「何件を上流へ渡せなかったか」
 /// を運用側から観測できなくなる。payload 自体は JSONL に残っている。
-async fn drain_remaining(cfg: &mut WorkerConfig) {
+async fn drain_remaining(cfg: &mut WorkerConfig, interrupted: Option<ExportRequest>) {
     // shutdown token をそのまま送信側へ渡すと即 abort されて 1 件も送れない。
     // drain 専用の期限 token を使う。
     let deadline = CancellationToken::new();
@@ -97,7 +102,11 @@ async fn drain_remaining(cfg: &mut WorkerConfig) {
 
     let mut drained: u64 = 0;
     let mut abandoned: u64 = 0;
-    while let Ok(request) = cfg.receiver.try_recv() {
+    // cancel で中断した送信中の batch も queue より先に送り直す。
+    for request in interrupted
+        .into_iter()
+        .chain(std::iter::from_fn(|| cfg.receiver.try_recv().ok()))
+    {
         if request.is_empty() {
             continue;
         }
@@ -111,6 +120,9 @@ async fn drain_remaining(cfg: &mut WorkerConfig) {
             Ok(()) => {
                 cfg.metrics.sent_total.fetch_add(1, Ordering::Relaxed);
                 drained += 1;
+            }
+            Err(e) if e.is::<SendCancelled>() => {
+                abandoned += 1;
             }
             Err(e) => {
                 cfg.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
@@ -143,6 +155,10 @@ async fn drain_remaining(cfg: &mut WorkerConfig) {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("proxy send cancelled")]
+struct SendCancelled;
+
 async fn send_with_retry(
     route_name: &str,
     client: &RouteClient,
@@ -155,18 +171,19 @@ async fn send_with_retry(
     let attempts = retry_max.saturating_add(1); // 初回 + retry_max 回
     for attempt in 0..attempts {
         if shutdown.is_cancelled() {
-            anyhow::bail!("cancelled during retry (route={route_name})");
+            return Err(SendCancelled.into());
         }
         let export_result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                anyhow::bail!("cancelled during send (route={route_name})");
+                return Err(SendCancelled.into());
             }
             result = client.export(request.clone()) => result,
         };
         match export_result {
             Ok(()) => return Ok(()),
             Err(e) => {
+                let retry_after = retry_delay(&e);
                 tracing::debug!(
                     route = %route_name,
                     attempt = attempt + 1,
@@ -175,15 +192,15 @@ async fn send_with_retry(
                     "proxy send attempt failed"
                 );
                 last_err = Some(e);
-                if attempt + 1 >= attempts {
+                if attempt + 1 >= attempts || retry_after.is_none() {
                     break;
                 }
                 // shutdown 中は無駄な sleep をせず即抜ける。
                 tokio::select! {
                     _ = shutdown.cancelled() => {
-                        anyhow::bail!("cancelled during backoff (route={route_name})");
+                        return Err(SendCancelled.into());
                     }
-                    _ = tokio::time::sleep(delay) => {}
+                    _ = tokio::time::sleep(delay.max(retry_after.unwrap_or_default())) => {}
                 }
                 // 単純 exponential (cap 30s)。jitter は運用中の同時多発を狙う場面は
                 // 現状少ないので省略。
@@ -216,7 +233,7 @@ mod tests {
 
     async fn failing_upstream(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode {
         attempts.fetch_add(1, Ordering::Relaxed);
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::SERVICE_UNAVAILABLE
     }
 
     /// `retry_max` は初回送信を含む総試行回数ではなく、初回失敗後の再試行回数として扱う。
@@ -303,6 +320,128 @@ mod tests {
         StatusCode::OK
     }
 
+    #[tokio::test]
+    async fn permanent_http_failure_is_not_retried() {
+        async fn reject(State(attempts): State<Arc<AtomicUsize>>) -> StatusCode {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            StatusCode::BAD_REQUEST
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/logs", post(reject))
+            .with_state(attempts.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let route = ProxyRoute {
+            name: "test".to_string(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 3000).unwrap();
+        assert!(
+            send_with_retry(
+                "test",
+                &client,
+                &ExportRequest::Logs(Box::default()),
+                3,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_interrupted_send_and_backoff_without_double_counting() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        #[derive(Clone)]
+        struct StateData {
+            attempts: Arc<AtomicUsize>,
+            started: Arc<Notify>,
+            stall: bool,
+        }
+        async fn recover(State(state): State<StateData>) -> (StatusCode, [(String, String); 1]) {
+            if state.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                state.started.notify_one();
+                if state.stall {
+                    std::future::pending::<()>().await;
+                }
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after".into(), "60".into())],
+                );
+            }
+            (StatusCode::OK, [("retry-after".into(), "0".into())])
+        }
+        for stall in [false, true] {
+            let state = StateData {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                started: Arc::new(Notify::new()),
+                stall,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/v1/logs", post(recover))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let route = ProxyRoute {
+                name: "test".to_string(),
+                service_names: vec![],
+                signals: ProxySignal::ALL.to_vec(),
+                transport: ProxyTransport::HttpProtobuf,
+                endpoint: format!("http://{addr}"),
+                headers: vec![],
+            };
+            let client = RouteClient::build(&route, 30_000).unwrap();
+            let metrics = Arc::new(RouteMetrics::default());
+            let shutdown = CancellationToken::new();
+            let (tx, receiver) = mpsc::channel(1);
+            tx.send(ExportRequest::Logs(Box::new(ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs::default()],
+            })))
+            .await
+            .unwrap();
+            let worker = spawn(WorkerConfig {
+                route_name: "test".into(),
+                client,
+                receiver,
+                metrics: metrics.clone(),
+                retry_max: 3,
+                shutdown: shutdown.clone(),
+            });
+            tokio::time::timeout(Duration::from_secs(2), state.started.notified())
+                .await
+                .unwrap();
+            if !stall {
+                // Retry-After 中には次の送信を始めない。
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(state.attempts.load(Ordering::Relaxed), 1);
+            }
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.attempts.load(Ordering::Relaxed), 2);
+            assert_eq!(metrics.sent_total.load(Ordering::Relaxed), 1);
+            assert_eq!(metrics.failed_total.load(Ordering::Relaxed), 0);
+            assert_eq!(metrics.dropped_total.load(Ordering::Relaxed), 0);
+            server.abort();
+        }
+    }
+
     /// 回帰テスト: shutdown 時に queue へ残っている batch を捨てずに送り切る。
     ///
     /// 猶予ゼロで捨てると、上流の応答より ingest が速いだけの通常運用でも、再起動の
@@ -373,6 +512,57 @@ mod tests {
             "猶予内に送れた batch を drop として数えない"
         );
 
+        server.abort();
+    }
+
+    /// drain の期限で中断した送信と未送信 queue は failed へ重複計上しない。
+    #[tokio::test]
+    async fn drain_deadline_counts_interrupted_and_queued_batches_as_dropped() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/logs", post(stalled_upstream))
+            .with_state(Arc::new(Notify::new()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let route = ProxyRoute {
+            name: "test".into(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 30_000).unwrap();
+        let metrics = Arc::new(RouteMetrics::default());
+        let (tx, receiver) = mpsc::channel(2);
+        for _ in 0..2 {
+            tx.send(ExportRequest::Logs(Box::new(ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs::default()],
+            })))
+            .await
+            .unwrap();
+        }
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let worker = spawn(WorkerConfig {
+            route_name: "test".into(),
+            client,
+            receiver,
+            metrics: metrics.clone(),
+            retry_max: 0,
+            shutdown,
+        });
+        tokio::time::timeout(DRAIN_GRACE + Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.sent_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.dropped_total.load(Ordering::Relaxed), 2);
         server.abort();
     }
 }

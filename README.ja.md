@@ -41,7 +41,7 @@
 - **欠落のない JSON Lines**: 単一の追記ファイルか日次ローテーションのファイルに保存し、graceful shutdown 時に `fsync` する。書き込みに失敗したら HTTP `503` / gRPC `Unavailable` を返し、exporter に batch を捨てさせず再送させる
 - **Claude Code と Codex の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない
 - **OTLP proxy 転送**: 保存した Claude Code / Codex の payload を、それぞれ別の上流 collector へ転送できる (任意)
-- **graceful shutdown**: SIGINT / SIGTERM で末尾の batch まで書き切る (`docker stop` でも落ちない)。待つのは最大 10 秒
+- **graceful shutdown**: SIGINT / SIGTERM で新しい受信を止め、受理済みの書き込み完了後に最終 `fsync` を行う。接続の終了待ちには 10 秒の猶予を設ける
 - **所有者だけが読めるファイル**: JSONL・設定ファイル・`--log-dir` のディレクトリを `0600` / `0700` で作る。telemetry には `user.email`・`user.id`・organization ID が含まれるため
 - **小さな配布物**: stripped で約 7 MB の単一バイナリ、glibc の無い環境 (distroless、Alpine) 向けの musl 静的ビルド、distroless のコンテナイメージ
 - **すぐ使える利用例**: Docker Compose / GitHub Actions / GitLab CI

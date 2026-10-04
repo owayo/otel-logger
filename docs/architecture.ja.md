@@ -9,7 +9,7 @@
 - 両トランスポートとも 1 リクエストの decode 上限を 32 MiB (`OTLP_MAX_REQUEST_BYTES`) に引き上げ、大きな batch が 4 MiB / 2 MiB の既定値で恒久拒否されないようにする
 - `Content-Encoding: gzip` の body は decode 前に解凍する。32 MiB の上限は OTLP 仕様の要求どおり解凍後の body に対して効く
 - 両トランスポートが共通の `Sink` に流れ込み、stdout pretty、任意の pretty log ファイル (`--pretty-log`)、JSONL へ書き出す
-- `tokio_util::sync::CancellationToken` と SIGINT / SIGTERM を待つ `tokio::select!` で graceful shutdown。gRPC / HTTP task の終了を待ってから最後に JSONL を flush するため、末尾のバッチも欠落しません
+- `tokio_util::sync::CancellationToken` と SIGINT / SIGTERM を待つ `tokio::select!` で graceful shutdown。受理済みの書き込みは handler が cancel されても admission gate で完了を待ち、最後に JSONL を同期する
 
 ## 受信
 
@@ -35,12 +35,17 @@
 - JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存し、graceful shutdown 時に `fsync`
 - JSONL の永続化に失敗した場合は HTTP `503 Service Unavailable` / gRPC `Status::unavailable` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)。OTLP 仕様上 500 や `Internal` は retry されず破棄されるため、retryable な code を返す
 - 累計使用量は JSONL 永続化に成功してから更新するため、retry された batch を二重計上しない
-- 各 batch は ACK 前に `BufWriter::flush` で kernel まで書き出すため、process crash で末尾の write がメモリバッファに取り残されることがない
+- 各 batch は改行まで kernel に書き渡してから ACK する。部分書き込みに失敗したら batch 開始位置へ truncate する。取り消しにも失敗した場合は、修復できるまで後続の書き込みを拒否する
+- ファイルを開く際は、最後の改行より後の未完了 tail を除去してから追記する。この batch には ACK を返していない。同じ保存先を複数の受信プロセスから同時に書かない
+- 日次 JSONL / pretty は書き込み時のローカル暦日で切り替える。数日間無通信でも次の書き込みを当日のファイルへ保存する
+- JSONL の障害は開始時に原因を報告し、続く失敗を最大 10 分ごとに再通知する。最後の失敗から 60 秒以上後の成功で回復を報告する
 - JSONL・設定ファイル・`--log-dir` のディレクトリは所有者のみアクセス可能な権限 (`0600` / `0700`) で作成する。telemetry payload には `user.email` / `user.id` / organization ID が含まれるため
 
 ## 終了処理
 
-- SIGINT / SIGTERM で graceful shutdown する (`docker stop` で末尾バッチが落ちない)
-- graceful shutdown には 10 秒の猶予を設ける。body を宣言したまま送り切らない client 1 本でプロセスを止められなくなり、最後の `fsync` に到達できない事態を防ぐ。2 回目のシグナルで in-flight を即座に諦める
+- SIGINT / SIGTERM で新しい受信を止め、受理済みの書き込みが完了してから最終同期する。handler が cancel されても書き込み完了を待つ
+- 接続の終了待ちには 10 秒の猶予を設ける。body を宣言したまま送り切らない client 1 本でプロセスを止められなくなり、最後の `fsync` に到達できない事態を防ぐ。2 回目のシグナルで in-flight を即座に諦める
 - まず JSONL を flush して `fsync` し、続いて人が読める出力の 2 つの writer を、共通の 5 秒の期限内で並行して drain する。読み手が止まって stdout への書き込みがブロックしたままでも、プロセスの終了は妨げられない
-- proxy の queue に残った batch は破棄せず 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
+- proxy の送信中・backoff 中だった batch と queue に残った batch は破棄せず 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
+
+10 秒は接続終了待ちの上限で、終了処理全体の上限ではありません。JSONL の disk 同期には timeout を掛けず、pretty / proxy の drain はそれぞれ期限を持ちます。強制終了や電源断は graceful shutdown の保証範囲外です。

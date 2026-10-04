@@ -41,7 +41,7 @@ By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to c
 - **Lossless JSON Lines**: one append-only file or daily-rotated files, `fsync`'d on graceful shutdown; a failed write returns HTTP `503` / gRPC `Unavailable` so exporters retry instead of dropping the batch
 - **Usage totals for Claude Code and Codex**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
 - **OTLP proxy forwarding**: optional routes that forward Claude Code and Codex payloads to separate upstream collectors after they are persisted
-- **Graceful shutdown**: SIGINT and SIGTERM keep the last batch (nothing is lost under `docker stop`), bounded by a 10-second grace period
+- **Graceful shutdown**: SIGINT and SIGTERM stop new ingestion and wait for admitted writes before the final `fsync`; connections have a 10-second drain grace period
 - **Private files**: JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`), because telemetry carries `user.email`, `user.id` and organization identifiers
 - **Small footprint**: a single static-ish binary (~7 MB stripped), a static musl build for systems without glibc (distroless, Alpine), and a distroless container image
 - **Ready-made examples**: Docker Compose, GitHub Actions, and GitLab CI

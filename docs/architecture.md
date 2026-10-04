@@ -9,7 +9,7 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 - Both transports raise their per-request decode limit to 32 MiB (`OTLP_MAX_REQUEST_BYTES`) so a large batch is never permanently rejected by the 4 MiB / 2 MiB transport defaults.
 - `Content-Encoding: gzip` bodies are decompressed before decoding, and the 32 MiB limit is enforced on the decompressed body as the OTLP spec requires.
 - Both transports converge on a shared `Sink` that writes pretty stdout, the optional pretty log files (`--pretty-log`) and lossless JSONL.
-- `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; gRPC/HTTP tasks are awaited before the final JSONL flush so the trailing batch never disappears.
+- `tokio_util::sync::CancellationToken` plus a `tokio::select!` that listens for SIGINT/SIGTERM gives a clean shutdown; an admission gate waits for accepted writes before the final JSONL flush, including writes whose handlers were cancelled.
 
 ## Receiving
 
@@ -35,12 +35,17 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 - JSON Lines are written to one append-only file or to daily-rotated files, and `fsync`'d on graceful shutdown
 - Persistence failures surface as HTTP `503 Service Unavailable` / gRPC `Status::unavailable` so OTLP exporters can retry instead of silently dropping payloads. OTLP treats `500` and `Internal` as non-retryable, so those codes would make exporters drop the batch
 - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
-- Each batch is `flush`'d to the kernel before ACK so an unexpected crash never leaves the last write trapped in `BufWriter`'s in-memory buffer
+- Each batch, including its newline, is written to the kernel before ACK; failed partial appends are truncated back to the batch start. If rollback fails, subsequent writes are rejected until rollback succeeds
+- On open, an incomplete tail after the last newline is removed before new records are appended. Such a batch was never acknowledged. Keep one receiver process per log sink
+- Daily JSONL and pretty files use the local calendar date at each write, including after several idle days
+- JSONL write failures report their underlying cause when the outage starts, at most every 10 minutes while it continues, and after 60 seconds without a failure
 - JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`); telemetry payloads carry `user.email`, `user.id` and organization identifiers
 
 ## Shutdown
 
-- SIGINT and SIGTERM trigger a graceful shutdown, so no batch is lost under `docker stop`
-- The shutdown is bounded by a 10-second grace period: a client that declares a body and never finishes sending it cannot hold the process hostage and prevent the final `fsync`. A second signal abandons in-flight connections immediately
+- SIGINT and SIGTERM trigger graceful shutdown; new ingestion is rejected before the final synchronization, and admitted writes finish even if their request handlers were cancelled
+- Connection draining has a 10-second grace period: a client that declares a body and never finishes sending it cannot hold the process hostage and prevent the final `fsync`. A second signal abandons in-flight connections immediately
 - JSONL is flushed and `fsync`'d first; the two human-readable writers are then drained concurrently within one shared 5-second deadline, so a stdout stuck in a blocking write (a reader that stopped reading) cannot keep the process from exiting
-- Queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged
+- Interrupted and queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged
+
+The 10-second grace bounds connection draining, not the whole shutdown. JSONL disk synchronization is awaited without a timeout; pretty and proxy drains have their own deadlines. A forced kill or power loss is outside the graceful-shutdown guarantee.

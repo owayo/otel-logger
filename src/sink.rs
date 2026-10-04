@@ -1,15 +1,14 @@
 use std::fs::OpenOptions as StdOpenOptions;
-use std::io::{self, BufWriter as StdBufWriter, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use anyhow::{Context, Result};
-use logroller::{LogRoller, LogRollerBuilder, Rotation, RotationAge, TimeZone};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -19,6 +18,7 @@ use crate::aggregator::Aggregator;
 use crate::cli::{LogSink, Settings};
 use crate::format;
 use crate::forward::ProxyRouter;
+use crate::storage::{AppendFile, DailyWriter};
 
 /// 日次 JSONL のファイル名 `otel-logger.YYYY-MM-DD` の前半。
 const ROTATION_PREFIX: &str = "otel-logger";
@@ -26,8 +26,7 @@ const ROTATION_PREFIX: &str = "otel-logger";
 /// `--pretty-log` の日次ファイル名 `otel-logger.pretty.YYYY-MM-DD.log` の前半と拡張子。
 ///
 /// JSONL の `otel-logger.YYYY-MM-DD` と区別できる名前にする。JSONL 側の厳密な名前判定
-/// (日付部分が 10 文字の実在暦日) にも、logroller が JSONL 用に組む
-/// `^otel-logger\.\d{4}-\d{2}-\d{2}$` にも一致しない。
+/// (日付部分が 10 文字の実在暦日) にも一致しない。
 const PRETTY_LOG_PREFIX: &str = "otel-logger.pretty";
 const PRETTY_LOG_SUFFIX: &str = "log";
 
@@ -64,29 +63,17 @@ impl TelemetryRecord {
 /// JSONL 出力 backend。追記専用ファイルか日次ローテーション付き directory writer のどちらか。
 /// どちらも内部は同期的な `std::io::Write` なので、書き込みは `spawn_blocking` 上で行う。
 enum JsonlWriter {
-    File(StdMutex<StdBufWriter<std::fs::File>>),
+    File(StdMutex<AppendFile>),
     Roller(Box<RotatedWriter>),
     #[cfg(test)]
     Fail,
 }
 
 /// 日次ローテーション付き writer。
-///
-/// logroller 本体の保持件数管理 (`max_keep_files`) は**使わない**。あちらの prune は
-/// `otel-logger.\d{4}-\d{2}-\d{2}` に一致するファイル名を辞書順に並べ、古い方から
-/// 「件数 - max_keep」個を消すだけで、日付が実在するかを見ない。そのため
-/// `otel-logger.2026-99-99` のような不正な日付や未来日付のファイルが 1 つあるだけで、
-/// 辞書順ではそれより手前にくる**書き込み中の active file** が削除対象に入る。
-/// Unix では open 済み fd への書き込みと ACK は成功し続けるため、これは
-/// エラーにならないまま prosess 終了時に全データが消える「無音のログ全損」になる。
-/// 保持は mtime と実在暦日を検証する `cleanup_old_rotated_logs` に一本化し、
-/// 日付が変わったタイミングで呼び直す。
-///
-/// 同じディレクトリに書く `--pretty-log` の日次ファイルの整理もこの writer が受け持つ。
-/// writer ごとにディレクトリを掃除させると 2 者が同じファイルを消し合ううえ、
-/// `--pretty-log` を無効に戻した後に残った古いファイルを誰も整理しなくなるため。
+/// 保持は mtime と実在暦日を検証する cleanup に一本化し、日付が変わるたびに実行する。
+/// 同じディレクトリにある pretty ファイルも整理し、無効化後に残った古い出力も回収する。
 struct RotatedWriter {
-    roller: StdMutex<LogRoller>,
+    roller: StdMutex<DailyWriter>,
     dir: PathBuf,
     keep_days: u32,
     /// 最後に cleanup を走らせた日 (UTC 基準の Julian day)。
@@ -115,21 +102,8 @@ impl RotatedWriter {
         }
     }
 
-    /// 日次ファイルを disk へ確定させる。
-    ///
-    /// logroller の `LogRoller::flush` は内部の `std::fs::File` を flush するだけで
-    /// fsync しない (crate 内に `sync_all` / `sync_data` が 1 箇所も存在しない)。
-    /// `--log-file` 経路は graceful shutdown で `sync_all` するのに `--log-dir` だけ
-    /// 何も保証されない状態になり、`init --daemon` が勧める常駐構成の方が
-    /// マシンクラッシュに弱いという逆転が起きていた。
-    ///
-    /// どのファイルが書き込み中かを logroller が公開しないため、保持対象の日次
-    /// ファイルをまとめて fsync する。shutdown 時の 1 回だけなのでコストは無視できる。
-    ///
-    /// 対象は JSONL の日次ファイルだけで、`--pretty-log` のファイルは含めない。人が読める
-    /// 出力は best-effort で、lossless な記録は JSONL が持つ。しかも pretty writer は
-    /// この時点で queue を書き終えていない (drain は JSONL の fsync の後) ため、ここで
-    /// 同期しても末尾は保証できない。
+    /// 保持対象の JSONL 日次ファイルを shutdown 時にまとめて fsync する。
+    /// ローテーション前のファイルも対象とし、best-effort の pretty は対象にしない。
     fn sync_rotated_files(&self) -> Result<()> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -178,14 +152,13 @@ impl RotatedWriter {
 
 impl JsonlWriter {
     fn write_line(&self, line: &[u8]) -> Result<()> {
-        // 永続化失敗を上位で 5xx に変換する以上、ACK 時点で BufWriter の中身は最低限
+        // 永続化失敗を上位で 5xx に変換する以上、ACK 時点で改行まで最低限
         // kernel に渡しておく必要がある。fsync まで毎 batch で待つと throughput が落ちるため
-        // ここでは flush のみ呼び、disk への確定は graceful shutdown 時の sync_all に任せる。
+        // ここでは書き込み完了まで待ち、disk への確定は graceful shutdown 時の sync_all に任せる。
         match self {
             Self::File(m) => {
                 let mut g = lock_recovering(m);
-                g.write_all(line).context("append JSONL line")?;
-                g.flush().context("flush JSONL line")?;
+                g.append(line).context("append JSONL line")?;
                 Ok(())
             }
             Self::Roller(w) => {
@@ -203,9 +176,8 @@ impl JsonlWriter {
     fn flush(&self) -> Result<()> {
         match self {
             Self::File(m) => {
-                let mut g = lock_recovering(m);
-                g.flush().context("flush JSONL file")?;
-                g.get_mut().sync_all().context("fsync JSONL file")
+                let g = lock_recovering(m);
+                g.sync_all().context("fsync JSONL file")
             }
             Self::Roller(w) => {
                 let mut g = lock_recovering(&w.roller);
@@ -454,6 +426,24 @@ fn log_health(destination: &str, report: &HealthReport, error: Option<&anyhow::E
     }
 }
 
+/// 永続化失敗は exporter に再送させるが、サーバー側にも原因と回復状況を残す。
+fn log_jsonl_health(report: &HealthReport, error: Option<&anyhow::Error>) {
+    let error = error.map(|error| format!("{error:#}"));
+    match report {
+        HealthReport::Silent => {}
+        HealthReport::Started => tracing::error!(error = ?error,
+            "JSONL persistence failed; rejecting batches with retryable status"),
+        HealthReport::Ongoing { failures, elapsed } => tracing::warn!(error = ?error,
+            failed_batches = failures, failing_for_secs = elapsed.as_secs(),
+            "JSONL persistence is still failing"),
+        HealthReport::Recovered { failures, elapsed } => tracing::info!(
+            failed_batches = failures,
+            failing_for_secs = elapsed.as_secs(),
+            "JSONL persistence recovered"
+        ),
+    }
+}
+
 /// 人が読める出力の書き出し先。
 #[derive(Clone)]
 enum PrettyTarget {
@@ -461,7 +451,7 @@ enum PrettyTarget {
     Stdout,
     /// `--pretty-log`: `log-dir` 内の日次ファイル (`otel-logger.pretty.YYYY-MM-DD.log`)。
     /// otel-logger 自身が開いたファイルなので、保存先も保持期間も分かっている。
-    File(Arc<StdMutex<LogRoller>>),
+    File(Arc<StdMutex<DailyWriter>>),
     /// テスト用: 書いた内容を溜める。
     #[cfg(test)]
     Capture(Arc<StdMutex<Vec<u8>>>),
@@ -678,6 +668,9 @@ fn write_pretty_to<W: io::Write>(
 
 struct SinkInner {
     summary_enabled: bool,
+    /// shutdown は受理済み処理の完了を待ってから閉じ、新しい受信を拒否する。
+    admission: Arc<RwLock<bool>>,
+    jsonl_health: StdMutex<WriteHealth>,
     file: Option<JsonlWriter>,
     /// stdout への人が読める出力 (`--no-stdout` なら `None`)。
     stdout: Option<PrettyOutput>,
@@ -766,6 +759,8 @@ impl Sink {
 
         Ok(Self {
             inner: Arc::new(SinkInner {
+                admission: Arc::new(RwLock::new(true)),
+                jsonl_health: StdMutex::new(WriteHealth::default()),
                 summary_enabled: settings.summary,
                 file,
                 stdout,
@@ -795,10 +790,32 @@ impl Sink {
     /// 人が読める出力 (stdout / pretty-log) はベストエフォートで、書き込みに失敗しても
     /// tracing にだけ記録する。
     pub async fn record(&self, record: TelemetryRecord) -> Result<()> {
+        let admission = Arc::clone(&self.inner.admission).read_owned().await;
+        anyhow::ensure!(*admission, "JSONL sink is shutting down");
+        let sink = self.clone();
+        // handler が cancel されても、blocking I/O の完了まで受理中の guard を保持する。
+        // listener を abort した後に接続 task が残っても、最後の fsync を追い越せない。
+        tokio::spawn(async move {
+            let _admission = admission;
+            sink.record_admitted(record).await
+        })
+        .await
+        .context("join admitted record task")?
+    }
+
+    async fn record_admitted(&self, record: TelemetryRecord) -> Result<()> {
         if self.inner.file.is_some() {
-            self.write_jsonl(&record)
+            let result = self
+                .write_jsonl(&record)
                 .await
-                .with_context(|| format!("persist {} batch to JSONL", record.kind()))?;
+                .with_context(|| format!("persist {} batch to JSONL", record.kind()));
+            let mut health = lock_recovering(&self.inner.jsonl_health);
+            let report = match &result {
+                Ok(()) => health.on_success(Instant::now()),
+                Err(_) => health.on_failure(Instant::now()),
+            };
+            log_jsonl_health(&report, result.as_ref().err());
+            result?;
         }
 
         // JSONL 永続化が成功した batch だけを集計する。失敗時は exporter が retry するため、
@@ -851,6 +868,13 @@ impl Sink {
         }
     }
 
+    /// 新しい受信を拒否し、受理済み batch の完了後に最終同期する。
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut admission = self.inner.admission.write().await;
+        *admission = false;
+        self.flush().await
+    }
+
     /// buffer 済み書き込みを flush する。SIGTERM でも末尾 batch を失わないよう、
     /// graceful shutdown から呼び出す。
     ///
@@ -893,25 +917,17 @@ async fn drain_pretty_output(output: Option<&PrettyOutput>, deadline: tokio::tim
     }
 }
 
-fn open_log_file_sync(path: &Path) -> Result<StdBufWriter<std::fs::File>> {
+fn open_log_file_sync(path: &Path) -> Result<AppendFile> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         crate::path::create_private_dir(parent)
             .with_context(|| format!("create parent directory of {}", path.display()))?;
     }
-    let mut options = StdOpenOptions::new();
-    options.create(true).append(true);
-    crate::path::restrict_new_file_mode(&mut options);
-    let file = options
-        .open(path)
-        .with_context(|| format!("open log file {}", path.display()))?;
-    Ok(StdBufWriter::new(file))
+    AppendFile::open(path).with_context(|| format!("open log file {}", path.display()))
 }
 
 fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
-    // logroller が作る日次ファイルの mode は指定できないため、ディレクトリ側を
-    // 0700 にして他ユーザーから辿れないようにする。
     crate::path::create_private_dir(dir)
         .with_context(|| format!("create log directory {}", dir.display()))?;
     // `--log-keep-days 0` が来た時に cutoff = now() となり全 rotated file が
@@ -919,12 +935,8 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
     let max_keep = keep_days.max(1);
     cleanup_old_rotated_logs(dir, max_keep)
         .with_context(|| format!("cleanup old log files in {}", dir.display()))?;
-    // `max_keep_files` は意図的に設定しない (理由は `RotatedWriter` の doc comment)。
-    let appender = LogRollerBuilder::new(dir, Path::new(ROTATION_PREFIX))
-        .rotation(Rotation::AgeBased(RotationAge::Daily))
-        .time_zone(TimeZone::Local)
-        .build()
-        .map_err(|e| anyhow::anyhow!("build log roller: {e}"))?;
+    let appender =
+        DailyWriter::new(dir, ROTATION_PREFIX, None).context("open daily JSONL writer")?;
     Ok(RotatedWriter {
         roller: StdMutex::new(appender),
         dir: dir.to_path_buf(),
@@ -933,26 +945,16 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
     })
 }
 
-/// `--pretty-log` の日次ファイル writer を開く。
-///
-/// JSONL と同じく logroller の日次ローテーション (ローカル時刻) を使い、同じ日付境界で
-/// ファイルを切り替える。`max_keep_files` は JSONL と同じ理由で設定しない
-/// (`RotatedWriter` の doc comment)。古いファイルの整理は、同じディレクトリの JSONL
-/// writer が `cleanup_old_rotated_logs` でまとめて行う。
-fn open_pretty_log_sync(dir: &Path) -> Result<LogRoller> {
-    // 通常は JSONL の directory sink が先に作っているが、単独でも 0700 で作る。
+/// JSONL と同じローカル暦日の境界で切り替える。保持管理は JSONL 側がまとめて行う。
+fn open_pretty_log_sync(dir: &Path) -> Result<DailyWriter> {
     crate::path::create_private_dir(dir)
         .with_context(|| format!("create log directory {}", dir.display()))?;
-    LogRollerBuilder::new(dir, Path::new(PRETTY_LOG_PREFIX))
-        .rotation(Rotation::AgeBased(RotationAge::Daily))
-        .time_zone(TimeZone::Local)
-        .suffix(PRETTY_LOG_SUFFIX.to_string())
-        .build()
-        .map_err(|e| anyhow::anyhow!("build pretty log roller: {e}"))
+    DailyWriter::new(dir, PRETTY_LOG_PREFIX, Some(PRETTY_LOG_SUFFIX))
+        .context("open daily pretty writer")
 }
 
 /// mtime 基準で `keep_days` より古い otel-logger の日次ファイル (JSONL と `--pretty-log`) を
-/// 削除する。claw-hooks の `cleanup_old_logs` と揃え、社内 CLI 間で挙動を一貫させる。
+/// 削除する。
 ///
 /// `--pretty-log` が無効でも pretty の日次ファイルを対象にする。無効に戻した後に
 /// 残ったファイルを整理する主体が他に無いため。
@@ -1147,6 +1149,8 @@ mod tests {
     fn failing_jsonl_sink() -> Sink {
         Sink {
             inner: Arc::new(SinkInner {
+                admission: Arc::new(RwLock::new(true)),
+                jsonl_health: StdMutex::new(WriteHealth::default()),
                 summary_enabled: true,
                 file: Some(JsonlWriter::Fail),
                 stdout: None,
@@ -1168,6 +1172,8 @@ mod tests {
             |target: PrettyTarget| PrettyOutput::spawn(target, false, Arc::clone(&aggregator));
         Sink {
             inner: Arc::new(SinkInner {
+                admission: Arc::new(RwLock::new(true)),
+                jsonl_health: StdMutex::new(WriteHealth::default()),
                 summary_enabled,
                 file: None,
                 stdout: stdout.map(spawn),
@@ -1742,6 +1748,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_waits_for_cancelled_handler_and_rejects_later_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let sink = Sink::from_settings(&settings_with_log_file(path.clone()))
+            .await
+            .unwrap();
+        let JsonlWriter::File(writer) = sink.inner.file.as_ref().unwrap() else {
+            panic!()
+        };
+        // writer を別 thread で止め、handler の cancel と disk I/O 完了の順を固定する。
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let blocker_sink = sink.clone();
+        let blocker_gate = gate.clone();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let JsonlWriter::File(writer) = blocker_sink.inner.file.as_ref().unwrap() else {
+                panic!()
+            };
+            let _writer = lock_recovering(writer);
+            locked_tx.send(()).unwrap();
+            let mut open = lock_recovering(&blocker_gate.0);
+            while !*open {
+                open = blocker_gate.1.wait(open).unwrap();
+            }
+        });
+        locked_rx.await.unwrap();
+        assert!(writer.try_lock().is_err());
+        let recording_sink = sink.clone();
+        let handler = tokio::spawn(async move {
+            recording_sink
+                .record(TelemetryRecord::Logs(Box::default()))
+                .await
+        });
+        wait_until("受理済み guard", || {
+            sink.inner.admission.try_write().is_err()
+        })
+        .await;
+        handler.abort();
+        let _ = handler.await;
+        let closing_sink = sink.clone();
+        let closing = tokio::spawn(async move { closing_sink.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !closing.is_finished(),
+            "書き込み完了前に最終同期を終了しない"
+        );
+        open_gate(&gate);
+        blocker.await.unwrap();
+        closing.await.unwrap().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+        assert!(
+            sink.record(TelemetryRecord::Logs(Box::default()))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
     /// 正常系: JSONL writer が成功すれば `record` は Ok を返し、ファイルに 1 行追記される。
     #[tokio::test]
     async fn record_persists_payload_and_returns_ok() {
@@ -1810,9 +1876,8 @@ mod tests {
 
     /// 回帰テスト: `--log-dir` 経路の fsync がローテーション名のファイルだけを対象にする。
     ///
-    /// logroller の `LogRoller::flush` は内部 `fs::File` の flush (= no-op) なので、
-    /// `--log-file` 経路と durability を揃えるには日次ファイルを開き直して `sync_all`
-    /// する必要がある。その際、同じ prefix の別用途ファイル (`otel-logger.pid` など) を
+    /// 日付切り替え前のファイルも disk へ確定するため、日次ファイルを開き直して
+    /// `sync_all` する。その際、同じ prefix の別用途ファイル (`otel-logger.pid` など) を
     /// 巻き込んで書き込みモードで開かないことを固定する。
     #[test]
     fn sync_rotated_files_skips_files_that_are_not_daily_logs() {
@@ -1857,7 +1922,7 @@ mod tests {
     /// 旧実装では `BufWriter` のメモリバッファに留まったまま ACK し、後続の `sink.flush()`
     /// 失敗で batch が失われる余地があったため、その regression test を兼ねる。
     #[tokio::test]
-    async fn record_flushes_buf_writer_before_returning_ok() {
+    async fn record_writes_to_kernel_before_returning_ok() {
         let dir = tempfile::TempDir::new().unwrap();
         let log_path = dir.path().join("otel-logger.jsonl");
         let sink = Sink::from_settings(&settings_with_log_file(log_path.clone()))
@@ -1870,7 +1935,7 @@ mod tests {
         sink.record(TelemetryRecord::Logs(Box::new(req)))
             .await
             .expect("record で永続化に成功すること");
-        // ここでは sink.flush() を呼ばずに直接ファイルを読む。BufWriter のままなら 0 byte の
+        // ここでは sink.flush() を呼ばずに直接ファイルを読む。writer のままなら 0 byte の
         // 可能性があるが、新実装では batch 毎の flush で kernel に渡している。
         let body = std::fs::read_to_string(&log_path).unwrap();
         assert!(

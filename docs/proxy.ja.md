@@ -6,8 +6,8 @@
 - **振り分け**: 組み込み既定で `claude-code` → Anthropic route、`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → OpenAI route。config で空でない `service_names` を明示すれば上書き可能。空の名前は startup 時に reject し、`service.name` が無い resource の誤転送を防ぐ
 - **優先順位**: 組み込み route と同名の config endpoint はそのまま利用しつつ、CLI の transport / header で上書きできる。endpoint を CLI で重ねて指定しなくても CLI > 環境変数 > config の優先順位を守る
 - **HTTP endpoint の検証**: `http-protobuf` route には絶対 `http://` / `https://` URL を指定する。設定値の末尾へ signal 別パス (`/v1/logs`、`/v1/traces`、`/v1/metrics`) を追加するため、query と fragment は startup 時に reject する
-- **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。route worker が指数バックオフで retry する (既定では初回送信後に最大 8 回、200ms → 30s cap)。受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく送信中の request も即座に中断し、設定した request timeout を待たない
-- **終了時の送り切り**: proxy の queue に残った batch は破棄せず 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
+- **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。route worker が OTLP 仕様で再送できる失敗だけを指数バックオフで retry する (既定では初回送信後に最大 8 回、200ms → 30s cap)。受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく送信中の request も即座に中断し、設定した request timeout を待たない
+- **終了時の送り切り**: 送信中・backoff 中に中断した batch を先頭に戻し、queue に残った batch と共に 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
 - **認証**: header 値に `env:VAR_NAME` を書くと環境変数から解決する。secret をプロセス一覧や config ファイルに平文で残さないためこちらを推奨
 
 ## CLI での指定例
@@ -71,3 +71,9 @@ route ごとの送信累計は `GET /stats` の `proxy` フィールドで観測
 ## Phase B (今後の予定) — crash-safe outbox
 
 現行 (Phase A) は「JSONL には確実に残るが、process crash 時に in-flight batch が転送されない可能性がある」段階です。Phase B では JSONL の byte-offset を per-route checkpoint として保持し、起動時に catch-up 走査して欠測ゼロを厳密に担保する予定です。このため `--proxy-checkpoint-dir` フラグ・checkpoint ディレクトリの配置場所は先行して用意されています。
+
+## 再送できる失敗
+
+HTTP は `429` / `502` / `503` / `504` だけを再送します。`3xx`、`400`、`401`、`413`、`500` などは再送しません。gRPC は `Cancelled` / `DeadlineExceeded` / `Aborted` / `OutOfRange` / `Unavailable` / `DataLoss`、および有効な `google.rpc.RetryInfo` 付きの `ResourceExhausted` を再送します。HTTP の `Retry-After` (秒数または HTTP-date) と gRPC RetryInfo が指定する待機時間が backoff より長い場合は、上流の指定を尊重します。詳細は [OTLP の失敗処理仕様](https://opentelemetry.io/docs/specs/otlp/#failures)を参照してください。
+
+shutdown で中断した batch は drain の結果で一度だけ件数へ反映します。期限を超えた分は `dropped`、恒久的な送信失敗は `failed` です。payload は JSONL に残りますが、Phase A では自動再生しません。

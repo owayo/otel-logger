@@ -37,6 +37,8 @@ When `conversation.id` is present on an SSE completion log, the aggregator uses 
 
 Codex turn metrics do not carry `conversation.id` or reasoning effort. Their last-session fallback is therefore isolated by `service.name`, preventing a concurrent TUI (`codex_cli_rs`) and Exec (`codex_exec`) process from assigning one process's provider/effort metadata to the other's metrics.
 
+Provider and effort are resolved independently. When the provider arrives first, usage moves to that provider while remaining pending for later effort metadata. Missing provider attributes never overwrite an already confirmed provider.
+
 ## Counter safety
 
 - Provider/model/effort values are kept dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free

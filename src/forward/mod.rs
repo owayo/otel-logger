@@ -1,4 +1,4 @@
-//! OTLP proxy forwarder。
+//! OTLP proxy 転送。
 //!
 //! 受信した OTLP payload を service.name で振り分け、Anthropic/OpenAI などの
 //! 上流 collector へ transparently に forward する。JSONL 保存 (受信 payload の

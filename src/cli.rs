@@ -791,7 +791,7 @@ fn validate_header_key(key: &str, route_name: &str) -> anyhow::Result<()> {
         anyhow::bail!("proxy route `{route_name}` has an empty header key");
     }
     // RFC 7230: token = 1*tchar. 制御文字と区切り文字を排除。
-    for ch in key.chars() {
+    for (position, ch) in key.chars().enumerate() {
         let ok = ch.is_ascii_graphic()
             && !matches!(
                 ch,
@@ -814,7 +814,7 @@ fn validate_header_key(key: &str, route_name: &str) -> anyhow::Result<()> {
             );
         if !ok {
             anyhow::bail!(
-                "proxy route `{route_name}` header key `{key}` contains invalid character `{ch}`"
+                "proxy route `{route_name}` header key contains an invalid character at position {position}"
             );
         }
     }
@@ -850,6 +850,20 @@ fn validate_header_value(key: &str, value: &str, route_name: &str) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_basic_header_does_not_leak_credentials_as_a_key() {
+        let mut headers = BTreeMap::new();
+        merge_cli_headers(
+            &mut headers,
+            &["Authorization: Basic ZXhhbXBsZTpzZWNyZXQ=".to_string()],
+        )
+        .unwrap();
+        let error = format!("{:#}", resolve_headers(headers, "test").unwrap_err());
+        assert!(error.contains("invalid character"));
+        assert!(!error.to_ascii_lowercase().contains("zxhhbxbsztpzzwnyzxq"));
+        assert!(!error.contains("Basic"));
+    }
+
     use super::*;
 
     fn run_test_in_child_with_env(test_name: &str, key: &str, value: &str) -> bool {
