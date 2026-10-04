@@ -514,4 +514,55 @@ mod tests {
 
         server.abort();
     }
+
+    /// drain の期限で中断した送信と未送信 queue は failed へ重複計上しない。
+    #[tokio::test]
+    async fn drain_deadline_counts_interrupted_and_queued_batches_as_dropped() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/logs", post(stalled_upstream))
+            .with_state(Arc::new(Notify::new()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let route = ProxyRoute {
+            name: "test".into(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 30_000).unwrap();
+        let metrics = Arc::new(RouteMetrics::default());
+        let (tx, receiver) = mpsc::channel(2);
+        for _ in 0..2 {
+            tx.send(ExportRequest::Logs(Box::new(ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs::default()],
+            })))
+            .await
+            .unwrap();
+        }
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let worker = spawn(WorkerConfig {
+            route_name: "test".into(),
+            client,
+            receiver,
+            metrics: metrics.clone(),
+            retry_max: 0,
+            shutdown,
+        });
+        tokio::time::timeout(DRAIN_GRACE + Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.sent_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.dropped_total.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
 }
