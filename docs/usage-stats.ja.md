@@ -37,6 +37,8 @@ Codex 0.144.1+ の SSE completion に含まれる `model_reasoning_effort` を�
 
 `conversation.id` / effort を持たない Codex turn metrics は、同じ `service.name` で最後に観測した session だけを fallback に使います。TUI (`codex_cli_rs`) と Exec (`codex_exec`) が同時稼働しても、片方の provider / effort がもう片方の metrics に混入しません。
 
+provider と effort は独立して補完します。provider が先に判明して effort が未判明なら、usage を正しい provider の unknown-effort バケットへ移し、後から effort を補完できるよう保留を続けます。provider 属性が欠けたイベントで確定済み provider を消すことはありません。
+
 ## カウンタの保護
 
 - provider/model/effort を固定 allowlist で制限せず動的に保持するため、`gpt-5.6-terra` や Fable のような新しい識別子も lossless に記録する。component 内に `/` や `%` が含まれても別バケットと衝突しない

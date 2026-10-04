@@ -57,6 +57,7 @@ axum = { version = "0.8.9", default-features = false, features = [
 ] }
 bytes = "1.12.1"
 http = "1.5.0"
+httpdate = "1.0.3"
 # OTLP/HTTP client は body を gzip して送ってよい (`Content-Encoding: gzip`)。
 # 解凍しないと protobuf decode に失敗して 400 を返し、OTLP 仕様上 400 は retry 禁止
 # なので batch がそのまま失われる。
@@ -103,8 +104,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 is-terminal = "0.4.17"
 
-# JSONL 出力の日次ローテーション (claw-hooks と揃える)。
-logroller = "0.1.12"
+# 日次ファイルは書き込み時のローカル暦日で切り替える。
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

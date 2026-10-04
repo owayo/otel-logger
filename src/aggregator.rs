@@ -629,9 +629,8 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
     let conversation_id = string_attr(attrs, "conversation.id")
         .map(str::to_string)
         .unwrap_or_default();
-    let provider = string_attr(attrs, "provider_name")
-        .map(str::to_string)
-        .unwrap_or_else(|| PROVIDER_OPENAI.to_string());
+    let provider_attr = string_attr(attrs, "provider_name").filter(|value| !value.is_empty());
+    let provider = provider_attr.unwrap_or(PROVIDER_OPENAI).to_string();
     let model = string_attr(attrs, "model")
         .map(str::to_string)
         .unwrap_or_default();
@@ -646,14 +645,14 @@ fn extract_session_from_attrs(attrs: &[KeyValue]) -> Option<CodexSession> {
         provider,
         model,
         effort,
-        provider_confirmed: true,
+        provider_confirmed: provider_attr.is_some(),
     })
 }
 
 struct CodexSseExtraction {
     bucket: Bucket,
     stats: ModelStats,
-    /// `conversation.id` 付きで届いたが、対応する session が未受信の場合に `Some(id)` を
+    /// `conversation.id` 付きで届き、provider / effort が未確定の場合に `Some(id)` を
     /// 返す。後続の `update_codex_session` で当該 conversation の usage だけを切り出し、
     /// 確定した provider / effort バケットへ移すために使う。
     pending_conversation_id: Option<String>,
@@ -732,13 +731,14 @@ fn extract_codex_sse_response_completed(
     // session 未着時は provider が暫定値になるため、effort を直接取得できた場合も pending
     // に積む。id 無しの旧 telemetry は従来どおり unknown バケット全体を後から移す。
     // `handle_responses` span から合成しただけの session も provider が暫定値なので、
-    // 確定済み (`conversation_starts` 由来) でない限り pending を維持する。
-    let pending_conversation_id =
-        if has_conversation_id && session.is_none_or(|s| !s.provider_confirmed) {
-            conversation_id
-        } else {
-            None
-        };
+    // provider と effort の両方が確定するまで pending を維持する。
+    let pending_conversation_id = if has_conversation_id
+        && (session.is_none_or(|s| !s.provider_confirmed) || bucket.effort == UNKNOWN)
+    {
+        conversation_id
+    } else {
+        None
+    };
     Some(CodexSseExtraction {
         bucket,
         stats,
@@ -1036,7 +1036,7 @@ fn merge_codex_pending_sse(
         // openai-compatible custom endpoint) で到着すると、`provider=session の
         // provider` だけで lookup すると miss して pending が残り続け、
         // SSE 時に積んだ暫定 provider / effort バケットの値も移動できない。
-        // そこで `(model, conversation_id)` でマッチするすべての pending を
+        // そこで `conversation_id` でマッチするすべての pending を
         // 取得し、各 from バケット (pending エントリが指す provider / effort) から
         // to バケット (session の provider / effort) へ個別に移す。
         //
@@ -1060,11 +1060,7 @@ fn merge_codex_pending_sse(
             // response に最も近い SSE 自身の effort を優先し、SSE が unknown の場合だけ
             // 遅着した session の effort で補完する。
             let resolved_effort = if key.effort == UNKNOWN {
-                if effort.is_empty() || effort == UNKNOWN {
-                    // session 側にも effort が無ければ確定できないため pending を維持する。
-                    continue;
-                }
-                effort.to_string()
+                non_empty(effort.to_string())
             } else {
                 key.effort.clone()
             };
@@ -1075,8 +1071,8 @@ fn merge_codex_pending_sse(
             // pending を捨てず、確定した effort と暫定 provider で置き直す。ここで
             // 捨てると、後から本物の `conversation_starts` が非既定 provider (Azure や
             // openai-compatible endpoint) で届いても usage を移せず、暫定 provider の
-            // バケットに取り残される。
-            if !provider_confirmed {
+            // バケットに取り残される。effort が unknown の場合も、後続の補完に備えて保留する。
+            if !provider_confirmed || actual_to.effort == UNKNOWN {
                 let moved_key = PendingCodexSseKey {
                     provider: actual_to.provider.clone(),
                     model: actual_to.model.clone(),
@@ -4426,6 +4422,14 @@ mod tests {
             SERVICE_CODEX_EXEC,
             "codex.conversation_starts",
             vec![kv_str("conversation.id", "conv-1")],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "conv-1"),
+                kv_str("provider_name", ""),
+            ],
         ));
         agg.ingest_logs(&make_log_req(
             SERVICE_CODEX_EXEC,

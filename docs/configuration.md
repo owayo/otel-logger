@@ -27,6 +27,8 @@ Files older than `log-keep-days` days, judged by their modification time, are re
 
 Cleanup only removes those two kinds of names, and only when the date in the name is a real calendar date. Other files in the same directory, such as `otel-logger.pid`, `otel-logger.stderr.log`, or a standalone `otel-logger.jsonl`, are left untouched. Date-shaped names containing an impossible date, symbolic links, and pretty-shaped names without the exact `.log` suffix (such as `otel-logger.pretty.2026-09-30` or `otel-logger.pretty.2026-09-30.log.gz`) are also left untouched.
 
+Daily files use the local calendar date at each write. After several idle days, the next batch still goes to the current day’s file.
+
 ## Starter files
 
 Generate a fully-commented starter file with the bundled command:

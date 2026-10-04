@@ -68,10 +68,8 @@ impl GrpcClient {
         let channel = endpoint.connect_lazy();
         let mut metadata = MetadataMap::new();
         for (key, value) in &route.headers {
-            let name =
-                AsciiMetadataKey::from_str(&key.to_ascii_lowercase()).with_context(|| {
-                    format!("invalid metadata key `{key}` for route `{}`", route.name)
-                })?;
+            let name = AsciiMetadataKey::from_str(&key.to_ascii_lowercase())
+                .with_context(|| format!("invalid metadata key for route `{}`", route.name))?;
             let val = AsciiMetadataValue::try_from(value.as_str()).with_context(|| {
                 format!(
                     "invalid metadata value for header `{key}` on route `{}`",
@@ -245,7 +243,7 @@ impl HttpClient {
             .tcp_keepalive(Some(Duration::from_secs(60)))
             // OTLP endpoint は明示指定なので redirect を追う正当性がない。既定 (最大 10 回)
             // のままだと、`api-key` のようなカスタム認証ヘッダは cross-host でも除去されず、
-            // 307/308 では body ごと別 origin へ再送される。3xx は送信失敗として retry させる。
+            // 307/308 では body ごと別 origin へ再送される。3xx は恒久的な送信失敗とする。
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build reqwest client")?;
@@ -268,10 +266,8 @@ impl HttpClient {
             reqwest::header::HeaderValue::from_static(OTLP_HTTP_PROTOBUF),
         );
         for (key, value) in &route.headers {
-            let name =
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()).with_context(|| {
-                    format!("invalid HTTP header key `{key}` on route `{}`", route.name)
-                })?;
+            let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                .with_context(|| format!("invalid HTTP header key on route `{}`", route.name))?;
             let val = reqwest::header::HeaderValue::from_str(value).with_context(|| {
                 format!(
                     "invalid HTTP header value for `{key}` on route `{}`",
@@ -312,12 +308,119 @@ impl HttpClient {
             // 本文は読まない。`text()` は全量をメモリに展開する (gzip なら展開後のサイズ) ため、
             // 読んでから切り詰めても上限にならず、中身も上流が自由に決められる文字列なので
             // そのまま stderr に出すと terminal escape injection の経路になる。
-            bail!("upstream returned HTTP {status}");
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+            return Err(HttpExportFailure {
+                status,
+                retry_after,
+            }
+            .into());
         }
         // 2xx かつ body 全体を discard。partial success の解析は今のところ省略 (Phase B で追加)。
         drop(response);
         Ok(())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("upstream returned HTTP {status}")]
+struct HttpExportFailure {
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let delay = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value).ok().map(|date| {
+                date.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            })
+        })?;
+    // 外部入力が巨大でも tokio の deadline 計算を overflow させない。
+    std::time::Instant::now().checked_add(delay).map(|_| delay)
+}
+
+/// `Some` は retry 可能な失敗、値は上流が指定した最小待機時間。
+/// OTLP が retry を禁止する status は即座に worker へ返す。
+pub(super) fn retry_delay(error: &anyhow::Error) -> Option<Duration> {
+    if let Some(error) = error.downcast_ref::<HttpExportFailure>() {
+        return matches!(error.status.as_u16(), 429 | 502 | 503 | 504)
+            .then(|| error.retry_after.unwrap_or_default());
+    }
+    if let Some(status) = error.downcast_ref::<tonic::Status>() {
+        return match status.code() {
+            tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unavailable
+            | tonic::Code::DataLoss => Some(grpc_retry_info(status).unwrap_or_default()),
+            tonic::Code::ResourceExhausted => grpc_retry_info(status),
+            _ => None,
+        };
+    }
+    // 接続断など、上流から status を受け取っていない transport 障害は再送できる。
+    error
+        .downcast_ref::<reqwest::Error>()
+        .map(|_| Duration::ZERO)
+}
+
+/// google.rpc.Status / Any / RetryInfo の必要な field だけを読む。
+/// ResourceExhausted は有効な RetryInfo を伴う場合だけ retry できる。
+#[derive(prost::Message)]
+struct RpcStatus {
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<RpcAny>,
+}
+
+#[derive(prost::Message)]
+struct RpcAny {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
+#[derive(prost::Message)]
+struct RpcRetryInfo {
+    #[prost(message, optional, tag = "1")]
+    retry_delay: Option<RpcDuration>,
+}
+
+#[derive(prost::Message)]
+struct RpcDuration {
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+    #[prost(int32, tag = "2")]
+    nanos: i32,
+}
+
+fn grpc_retry_info(status: &tonic::Status) -> Option<Duration> {
+    let decoded = RpcStatus::decode(status.details()).ok()?;
+    decoded.details.iter().find_map(|detail| {
+        if detail.type_url.rsplit('/').next() != Some("google.rpc.RetryInfo") {
+            return None;
+        }
+        let info = RpcRetryInfo::decode(detail.value.as_slice()).ok()?;
+        let Some(duration) = info.retry_delay else {
+            return Some(Duration::ZERO);
+        };
+        if !(0..=315_576_000_000).contains(&duration.seconds)
+            || !(0..1_000_000_000).contains(&duration.nanos)
+        {
+            return None;
+        }
+        let delay = Duration::new(duration.seconds as u64, duration.nanos as u32);
+        std::time::Instant::now().checked_add(delay).map(|_| delay)
+    })
 }
 
 fn encode_pb<M: Message>(msg: &M) -> Vec<u8> {
@@ -348,6 +451,138 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn http_retry_policy_accepts_only_otlp_retryable_statuses() {
+        for code in 300..600 {
+            let error = HttpExportFailure {
+                status: reqwest::StatusCode::from_u16(code).unwrap(),
+                retry_after: Some(Duration::from_secs(3)),
+            };
+            assert_eq!(
+                retry_delay(&error.into()),
+                matches!(code, 429 | 502 | 503 | 504).then_some(Duration::from_secs(3)),
+                "HTTP {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_retry_policy_requires_retry_info_for_resource_exhausted() {
+        for code in 1..=16 {
+            let code = tonic::Code::from_i32(code);
+            let error =
+                anyhow::Error::new(tonic::Status::new(code, "untrusted message")).context("export");
+            assert_eq!(
+                retry_delay(&error).is_some(),
+                matches!(
+                    code,
+                    tonic::Code::Cancelled
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::Aborted
+                        | tonic::Code::OutOfRange
+                        | tonic::Code::Unavailable
+                        | tonic::Code::DataLoss
+                )
+            );
+        }
+        let retry = RpcRetryInfo {
+            retry_delay: Some(RpcDuration {
+                seconds: 2,
+                nanos: 500_000_000,
+            }),
+        };
+        let details = RpcStatus {
+            details: vec![RpcAny {
+                type_url: "type.googleapis.com/google.rpc.RetryInfo".to_string(),
+                value: retry.encode_to_vec(),
+            }],
+        }
+        .encode_to_vec();
+        let status =
+            tonic::Status::with_details(tonic::Code::ResourceExhausted, "busy", details.into());
+        assert_eq!(
+            retry_delay(&status.into()),
+            Some(Duration::from_millis(2500))
+        );
+        let invalid = tonic::Status::with_details(
+            tonic::Code::ResourceExhausted,
+            "busy",
+            Bytes::from_static(b"bad"),
+        );
+        assert_eq!(retry_delay(&invalid.into()), None);
+        for (delay, expected) in [
+            (None, Some(Duration::ZERO)),
+            (
+                Some(RpcDuration {
+                    seconds: -1,
+                    nanos: 0,
+                }),
+                None,
+            ),
+            (
+                Some(RpcDuration {
+                    seconds: 0,
+                    nanos: 1_000_000_000,
+                }),
+                None,
+            ),
+            (
+                Some(RpcDuration {
+                    seconds: 315_576_000_001,
+                    nanos: 0,
+                }),
+                None,
+            ),
+        ] {
+            let details = RpcStatus {
+                details: vec![RpcAny {
+                    type_url: "type.googleapis.com/google.rpc.RetryInfo".into(),
+                    value: RpcRetryInfo { retry_delay: delay }.encode_to_vec(),
+                }],
+            }
+            .encode_to_vec();
+            let status =
+                tonic::Status::with_details(tonic::Code::ResourceExhausted, "busy", details.into());
+            assert_eq!(retry_delay(&status.into()), expected);
+        }
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(60));
+        let delay = parse_retry_after(&date).unwrap();
+        assert!(delay > Duration::from_secs(58) && delay <= Duration::from_secs(60));
+        assert_eq!(parse_retry_after("invalid"), None);
+        assert_eq!(parse_retry_after("18446744073709551615"), None);
+    }
+
+    #[tokio::test]
+    async fn client_header_validation_does_not_echo_an_invalid_key() {
+        for transport in [ProxyTransport::Grpc, ProxyTransport::HttpProtobuf] {
+            let route = ProxyRoute {
+                name: "test".to_string(),
+                service_names: vec![],
+                signals: ProxySignal::ALL.to_vec(),
+                transport,
+                endpoint: "http://localhost:4317".to_string(),
+                headers: vec![(
+                    "Authorization: Basic example-secret".to_string(),
+                    "".to_string(),
+                )],
+            };
+            let error = match RouteClient::build(&route, 3000) {
+                Ok(_) => panic!("不正な header を受理した"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(!error.contains("example-secret"));
+        }
+    }
 
     #[derive(Default)]
     struct MockState {

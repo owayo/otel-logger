@@ -206,7 +206,7 @@ pub fn render_config_template(profile: InitProfile) -> String {
 pub struct Config {
     /// gRPC bind address (OTLP/gRPC)。
     pub grpc_addr: Option<SocketAddr>,
-    /// HTTP bind address (OTLP/HTTP)。
+    /// OTLP/HTTP の bind アドレス。
     pub http_addr: Option<SocketAddr>,
     /// 受信した telemetry を JSON Lines としてこのファイルへ保存する。
     /// `log_dir` とは同時に指定できない。

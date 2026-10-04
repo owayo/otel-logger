@@ -6,8 +6,8 @@
 - **Routing defaults**: `claude-code` → the Anthropic route, `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → the OpenAI route. Override with a non-empty `service_names` list in the config to add or replace; empty names are rejected at startup so resources without a `service.name` cannot be routed accidentally.
 - **Precedence**: CLI transport and headers override a matching built-in route in the config while reusing its endpoint, following CLI > environment > config precedence without requiring the endpoint to be repeated.
 - **HTTP endpoint validation**: `http-protobuf` routes require an absolute `http://` or `https://` URL. Query strings and fragments are rejected at startup because OTLP signal paths (`/v1/logs`, `/v1/traces`, and `/v1/metrics`) are appended to the configured endpoint.
-- **Failure semantics**: JSONL is persisted first, then the payload is `try_send`'d to the per-route worker. Workers retry with exponential backoff (by default, up to 8 retries after the initial attempt; 200ms → 30s cap). The receive path is never blocked by the upstream, and shutdown cancels both an in-flight request and backoff immediately instead of waiting for the configured request timeout.
-- **Shutdown drain**: queued proxy batches get a 5-second drain window instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged.
+- **Failure semantics**: JSONL is persisted first, then the payload is `try_send`'d to the per-route worker. Workers retry OTLP-retryable failures with exponential backoff (by default, up to 8 retries after the initial attempt; 200ms → 30s cap). The receive path is never blocked by the upstream, and shutdown cancels both an in-flight request and backoff immediately instead of waiting for the configured request timeout.
+- **Shutdown drain**: interrupted sends and backoffs are carried into the 5-second drain window before queued batches instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged.
 - **Auth**: header values may be written as `env:VAR_NAME` to resolve from an environment variable, so secrets never appear in `ps` output or config files.
 
 ## CLI example
@@ -71,3 +71,9 @@ Per-route counters are exposed at `GET /stats`:
 ## Phase B — crash-safe outbox (planned)
 
 The current implementation (Phase A) keeps every payload in JSONL, but a crash mid-forward can leave in-flight batches un-forwarded. Phase B will track the JSONL byte offset per route and catch up on restart, so that no payload is lost even across restarts. `--proxy-checkpoint-dir` is reserved for that follow-up work.
+
+## Retryable failures
+
+HTTP retries only `429`, `502`, `503`, and `504`; redirects and other failures such as `400`, `401`, `413`, and `500` are permanent. gRPC retries `Cancelled`, `DeadlineExceeded`, `Aborted`, `OutOfRange`, `Unavailable`, and `DataLoss`; `ResourceExhausted` requires valid `google.rpc.RetryInfo`. HTTP `Retry-After` (seconds or HTTP-date) and gRPC RetryInfo override the backoff when they request a longer wait. See the [OTLP failure specification](https://opentelemetry.io/docs/specs/otlp/#failures).
+
+Interrupted batches are counted once according to their drain result: deadline cancellations are `dropped`, permanent failures are `failed`. Payloads remain in JSONL, but Phase A does not replay them automatically.
