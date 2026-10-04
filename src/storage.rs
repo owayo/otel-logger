@@ -8,13 +8,20 @@ use chrono::{Local, NaiveDate};
 
 /// 部分書き込みの取り消しに必要な操作。テストではディスク障害を注入する。
 trait AppendStorage: Write {
-    fn len(&self) -> io::Result<u64>;
+    fn append_start(&mut self) -> io::Result<u64>;
     fn truncate(&mut self, len: u64) -> io::Result<()>;
 }
 
 impl AppendStorage for File {
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.metadata()?.len())
+    fn append_start(&mut self) -> io::Result<u64> {
+        #[cfg(windows)]
+        {
+            self.seek(SeekFrom::End(0))
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.metadata()?.len())
+        }
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -44,7 +51,7 @@ impl<F: AppendStorage> TransactionalAppend<F> {
 
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.repair()?;
-        let start = self.file.len()?;
+        let start = self.file.append_start()?;
         if let Err(error) = self.file.write_all(bytes).and_then(|()| self.file.flush()) {
             self.rollback = Some(start);
             if self.file.truncate(start).is_ok() {
@@ -63,7 +70,13 @@ pub(crate) struct AppendFile {
 impl AppendFile {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
-        options.create(true).read(true).append(true);
+        options.create(true).read(true);
+        // Windows の append-only handle は set_len に必要な FILE_WRITE_DATA を持たない。
+        // read/write で開き、append_start が書き込みごとに末尾へ移す。
+        #[cfg(windows)]
+        options.write(true);
+        #[cfg(not(windows))]
+        options.append(true);
         crate::path::restrict_new_file_mode(&mut options);
         let mut file = options.open(path)?;
         recover_tail(&mut file)?;
@@ -253,7 +266,7 @@ mod tests {
     }
 
     impl AppendStorage for FailingFile {
-        fn len(&self) -> io::Result<u64> {
+        fn append_start(&mut self) -> io::Result<u64> {
             Ok(self.bytes.len() as u64)
         }
         fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -325,6 +338,20 @@ mod tests {
     }
 
     #[test]
+    fn append_preserves_existing_lines_after_cursor_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let mut writer = AppendFile::open(&path).unwrap();
+        writer.append(b"{\"first\":1}\n").unwrap();
+        writer.writer.file.seek(SeekFrom::Start(0)).unwrap();
+        writer.append(b"{\"second\":2}\n").unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"{\"first\":1}\n{\"second\":2}\n"
+        );
+    }
+
+    #[test]
     fn flush_failure_rolls_back_the_whole_line() {
         let mut writer = TransactionalAppend {
             file: FailingFile {
@@ -358,7 +385,7 @@ mod tests {
         assert!(!daily_path(dir.path(), "otel-logger", None, later).exists());
         writer.file.writer.file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .open(&first_path)
             .unwrap();
         writer.append_at(b"{}\n", later).unwrap();
