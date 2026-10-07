@@ -2,6 +2,8 @@
 # rust を上げたら Cargo.toml の rust-version と Dockerfile のベースイメージも同じ版にそろえる。
 
 [tools]
+# 依存脆弱性の検査も、ローカルで使う版を固定する。
+"cargo:cargo-audit" = "0.22.2"
 # profile と components を明示する。未指定だと rustup の既定の profile 次第で入るものが変わり、
 # GitHub Actions のランナー (minimal) では cargo fmt / clippy が無いと言われて落ちる
 rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }

@@ -39,7 +39,7 @@
 - **OTLP の 2 経路を 1 プロセスで受信**: OTLP/gRPC (4317) と OTLP/HTTP (4318)。HTTP は `application/x-protobuf` と `application/json` の両方を、gzip 圧縮の有無を問わず受け付ける。1 リクエストの上限 32 MiB は解凍後のサイズで判定する
 - **読みやすい stdout**: severity 別に色分けする (リダイレクト時や `NO_COLOR` の設定時は色を付けない)。受信した payload の制御文字は terminal に届く前に escape する。`--pretty-log` を付けると、同じ出力を色なしの日次ファイルとして `--log-dir` にも残す
 - **欠落のない JSON Lines**: 単一の追記ファイルか日次ローテーションのファイルに保存し、graceful shutdown 時に `fsync` する。書き込みに失敗したら HTTP `503` / gRPC `Unavailable` を返し、exporter に batch を捨てさせず再送させる
-- **Claude Code と Codex の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない
+- **Claude Code と Codex (Codex Desktop を含む) の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない
 - **OTLP proxy 転送**: 保存した Claude Code / Codex の payload を、それぞれ別の上流 collector へ転送できる (任意)
 - **graceful shutdown**: SIGINT / SIGTERM で新しい受信を止め、受理済みの書き込み完了後に最終 `fsync` を行う。接続の終了待ちには 10 秒の猶予を設ける
 - **所有者だけが読めるファイル**: JSONL・設定ファイル・`--log-dir` のディレクトリを `0600` / `0700` で作る。telemetry には `user.email`・`user.id`・organization ID が含まれるため

@@ -169,8 +169,8 @@ pub struct Cli {
     pub proxy_anthropic_headers: Vec<String>,
 
     /// Forward Codex (`service.name=codex_cli_rs` etc.) telemetry to this OTLP endpoint.
-    /// Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` /
-    /// `codex_mcp_server`) の OTLP を、
+    /// Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` /
+    /// `Codex Desktop` / `codex-exec-server`) の OTLP を、
     /// JSONL 保存と同時にこの endpoint へ転送する。
     // Anthropic 側と同じ理由で環境変数の値を `--help` に出さない。
     #[arg(
@@ -311,6 +311,8 @@ pub const DEFAULT_OPENAI_SERVICES: &[&str] = &[
     "codex_exec",
     "codex-app-server",
     "codex_mcp_server",
+    "Codex Desktop",
+    "codex-exec-server",
 ];
 
 /// route 1 件分の解決済み設定。CLI/config/組み込み既定を merge 済みで、環境変数
@@ -772,9 +774,15 @@ fn resolve_headers(
             );
         }
         let final_value = if let Some(var) = value.strip_prefix("env:") {
-            std::env::var(var).with_context(|| {
-                format!(
-                    "proxy route `{route_name}`: env var `{var}` (referenced by header `{key}`) is not set"
+            std::env::var(var).map_err(|error| {
+                // NotUnicode は環境変数の値そのものを保持し、Display / Debug で露出する。
+                // 秘密を含む元エラーは chain に残さず、原因の種類だけを報告する。
+                let reason = match error {
+                    std::env::VarError::NotPresent => "is not set",
+                    std::env::VarError::NotUnicode(_) => "is not valid Unicode",
+                };
+                anyhow::anyhow!(
+                    "proxy route `{route_name}`: env var `{var}` (referenced by header `{key}`) {reason} (value not shown)"
                 )
             })?
         } else {
@@ -866,7 +874,11 @@ mod tests {
 
     use super::*;
 
-    fn run_test_in_child_with_env(test_name: &str, key: &str, value: &str) -> bool {
+    fn run_test_in_child_with_env(
+        test_name: &str,
+        key: &str,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> bool {
         const CHILD_TEST_ENV: &str = "OTEL_LOGGER_CHILD_TEST";
 
         if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(test_name) {
@@ -1370,6 +1382,8 @@ mod tests {
                 "codex_exec".to_string(),
                 "codex-app-server".to_string(),
                 "codex_mcp_server".to_string(),
+                "Codex Desktop".to_string(),
+                "codex-exec-server".to_string(),
             ]
         );
         assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
@@ -1411,6 +1425,37 @@ mod tests {
             err.to_string().contains("OTEL_LOGGER_NEVER_SET_TOKEN_XYZ"),
             "expected missing env var to be surfaced, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_proxy_non_unicode_env_error_does_not_leak_the_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let key = "OTEL_LOGGER_TEST_NON_UNICODE_TOKEN";
+        let secret = "Bearer synthetic-secret";
+        let mut bytes = secret.as_bytes().to_vec();
+        bytes.push(0xff);
+        let value = std::ffi::OsString::from_vec(bytes);
+        let test_name = "cli::tests::merge_proxy_non_unicode_env_error_does_not_leak_the_value";
+        if !run_test_in_child_with_env(test_name, key, &value) {
+            return;
+        }
+
+        let mut cli = cli_with_log_file();
+        cli.proxy_openai_endpoint = Some("https://collector.example".to_string());
+        cli.proxy_openai_headers = vec![format!("Authorization=env:{key}")];
+        let error = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
+        // 通常表示、main の詳細な chain、Debug のいずれにも秘密を残さない。
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(!rendered.contains(secret), "環境変数の値を診断へ載せない");
+            assert!(rendered.contains(key));
+            assert!(rendered.contains("Unicode"));
+        }
     }
 
     #[test]

@@ -30,11 +30,15 @@ const SERVICE_CODEX_APP_SERVER: &str = "codex-app-server";
 /// process / SQLite 初期化 metrics が観測されているため、他の Codex バイナリと同じ
 /// 集計対象として扱う。
 const SERVICE_CODEX_MCP_SERVER: &str = "codex_mcp_server";
+/// Desktop は `service.name` を製品名へ変えて同じ Codex usage schema を送る。
+const SERVICE_CODEX_DESKTOP: &str = "Codex Desktop";
+/// リモート実行用 server。実ログでは運用 span のみだが proxy の対象にも含める。
+const SERVICE_CODEX_EXEC_SERVER: &str = "codex-exec-server";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_OPENAI: &str = "OpenAI";
 const UNKNOWN: &str = "unknown";
 
-/// OTLP の `service.name` が Codex 系 (TUI / Exec / Apps Server / MCP Server) かを判定する。
+/// OTLP の `service.name` が Codex 系のプロセスかを判定する。
 /// 新しい Codex バイナリが増えた場合はここに追加する。
 fn is_codex_service(service: &str) -> bool {
     matches!(
@@ -43,6 +47,8 @@ fn is_codex_service(service: &str) -> bool {
             | SERVICE_CODEX_EXEC
             | SERVICE_CODEX_APP_SERVER
             | SERVICE_CODEX_MCP_SERVER
+            | SERVICE_CODEX_DESKTOP
+            | SERVICE_CODEX_EXEC_SERVER
     )
 }
 
@@ -3702,6 +3708,90 @@ mod tests {
         assert_eq!(bucket.stats.reasoning_output_tokens, 30);
     }
 
+    #[test]
+    fn codex_desktop_telemetry_is_aggregated_without_double_count() {
+        let agg = Aggregator::new();
+        let service = "Codex Desktop";
+        agg.ingest_logs(&make_log_req(
+            service,
+            "codex.conversation_starts",
+            vec![
+                kv_str("conversation.id", "desktop-conversation"),
+                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("model", "desktop-model"),
+                kv_str("reasoning_effort", "high"),
+            ],
+        ));
+        // Desktop も span から当該 conversation の effort を補完する。
+        assert_eq!(
+            agg.ingest_traces(&make_trace_req(
+                service,
+                vec![handle_responses_span_with_attrs(vec![
+                    kv_str("conversation.id", "desktop-conversation"),
+                    kv_str("codex.request.reasoning_effort", "xhigh"),
+                ])],
+            )),
+            1
+        );
+        assert_eq!(
+            agg.ingest_logs(&make_log_req(
+                service,
+                "",
+                vec![
+                    kv_str("event.name", "codex.sse_event"),
+                    kv_str("event.kind", "response.completed"),
+                    kv_str("conversation.id", "desktop-conversation"),
+                    kv_str("model", "desktop-model"),
+                    kv_int("input_token_count", 100),
+                    kv_int("output_token_count", 20),
+                    kv_int("cached_token_count", 50),
+                    kv_int("reasoning_token_count", 7),
+                ],
+            )),
+            1
+        );
+        // 同じ usage の後着 metrics は加算せず、turn 数と所要時間だけを補う。
+        assert_eq!(
+            agg.ingest_metrics(&make_metric_req(
+                service,
+                vec![
+                    codex_token_metric("desktop-model", "input", 100.0),
+                    codex_token_metric("desktop-model", "output", 20.0),
+                    codex_turn_count("desktop-model", 1),
+                    codex_duration_metric("desktop-model", 500.0),
+                ]
+            )),
+            2
+        );
+        let snap = agg.snapshot();
+        let stats = &snap.agents[AGENT_CODEX];
+        let bucket = &stats.buckets["OpenAI/desktop-model/xhigh"];
+        assert_eq!(stats.buckets.len(), 1);
+        assert_eq!(stats.total.input_tokens, 100);
+        assert_eq!(bucket.stats.output_tokens, 20);
+        assert_eq!(bucket.stats.cache_read_tokens, 50);
+        assert_eq!(bucket.stats.reasoning_output_tokens, 7);
+        assert_eq!(bucket.stats.request_count, 1);
+        assert_eq!(bucket.stats.duration_ms, 500);
+    }
+
+    #[test]
+    fn codex_exec_server_operational_traces_do_not_affect_usage() {
+        let agg = Aggregator::new();
+        assert_eq!(
+            agg.ingest_traces(&make_trace_req(
+                "codex-exec-server",
+                vec![opentelemetry_proto::tonic::trace::v1::Span {
+                    name: "fs.get_metadata".to_string(),
+                    attributes: vec![kv_str("conversation.id", "exec-conversation")],
+                    ..Default::default()
+                }],
+            )),
+            0
+        );
+        assert!(agg.snapshot().agents.is_empty());
+    }
+
     /// `codex-app-server` サービスでも tool-only な SSE completion は token usage に
     /// 加算しない (`input_token_count == tool_token_count` で他が 0 の挙動を維持)。
     #[test]
@@ -3743,7 +3833,7 @@ mod tests {
         assert_eq!(updates, 1);
     }
 
-    /// `is_codex_service` は TUI / Exec / Apps Server / MCP Server を Codex として扱い、
+    /// `is_codex_service` は Desktop と各 Codex server も Codex として扱い、
     /// 既存の Claude や未知の service.name は false で弾く。
     #[test]
     fn is_codex_service_recognizes_all_codex_binaries() {
@@ -3751,6 +3841,8 @@ mod tests {
         assert!(is_codex_service(SERVICE_CODEX_EXEC));
         assert!(is_codex_service(SERVICE_CODEX_APP_SERVER));
         assert!(is_codex_service(SERVICE_CODEX_MCP_SERVER));
+        assert!(is_codex_service(SERVICE_CODEX_DESKTOP));
+        assert!(is_codex_service(SERVICE_CODEX_EXEC_SERVER));
         assert!(!is_codex_service(SERVICE_CLAUDE));
         assert!(!is_codex_service(""));
         assert!(!is_codex_service("codex-unknown"));

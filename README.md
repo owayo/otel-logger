@@ -39,7 +39,7 @@ By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to c
 - **Both OTLP transports in one process**: OTLP/gRPC (4317) and OTLP/HTTP (4318); HTTP accepts both `application/x-protobuf` and `application/json`, gzip-compressed or not. The 32 MiB request limit applies after decompression.
 - **Readable stdout**: severity-based colors (turned off when redirected or when `NO_COLOR` is set), with control characters in incoming payloads escaped before they reach the terminal; `--pretty-log` also keeps the stream as uncolored daily files in `--log-dir`
 - **Lossless JSON Lines**: one append-only file or daily-rotated files, `fsync`'d on graceful shutdown; a failed write returns HTTP `503` / gRPC `Unavailable` so exporters retry instead of dropping the batch
-- **Usage totals for Claude Code and Codex**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
+- **Usage totals for Claude Code and Codex (including Codex Desktop)**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
 - **OTLP proxy forwarding**: optional routes that forward Claude Code and Codex payloads to separate upstream collectors after they are persisted
 - **Graceful shutdown**: SIGINT and SIGTERM stop new ingestion and wait for admitted writes before the final `fsync`; connections have a 10-second drain grace period
 - **Private files**: JSONL files, the config file and `--log-dir` directories are created with owner-only permissions (`0600` / `0700`), because telemetry carries `user.email`, `user.id` and organization identifiers

@@ -15,11 +15,11 @@ Codex の token usage は Codex が出す 2 つの形を重複排除して集計
 
 ## Claude Code
 
-Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
+Anthropic のログは `model` のサフィックス (`[1m]` 等) を落とすため、メトリクス側で観測したフル名 (`claude-opus-4-7[1m]`) を canonical 表として保持し、後続のログ側 bare 名を同じ bucket にマージします。ただし metrics が bare 名も直接送った場合は、実在する別バリアントとして保持し、接尾辞付きの model へ畳み込みません。token・cost は API request ログを優先し、先に計上した metrics 分は元の bucket ごとに取り消します。`aggregationTemporality=DELTA` のみ受け入れ、Cumulative は警告ログ付きで破棄します。
 
 ## Codex
 
-`service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) / MCP Server (`codex_mcp_server`、Codex 0.146.1 / 0.147.0 の実ログで確認) を Codex として認識します。Apps Server は `codex.turn.*` などの metrics を送らず logs / traces だけを送ってくるため、ここを取りこぼすと Apps Server 経由の token usage が累計から欠落します。
+`service.name` で TUI (`codex_cli_rs`) / Exec (`codex_exec`) / Apps Server (`codex-app-server`、Codex 0.140.0+) / MCP Server (`codex_mcp_server`) / Desktop (`Codex Desktop`) / Exec Server (`codex-exec-server`) を Codex として認識します。Desktop は SSE 完了ログと turn metrics を送り、CLI と同じ source 選択で token usage を一度だけ計上します。Apps Server の usage は `codex.turn.*` metrics ではなく logs / traces から届きます。実ログで確認した Exec Server の運用トレースは proxy 転送の対象ですが、使用量の累計には加算しません。
 
 Codex は同じ usage を SSE 完了ログと turn token metrics の両方で送るため、`otel-logger` は model ごとに最初に観測した token source (SSE `response.completed` ログか `codex.turn.token_usage` metric) を採用し、その model ではもう一方の token counter を二重計上防止のため無視します。ローカル実ログでは SSE 先着と metric 先着の両方があり、metric 先着時も後着 SSE と token 種別ごとの合計が完全一致することを確認しています。usage を持たない WebSocket `response.completed` は、別 usage として加算しません。
 
