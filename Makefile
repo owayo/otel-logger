@@ -73,6 +73,7 @@ init-force: build ## Same as init, but overwrites an existing file
 
 test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
+	$(RUN) cargo test $(CARGO_FLAGS) --examples
 
 lint: ## Run clippy with warnings as errors
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings

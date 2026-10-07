@@ -106,7 +106,9 @@ jobs:
       # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
       - name: Test (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          cargo test --locked --examples
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

@@ -3,12 +3,12 @@
 `otel-logger` can persist received OTLP payloads to JSONL **and** forward them to one or more upstream OTLP collectors at the same time. Anthropic (Claude Code) and OpenAI (Codex) traffic are split by `service.name` and can target separate endpoints.
 
 - **Requirement**: proxy forwarding requires a JSONL sink (`--log-file` or `--log-dir`) so every accepted payload remains durable even when forwarding fails. Automatic replay to the upstream is planned for Phase B.
-- **Routing defaults**: `claude-code` → the Anthropic route, `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → the OpenAI route. Override with a non-empty `service_names` list in the config to add or replace; empty names are rejected at startup so resources without a `service.name` cannot be routed accidentally.
+- **Routing defaults**: `claude-code` → the Anthropic route, `codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` / `Codex Desktop` / `codex-exec-server` → the OpenAI route. Override with a non-empty `service_names` list in the config to add or replace; empty names are rejected at startup so resources without a `service.name` cannot be routed accidentally.
 - **Precedence**: CLI transport and headers override a matching built-in route in the config while reusing its endpoint, following CLI > environment > config precedence without requiring the endpoint to be repeated.
 - **HTTP endpoint validation**: `http-protobuf` routes require an absolute `http://` or `https://` URL. Query strings and fragments are rejected at startup because OTLP signal paths (`/v1/logs`, `/v1/traces`, and `/v1/metrics`) are appended to the configured endpoint.
 - **Failure semantics**: JSONL is persisted first, then the payload is `try_send`'d to the per-route worker. Workers retry OTLP-retryable failures with exponential backoff (by default, up to 8 retries after the initial attempt; 200ms → 30s cap). The receive path is never blocked by the upstream, and shutdown cancels both an in-flight request and backoff immediately instead of waiting for the configured request timeout.
 - **Shutdown drain**: interrupted sends and backoffs are carried into the 5-second drain window before queued batches instead of being discarded outright, so a restart does not silently strand everything the upstream had not yet acknowledged.
-- **Auth**: header values may be written as `env:VAR_NAME` to resolve from an environment variable, so secrets never appear in `ps` output or config files.
+- **Auth**: header values may be written as `env:VAR_NAME` to resolve from an environment variable, so secrets never appear in `ps` output or config files. Missing or non-Unicode values fail at startup; diagnostics identify the variable and cause without echoing its value.
 
 ## CLI example
 

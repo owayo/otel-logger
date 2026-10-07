@@ -3,12 +3,12 @@
 受信した OTLP payload を **JSONL に保存しつつ** 上流の OTLP collector にも転送する proxy モードがあります。Claude Code (Anthropic 系) と Codex (OpenAI 系) の 2 系統を `service.name` で振り分け、それぞれ別の endpoint に送れます。
 
 - **前提**: proxy を有効化するときは `--log-file` か `--log-dir` のどちらかを必ず指定する (転送に失敗しても受理済み payload を JSONL に残すため。上流への自動再送は Phase B で実装予定)
-- **振り分け**: 組み込み既定で `claude-code` → Anthropic route、`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` → OpenAI route。config で空でない `service_names` を明示すれば上書き可能。空の名前は startup 時に reject し、`service.name` が無い resource の誤転送を防ぐ
+- **振り分け**: 組み込み既定で `claude-code` → Anthropic route、`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` / `Codex Desktop` / `codex-exec-server` → OpenAI route。config で空でない `service_names` を明示すれば上書き可能。空の名前は startup 時に reject し、`service.name` が無い resource の誤転送を防ぐ
 - **優先順位**: 組み込み route と同名の config endpoint はそのまま利用しつつ、CLI の transport / header で上書きできる。endpoint を CLI で重ねて指定しなくても CLI > 環境変数 > config の優先順位を守る
 - **HTTP endpoint の検証**: `http-protobuf` route には絶対 `http://` / `https://` URL を指定する。設定値の末尾へ signal 別パス (`/v1/logs`、`/v1/traces`、`/v1/metrics`) を追加するため、query と fragment は startup 時に reject する
 - **失敗時挙動**: JSONL 保存が成功してから proxy に `try_send` する fire-and-forget。route worker が OTLP 仕様で再送できる失敗だけを指数バックオフで retry する (既定では初回送信後に最大 8 回、200ms → 30s cap)。受信 endpoint は proxy の遅延に影響されない。shutdown 時は backoff 中だけでなく送信中の request も即座に中断し、設定した request timeout を待たない
 - **終了時の送り切り**: 送信中・backoff 中に中断した batch を先頭に戻し、queue に残った batch と共に 5 秒間の drain で送り切る。再起動のたびに「上流がまだ受け取っていない分」を無言で失わないため
-- **認証**: header 値に `env:VAR_NAME` を書くと環境変数から解決する。secret をプロセス一覧や config ファイルに平文で残さないためこちらを推奨
+- **認証**: header 値に `env:VAR_NAME` を書くと環境変数から解決する。secret をプロセス一覧や config ファイルに平文で残さないためこちらを推奨。未設定や Unicode として読めない値は起動時に拒否し、診断には変数名と原因だけを載せて値を露出させない
 
 ## CLI での指定例
 

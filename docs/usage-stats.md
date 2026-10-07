@@ -15,11 +15,11 @@ Codex token usage is deduplicated across the two shapes Codex emits: current loc
 
 ## Claude Code
 
-Anthropic logs strip variant suffixes from `model` (e.g. `claude-opus-4-7`) while metrics carry the full name (`claude-opus-4-7[1m]`). The aggregator canonicalizes log-side bare names to whichever full name was last seen on a metric, so 1M and standard variants do not fragment into separate buckets. Only `aggregationTemporality=DELTA` is honored; cumulative points are dropped with a warning.
+Anthropic logs strip variant suffixes from `model` (e.g. `claude-opus-4-7`) while metrics carry the full name (`claude-opus-4-7[1m]`). The aggregator canonicalizes log-side bare names to the full name observed on a metric. If metrics explicitly report a bare model as well, it remains a distinct variant and is not folded into the suffixed model. API request logs take precedence over metrics for token and cost totals; previously counted metric usage is cancelled in each original bucket. Only `aggregationTemporality=DELTA` is honored; cumulative points are dropped with a warning.
 
 ## Codex
 
-Supported Codex processes are recognised via `service.name`: TUI (`codex_cli_rs`), Exec (`codex_exec`), Apps Server (`codex-app-server`, Codex 0.140.0+), and MCP Server (`codex_mcp_server`, observed in Codex 0.146.1/0.147.0). Apps-Server-only deployments — which emit logs/traces but no `codex.turn.*` metrics — are still aggregated.
+Supported Codex processes are recognised via `service.name`: TUI (`codex_cli_rs`), Exec (`codex_exec`), Apps Server (`codex-app-server`, Codex 0.140.0+), MCP Server (`codex_mcp_server`), Desktop (`Codex Desktop`), and Exec Server (`codex-exec-server`). Desktop sends SSE completion logs and turn metrics; their token usage is counted once through the same source selection as CLI telemetry. Apps Server emits usage through logs / traces rather than `codex.turn.*` metrics. Exec Server was observed emitting operational traces without usage, which are forwarded by the proxy but do not change usage totals.
 
 Codex emits both SSE completion logs and turn token metrics for the same usage. `otel-logger` accepts the first token source observed for each model (the first SSE `response.completed` log or `codex.turn.token_usage` metric) and ignores the other source for that model's token counters to avoid double-counting. Real local logs contain both arrival orders; when metrics arrived first, their per-class totals exactly matched the later SSE values. WebSocket `response.completed` events without usage are not counted as separate usage.
 
