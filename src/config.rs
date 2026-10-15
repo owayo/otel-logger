@@ -135,7 +135,8 @@ color = "auto"
 # 組み込み既定 route:
 #   - name = "anthropic" → service_names = ["claude-code"]
 #   - name = "openai"    → service_names = ["codex_cli_rs", "codex_exec",
-#                                           "codex-app-server", "codex_mcp_server"]
+#                                           "codex-app-server", "codex_mcp_server",
+#                                           "Codex Desktop", "codex-exec-server"]
 #
 # CLI 短縮フラグ (`--proxy-anthropic-endpoint` / `--proxy-openai-endpoint`) を使うと
 # ここで endpoint を書かずに済みます。config で明示すると CLI/env より低優先です。
@@ -349,11 +350,18 @@ impl Config {
             .with_context(|| format!("read config file {}", path.display()))?;
         let config = toml::from_str::<Self>(&body)
             .map_err(|mut e| {
-                // toml crate は元テキストを添付してエラー箇所の行を描画する。設定に
-                // `Authorization = "Bearer ..."` のような秘密が書かれていると、構文エラー
-                // ひとつで stderr / journal に平文で残るため、入力の添付を外す。
+                // 元テキストだけでなく、serde の型エラー本文にも値が含まれる。
+                // 引用符の形式に依存した伏せ字では漏れが残るため、位置だけを引き継ぎ、
+                // 元エラーを chain / Debug に残さない。
                 e.set_input(None);
-                e
+                let position = e.span().map(|span| {
+                    let prefix = &body.as_bytes()[..span.start.min(body.len())];
+                    let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
+                    let column = prefix.iter().rposition(|byte| *byte == b'\n')
+                        .map_or(prefix.len() + 1, |index| prefix.len() - index);
+                    format!(" at line {line}, column {column}")
+                }).unwrap_or_default();
+                anyhow::anyhow!("invalid TOML configuration{position}: check syntax and value types (values omitted)")
             })
             .with_context(|| format!("parse TOML in {}", path.display()))?;
         Ok(config)
@@ -680,5 +688,27 @@ mystery-key = 1
         .unwrap();
         let err = Config::load(Some(&path)).unwrap_err();
         assert!(err.to_string().contains("parse TOML"));
+    }
+
+    #[test]
+    fn config_errors_never_echo_values_in_any_error_format() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        for body in [
+            "[[proxy.routes]]\nname='test'\nendpoint='https://collector.example.com'\nheaders='Authorization=Bearer private-test-token'\n",
+            "[[proxy.routes]]\nname='test'\nendpoint='https://collector.example.com'\ntransport='private-test-token'\n",
+            "[proxy.routes.headers]\nAuthorization = \"private-test-token\n",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let error = Config::load(Some(&path)).unwrap_err();
+            for rendered in [
+                error.to_string(),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(!rendered.contains("private-test-token"), "{rendered}");
+            }
+            assert!(format!("{error:#}").contains("line "));
+        }
     }
 }

@@ -41,6 +41,7 @@ Provider and effort are resolved independently. When the provider arrives first,
 
 ## Counter safety
 
+- Metric points with the `NoRecordedValue` flag are missing-data markers. Their values are excluded from totals and do not select a token source; the received payload remains unchanged in JSONL. Other flag bits do not suppress recorded values.
 - Provider/model/effort values are kept dynamically instead of using a model allowlist, so newly introduced identifiers such as `gpt-5.6-terra` and Fable are retained losslessly; `/` and `%` inside components remain collision-free
 - Non-finite or out-of-range numeric attributes and metric values (`NaN`, `±Infinity`, huge `double`s) on tokens, durations and cost are rejected at parse time so untrusted telemetry sources cannot poison cumulative counters with saturated `i64::MAX` / `u64::MAX` or `cost_usd=inf`
 - Cumulative counters use saturating arithmetic, so repeated extreme batches cannot wrap token totals or turn cost into `Infinity`

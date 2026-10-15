@@ -2,7 +2,7 @@
 name = "otel-logger"
 version = "26.9.100"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 description = "OTLP receiver that logs Claude Code / Codex telemetry to stdout and JSONL"
 license = "MIT"
 repository = "https://github.com/owayo/otel-logger"
@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # OTLP 型と gRPC service trait (proto drift を避けるため単一の真実として使う)
-opentelemetry-proto = { version = "0.33.0", default-features = false, features = [
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = [
     "gen-tonic",
     "trace",
     "metrics",
@@ -73,7 +73,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
 ] }
 
 # 非同期 runtime
-tokio = { version = "1.53.1", features = [
+tokio = { version = "1.53.3", features = [
     "rt-multi-thread",
     "macros",
     "signal",
@@ -86,19 +86,19 @@ tokio = { version = "1.53.1", features = [
     # ビルドできなくなる。
     "time",
 ] }
-tokio-util = "0.7.19"
+tokio-util = "0.7.20"
 
 # CLI
 clap = { version = "4.6.7", features = ["derive", "env"] }
 
 # シリアライズ / 出力
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-toml = "1.1.6"
+serde_json = "1.0.154"
+toml = "1.1.8"
 
 # その他
 anyhow = "1.0.104"
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

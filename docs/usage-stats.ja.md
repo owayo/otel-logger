@@ -41,6 +41,7 @@ provider と effort は独立して補完します。provider が先に判明し
 
 ## カウンタの保護
 
+- `NoRecordedValue` フラグ付きの metric point は欠測を表すため、値を累計へ加算せず、token source の選択にも使わない。受信した payload は JSONL にそのまま保存する。他のフラグだけが立っている場合は、値を通常どおり集計する
 - provider/model/effort を固定 allowlist で制限せず動的に保持するため、`gpt-5.6-terra` や Fable のような新しい識別子も lossless に記録する。component 内に `/` や `%` が含まれても別バケットと衝突しない
 - token / duration / cost の属性値や metric 値に NaN / Infinity / 範囲外の巨大な double が混入しても、parse 時点で弾いて累計を破壊しない (信頼できない telemetry source からの `i64::MAX` / `u64::MAX` 飽和値や `cost_usd=inf` の混入を防ぐ)
 - 累計 counter は saturating arithmetic で加算し、極端な batch が繰り返されても token 合計の wrap や `cost_usd=inf` を起こさない

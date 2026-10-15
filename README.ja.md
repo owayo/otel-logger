@@ -59,7 +59,7 @@ brew install owayo/otel-logger/otel-logger
 
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/otel-logger --locked

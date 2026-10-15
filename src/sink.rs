@@ -1,4 +1,3 @@
-use std::fs::OpenOptions as StdOpenOptions;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -18,7 +17,7 @@ use crate::aggregator::Aggregator;
 use crate::cli::{LogSink, Settings};
 use crate::format;
 use crate::forward::ProxyRouter;
-use crate::storage::{AppendFile, DailyWriter};
+use crate::storage::{AppendFile, DailyWriter, daily_path};
 
 /// 日次 JSONL のファイル名 `otel-logger.YYYY-MM-DD` の前半。
 const ROTATION_PREFIX: &str = "otel-logger";
@@ -101,53 +100,6 @@ impl RotatedWriter {
             );
         }
     }
-
-    /// 保持対象の JSONL 日次ファイルを shutdown 時にまとめて fsync する。
-    /// ローテーション前のファイルも対象とし、best-effort の pretty は対象にしない。
-    fn sync_rotated_files(&self) -> Result<()> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            // ディレクトリごと消えているなら同期するものは無い。
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("read log directory {}", self.dir.display()));
-            }
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            // symlink を辿って無関係なファイルを同期しない (cleanup 側と揃える)。
-            // `d_type` が `DT_UNKNOWN` の FS (NFS / 一部 FUSE) では `lstat` に落ちるため、
-            // readdir との間に並行削除が入ると `NotFound` になる。正常系として飛ばす。
-            match entry.file_type() {
-                Ok(ft) if ft.is_file() => {}
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("stat log file {}", path.display()));
-                }
-            }
-            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !is_rotated_log_filename(filename) {
-                continue;
-            }
-            let file = match StdOpenOptions::new().write(true).open(&path) {
-                Ok(file) => file,
-                // 並行して rotation / cleanup が走った場合は同期対象から外れただけ。
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("reopen rotated JSONL {}", path.display()));
-                }
-            };
-            file.sync_all()
-                .with_context(|| format!("fsync rotated JSONL {}", path.display()))?;
-        }
-        Ok(())
-    }
 }
 
 impl JsonlWriter {
@@ -184,7 +136,7 @@ impl JsonlWriter {
                 g.flush().context("flush JSONL roller")?;
                 // lock を持ったまま fsync する。先に解放すると、並行 batch の書き込みが
                 // fsync の後ろに挟まって同期されないまま残る。
-                w.sync_rotated_files()
+                g.sync_all().context("fsync JSONL roller")
             }
             #[cfg(test)]
             Self::Fail => Ok(()),
@@ -917,6 +869,50 @@ async fn drain_pretty_output(output: Option<&PrettyOutput>, deadline: tokio::tim
     }
 }
 
+/// dry-run 用に出力先を検査する。既存の内容と保持対象ファイルは変更しない。
+/// 未作成の出力先は、通常起動と同じ権限で作成する。
+pub async fn probe_settings(settings: &Settings) -> Result<()> {
+    let log_sink = settings.log_sink.clone();
+    let pretty_log_dir = settings.pretty_log_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        match log_sink {
+            None => {}
+            Some(LogSink::File(path)) => probe_log_file(&path)?,
+            Some(LogSink::Directory { dir, .. }) => {
+                crate::path::create_private_dir(&dir)?;
+                // 通常起動の cleanup に必要なディレクトリ走査も検証するが、削除はしない。
+                for entry in std::fs::read_dir(&dir)? {
+                    entry?;
+                }
+                probe_log_file(&daily_path(
+                    &dir,
+                    ROTATION_PREFIX,
+                    None,
+                    chrono::Local::now().date_naive(),
+                ))?;
+            }
+        }
+        if let Some(dir) = pretty_log_dir {
+            probe_log_file(&daily_path(
+                &dir,
+                PRETTY_LOG_PREFIX,
+                Some(PRETTY_LOG_SUFFIX),
+                chrono::Local::now().date_naive(),
+            ))?;
+        }
+        Ok(())
+    })
+    .await
+    .context("join sink probe task")?
+}
+
+fn probe_log_file(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        crate::path::create_private_dir(parent)?;
+    }
+    AppendFile::probe(path).with_context(|| format!("probe log file {}", path.display()))
+}
+
 fn open_log_file_sync(path: &Path) -> Result<AppendFile> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -935,8 +931,9 @@ fn open_rotated_sync(dir: &Path, keep_days: u32) -> Result<RotatedWriter> {
     let max_keep = keep_days.max(1);
     cleanup_old_rotated_logs(dir, max_keep)
         .with_context(|| format!("cleanup old log files in {}", dir.display()))?;
-    let appender =
-        DailyWriter::new(dir, ROTATION_PREFIX, None).context("open daily JSONL writer")?;
+    let appender = DailyWriter::new(dir, ROTATION_PREFIX, None)
+        .context("open daily JSONL writer")?
+        .with_sync_on_rotate();
     Ok(RotatedWriter {
         roller: StdMutex::new(appender),
         dir: dir.to_path_buf(),
@@ -1044,11 +1041,6 @@ fn daily_log_kind(filename: &str) -> Option<DailyLogKind> {
         .strip_prefix(ROTATION_PREFIX)
         .and_then(|rest| rest.strip_prefix('.'))?;
     is_calendar_date(date).then_some(DailyLogKind::Jsonl)
-}
-
-/// JSONL の日次ファイル名か。
-fn is_rotated_log_filename(filename: &str) -> bool {
-    daily_log_kind(filename) == Some(DailyLogKind::Jsonl)
 }
 
 /// `YYYY-MM-DD` 形式で、かつ実在する暦日か。
@@ -1324,10 +1316,13 @@ mod tests {
 
     #[test]
     fn rotated_log_filename_requires_a_real_calendar_date() {
-        assert!(is_rotated_log_filename("otel-logger.2024-02-29"));
-        assert!(!is_rotated_log_filename("otel-logger.2023-02-29"));
-        assert!(!is_rotated_log_filename("otel-logger.2026-13-01"));
-        assert!(!is_rotated_log_filename("otel-logger.2026-04-31"));
+        assert_eq!(
+            daily_log_kind("otel-logger.2024-02-29"),
+            Some(DailyLogKind::Jsonl)
+        );
+        assert_eq!(daily_log_kind("otel-logger.2023-02-29"), None);
+        assert_eq!(daily_log_kind("otel-logger.2026-13-01"), None);
+        assert_eq!(daily_log_kind("otel-logger.2026-04-31"), None);
     }
 
     /// JSONL 専用の処理 (shutdown の fsync) に pretty-log を巻き込まないよう、
@@ -1342,9 +1337,10 @@ mod tests {
             daily_log_kind("otel-logger.pretty.2026-09-30.log"),
             Some(DailyLogKind::Pretty)
         );
-        assert!(!is_rotated_log_filename(
-            "otel-logger.pretty.2026-09-30.log"
-        ));
+        assert_ne!(
+            daily_log_kind("otel-logger.pretty.2026-09-30.log"),
+            Some(DailyLogKind::Jsonl)
+        );
         for name in [
             "otel-logger.pretty.2026-09-30",
             "otel-logger.pretty.2026-09-30.log.gz",
@@ -1855,7 +1851,7 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(is_rotated_log_filename)
+                    .is_some_and(|name| daily_log_kind(name) == Some(DailyLogKind::Jsonl))
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1874,34 +1870,73 @@ mod tests {
         sink.flush().await.unwrap();
     }
 
-    /// 回帰テスト: `--log-dir` 経路の fsync がローテーション名のファイルだけを対象にする。
-    ///
-    /// 日付切り替え前のファイルも disk へ確定するため、日次ファイルを開き直して
-    /// `sync_all` する。その際、同じ prefix の別用途ファイル (`otel-logger.pid` など) を
-    /// 巻き込んで書き込みモードで開かないことを固定する。
-    #[test]
-    fn sync_rotated_files_skips_files_that_are_not_daily_logs() {
+    #[tokio::test]
+    async fn probe_preserves_existing_tails_and_expired_files() {
         let dir = tempfile::TempDir::new().unwrap();
-        // 同じ prefix だがローテーション名ではないファイルを read-only で置く。
-        // 対象に含めてしまうと `write(true)` の open が失敗するので検出できる。
-        // pretty-log の日次ファイルも、JSONL 専用の fsync には含めない。
-        for name in ["otel-logger.pid", "otel-logger.pretty.2026-09-30.log"] {
-            let unrelated = dir.path().join(name);
-            std::fs::write(&unrelated, "4242").unwrap();
-            let mut perms = std::fs::metadata(&unrelated).unwrap().permissions();
-            perms.set_readonly(true);
-            std::fs::set_permissions(&unrelated, perms).unwrap();
-        }
+        let mut settings = settings_with_log_dir(dir.path().to_path_buf());
+        settings.pretty_log_dir = Some(dir.path().to_path_buf());
+        let today = chrono::Local::now().date_naive();
+        let jsonl = daily_path(dir.path(), ROTATION_PREFIX, None, today);
+        let pretty = daily_path(
+            dir.path(),
+            PRETTY_LOG_PREFIX,
+            Some(PRETTY_LOG_SUFFIX),
+            today,
+        );
+        let partial = b"{}\n{\"partial";
+        std::fs::write(&jsonl, partial).unwrap();
+        std::fs::write(&pretty, partial).unwrap();
+        let expired = dir.path().join("otel-logger.2025-01-01");
+        std::fs::write(&expired, b"{}\n").unwrap();
+        touch_mtime(&expired, SystemTime::UNIX_EPOCH);
+        probe_settings(&settings).await.unwrap();
+        assert_eq!(std::fs::read(&jsonl).unwrap(), partial);
+        assert_eq!(std::fs::read(&pretty).unwrap(), partial);
+        assert!(expired.exists());
+        settings.log_sink = Some(LogSink::File(jsonl.clone()));
+        probe_settings(&settings).await.unwrap();
+        assert_eq!(std::fs::read(&jsonl).unwrap(), partial);
+    }
 
-        let writer = open_rotated_sync(dir.path(), 7).unwrap();
-        writer
-            .sync_rotated_files()
-            .expect("JSONL の日次ファイル以外は fsync 対象に含めない");
+    #[tokio::test]
+    async fn probe_reports_unusable_output_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let mut settings = settings_with_log_dir(file.join("logs"));
+        assert!(probe_settings(&settings).await.is_err());
+        settings.log_sink = Some(LogSink::File(dir.path().to_path_buf()));
+        assert!(probe_settings(&settings).await.is_err());
+    }
 
-        // 日次ファイルを作ってから呼び直しても成功する。
-        let jsonl = JsonlWriter::Roller(Box::new(writer));
+    /// 過去ファイルの権限や、稼働ファイルの rename に依存せず自分の handle を同期する。
+    #[test]
+    fn rotated_shutdown_sync_uses_owned_handle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archived = dir.path().join("otel-logger.2026-01-01");
+        std::fs::write(&archived, b"{}\n").unwrap();
+        let mut permissions = std::fs::metadata(&archived).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&archived, permissions).unwrap();
+        let jsonl = JsonlWriter::Roller(Box::new(open_rotated_sync(dir.path(), 3650).unwrap()));
         jsonl.write_line(b"{}\n").unwrap();
-        jsonl.flush().expect("日次ファイルを fsync できる");
+        jsonl
+            .flush()
+            .expect("過去ファイルを書き込み用に開き直さない");
+        // Unix は開いたままの rename を許す。元のパスから開き直さなくても同期できる。
+        #[cfg(unix)]
+        {
+            let today = daily_path(
+                dir.path(),
+                ROTATION_PREFIX,
+                None,
+                chrono::Local::now().date_naive(),
+            );
+            std::fs::rename(&today, today.with_extension("moved")).unwrap();
+            jsonl
+                .flush()
+                .expect("rename 後も所有する handle で同期する");
+        }
     }
 
     #[tokio::test]

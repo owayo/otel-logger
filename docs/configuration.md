@@ -10,6 +10,8 @@ Leading `~` / `~/` is expanded to `$HOME` for `--config`, `otel-logger init --pa
 
 Note: TOML paths are not generally shell-expanded. A leading `~` / `~/` is expanded for the path settings listed above, but embedded environment variables such as `$HOME/logs` are not expanded; write absolute paths for those cases.
 
+Configuration parse errors report the file and position without echoing values or the underlying parser message, which can contain authentication headers. Check both TOML syntax and value types at the reported position.
+
 ## Precedence
 
 **Precedence** (highest wins): CLI flag > environment variable > config file > default. For the mutually exclusive log sinks, this precedence also applies across `log-file` and `log-dir`: specifying `--log-file` ignores a configured `log-dir`, and specifying `--log-dir` ignores a configured `log-file`.
