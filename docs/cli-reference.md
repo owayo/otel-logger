@@ -29,7 +29,7 @@ Without a subcommand, `otel-logger` runs the OTLP receiver.
 | `--proxy-anthropic-endpoint` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | Forward `service.name=claude-code` payloads to this upstream OTLP endpoint (see [proxy.md](proxy.md)) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` or `http-protobuf`                                 |
 | `--proxy-anthropic-header` | | (none) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` header (`env:VAR_NAME` resolves from env); repeatable |
-| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server`) payloads |
+| `--proxy-openai-endpoint` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Forward Codex (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` / `Codex Desktop` / `codex-exec-server`) payloads |
 | `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | Same as above                                             |
 | `--proxy-openai-header` | | (none) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | Same as above                                             |
 | `--proxy-checkpoint-dir` | | (next to JSONL) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | Directory for forward checkpoints (reserved for Phase B)  |

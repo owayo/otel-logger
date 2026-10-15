@@ -29,7 +29,7 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 | `--proxy-anthropic-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | `service.name=claude-code` の受信 payload を転送する上流 OTLP endpoint (詳細は [proxy.ja.md](proxy.ja.md)) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` / `http-protobuf`                                    |
 | `--proxy-anthropic-header` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` 形式 (`env:VAR_NAME` で環境変数解決)。複数指定可 |
-| `--proxy-openai-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server`) の転送先 |
+| `--proxy-openai-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_ENDPOINT` | Codex 系 (`codex_cli_rs` / `codex_exec` / `codex-app-server` / `codex_mcp_server` / `Codex Desktop` / `codex-exec-server`) の転送先 |
 | `--proxy-openai-transport` | | `grpc` | `OTEL_LOGGER_PROXY_OPENAI_TRANSPORT` | 同上                                                        |
 | `--proxy-openai-header` | | (なし) | `OTEL_LOGGER_PROXY_OPENAI_HEADERS` | 同上                                                        |
 | `--proxy-checkpoint-dir` | | (JSONL の隣) | `OTEL_LOGGER_PROXY_CHECKPOINT_DIR` | 転送 checkpoint 用ディレクトリ (Phase B 用に予約)              |

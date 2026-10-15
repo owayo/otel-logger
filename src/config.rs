@@ -135,7 +135,8 @@ color = "auto"
 # 組み込み既定 route:
 #   - name = "anthropic" → service_names = ["claude-code"]
 #   - name = "openai"    → service_names = ["codex_cli_rs", "codex_exec",
-#                                           "codex-app-server", "codex_mcp_server"]
+#                                           "codex-app-server", "codex_mcp_server",
+#                                           "Codex Desktop", "codex-exec-server"]
 #
 # CLI 短縮フラグ (`--proxy-anthropic-endpoint` / `--proxy-openai-endpoint`) を使うと
 # ここで endpoint を書かずに済みます。config で明示すると CLI/env より低優先です。

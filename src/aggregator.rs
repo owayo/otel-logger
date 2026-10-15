@@ -9,7 +9,8 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value as OtlpValue;
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use opentelemetry_proto::tonic::metrics::v1::{
-    AggregationTemporality, HistogramDataPoint, Metric, NumberDataPoint, metric::Data as MetricData,
+    AggregationTemporality, DataPointFlags, HistogramDataPoint, Metric, NumberDataPoint,
+    metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use serde::Serialize;
@@ -1329,6 +1330,10 @@ fn is_delta_temporality(temporality: i32, metric_name: &str) -> bool {
 }
 
 fn number_value_as_u64(dp: &NumberDataPoint) -> u64 {
+    // 欠測マーカーの value は値が残っていても無視する。未知のフラグとは区別する。
+    if dp.flags & DataPointFlags::NoRecordedValueMask as u32 != 0 {
+        return 0;
+    }
     match dp.value {
         Some(NumberValue::AsInt(i)) => i.max(0) as u64,
         Some(NumberValue::AsDouble(d)) => finite_u64_from_f64(d),
@@ -1337,6 +1342,9 @@ fn number_value_as_u64(dp: &NumberDataPoint) -> u64 {
 }
 
 fn number_value_as_f64(dp: &NumberDataPoint) -> f64 {
+    if dp.flags & DataPointFlags::NoRecordedValueMask as u32 != 0 {
+        return 0.0;
+    }
     match dp.value {
         Some(NumberValue::AsDouble(d)) if d.is_finite() => d.max(0.0),
         Some(NumberValue::AsInt(i)) => i.max(0) as f64,
@@ -1345,6 +1353,9 @@ fn number_value_as_f64(dp: &NumberDataPoint) -> f64 {
 }
 
 fn histogram_sum_as_u64(dp: &HistogramDataPoint) -> u64 {
+    if dp.flags & DataPointFlags::NoRecordedValueMask as u32 != 0 {
+        return 0;
+    }
     match dp.sum {
         Some(s) => finite_u64_from_f64(s),
         _ => 0,
@@ -2569,6 +2580,9 @@ mod tests {
             "claude_code.managed_settings_resolved",
             "claude_code.hook_execution_start",
             "claude_code.hook_registered",
+            "claude_code.hook_execution_complete",
+            "claude_code.assistant_response",
+            "claude_code.tool_decision",
         ] {
             let count = agg.ingest_logs(&make_log_req(
                 SERVICE_CLAUDE,
@@ -3216,6 +3230,84 @@ mod tests {
         assert_eq!(histogram_sum_as_u64(&rounded_histogram), 0);
     }
 
+    /// 欠測マーカーに値が残っていても、集計や token source の選択には使わない。
+    #[test]
+    fn no_recorded_value_metrics_do_not_affect_usage_or_sources() {
+        let agg = Aggregator::new();
+        for (service, mut metrics) in [
+            (
+                SERVICE_CLAUDE,
+                vec![
+                    claude_token_metric("test-model", "high", "input", 999),
+                    claude_cost_metric("test-model", "high", 9.0),
+                ],
+            ),
+            (
+                SERVICE_CODEX_EXEC,
+                vec![
+                    codex_token_metric("test-model", "input", 999.0),
+                    codex_turn_count("test-model", 99),
+                    codex_duration_metric("test-model", 999.0),
+                ],
+            ),
+        ] {
+            for metric in &mut metrics {
+                // flags は bit field。将来のフラグと同時に立つ場合も欠測として扱う。
+                match metric.data.as_mut().unwrap() {
+                    MetricData::Sum(sum) => {
+                        for point in &mut sum.data_points {
+                            point.flags = 3;
+                        }
+                    }
+                    MetricData::Histogram(hist) => {
+                        for point in &mut hist.data_points {
+                            point.flags = 3;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(agg.ingest_metrics(&make_metric_req(service, metrics)), 0);
+        }
+        assert!(agg.snapshot().agents.is_empty());
+
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![kv_str("model", "test-model"), kv_int("input_tokens", 5)],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CODEX_EXEC,
+            "",
+            vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("model", "test-model"),
+                kv_int("input_token_count", 7),
+            ],
+        ));
+        let snapshot = agg.snapshot();
+        assert_eq!(snapshot.agents[AGENT_CLAUDE].total.input_tokens, 5);
+        assert_eq!(snapshot.agents[AGENT_CODEX].total.input_tokens, 7);
+        assert_eq!(snapshot.agents[AGENT_CODEX].total.request_count, 0);
+        assert_eq!(snapshot.agents[AGENT_CODEX].total.duration_ms, 0);
+    }
+
+    #[test]
+    fn unknown_data_point_flags_preserve_recorded_values() {
+        let mut integer = make_int_dp(vec![], 42);
+        let mut double = make_double_dp(vec![], 42.5);
+        let mut histogram = make_hist_dp(vec![], 42.5);
+        for flags in [0, 2, 1 << 31] {
+            integer.flags = flags;
+            double.flags = flags;
+            histogram.flags = flags;
+            assert_eq!(number_value_as_u64(&integer), 42);
+            assert_eq!(number_value_as_f64(&double), 42.5);
+            assert_eq!(histogram_sum_as_u64(&histogram), 42);
+        }
+    }
+
     /// `conversation_id` 付きの SSE 完了ログを受けた後、別 conversation の session が
     /// 届いても、unknown バケットの内容が無関係な effort バケットへ移動しないことを確認する。
     #[test]
@@ -3586,6 +3678,52 @@ mod tests {
         assert_eq!(bucket.stats.cache_creation_tokens, 25277);
         assert_eq!(bucket.stats.duration_ms, 6084);
         assert!((bucket.stats.cost_usd - 0.294048).abs() < 1e-9);
+    }
+
+    /// キャッシュ作成の保持期間別内訳は合計の別表現で、加算対象ではない。
+    /// logs と metrics の到着順にかかわらず、合計を一度だけ計上する。
+    #[test]
+    fn claude_cache_creation_breakdown_does_not_double_count_total() {
+        for metrics_first in [true, false] {
+            let agg = Aggregator::new();
+            let metrics = make_metric_req(
+                SERVICE_CLAUDE,
+                vec![claude_token_metric(
+                    "test-model",
+                    "high",
+                    "cacheCreation",
+                    1000,
+                )],
+            );
+            if metrics_first {
+                agg.ingest_metrics(&metrics);
+            }
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CLAUDE,
+                "claude_code.api_request",
+                vec![
+                    kv_str("model", "test-model"),
+                    kv_str("effort", "high"),
+                    kv_str("cache_creation_tokens", "1000"),
+                    kv_str("cache_creation_1h_tokens", "300"),
+                    kv_str("cache_creation_5m_tokens", "700"),
+                ],
+            ));
+            if !metrics_first {
+                agg.ingest_metrics(&metrics);
+            }
+            let snapshot = agg.snapshot();
+            let agent = &snapshot.agents[AGENT_CLAUDE];
+            assert_eq!(agent.total.cache_creation_tokens, 1000);
+            assert_eq!(agent.total.request_count, 1);
+            assert_eq!(agent.buckets.len(), 1);
+            assert_eq!(
+                agent.buckets["anthropic/test-model/high"]
+                    .stats
+                    .cache_creation_tokens,
+                agent.total.cache_creation_tokens,
+            );
+        }
     }
 
     /// バグ回帰: `conversation.id` 付きの `handle_responses` span が effort を補完する際、
@@ -4164,6 +4302,7 @@ mod tests {
             "codex.user_prompt",
             "codex.turn_ttft",
             "codex.agent_communication",
+            "codex.skill_invocation",
         ] {
             agg.ingest_logs(&make_log_req(
                 SERVICE_CODEX_EXEC,

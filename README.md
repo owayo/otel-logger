@@ -59,7 +59,7 @@ brew install owayo/otel-logger/otel-logger
 
 ### Cargo
 
-Requires Rust 1.98 or later.
+Requires Rust 1.99 or later.
 
 ```bash
 cargo install --git https://github.com/owayo/otel-logger --locked
