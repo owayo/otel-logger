@@ -228,6 +228,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn jsonl_rotation_retries_after_sync_failure_without_losing_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut writer = DailyWriter::at_date(dir.path(), "otel-logger", None, date)
+            .unwrap()
+            .with_sync_on_rotate();
+        writer.append_at(b"first\n", date).unwrap();
+        // /dev/null は書けるが fsync できない。同期の失敗だけを注入する。
+        let unsyncable = AppendFile::open(Path::new("/dev/null")).unwrap();
+        assert!(unsyncable.sync_all().is_err());
+        let previous = std::mem::replace(&mut writer.file, unsyncable);
+        let next = date.succ_opt().unwrap();
+        let next_path = daily_path(dir.path(), "otel-logger", None, next);
+        assert!(writer.append_at(b"second\n", next).is_err());
+        assert_eq!(writer.date, date);
+        assert!(
+            !next_path.exists(),
+            "旧ファイルの同期前に次の batch を書かない"
+        );
+        writer.file = previous;
+        writer.append_at(b"second\n", next).unwrap();
+        writer.sync_all().unwrap();
+        assert_eq!(
+            std::fs::read(daily_path(dir.path(), "otel-logger", None, date)).unwrap(),
+            b"first\n"
+        );
+        assert_eq!(std::fs::read(next_path).unwrap(), b"second\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn jsonl_rotation_syncs_owned_files_after_rename() {
         let dir = tempfile::tempdir().unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
