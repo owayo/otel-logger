@@ -25,7 +25,7 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 | `--pretty-log` |       | `false`          | `OTEL_LOGGER_PRETTY_LOG`  | 人が読める出力を `<log-dir>/otel-logger.pretty.YYYY-MM-DD.log` (日次、ローカルタイム) にも書き出す。色は付けない。`--log-dir` が必須 |
 | `--summary`    |       | `false`          | `OTEL_LOGGER_SUMMARY`     | 使用量の累計が更新された時に、累計サマリーを人が読める出力 (stdout と `--pretty-log` のファイルのうち有効なもの) に追記 |
 | `--color`      |       | `auto`           | `OTEL_LOGGER_COLOR`       | stdout の `auto` / `always` / `never` (`NO_COLOR` を尊重)。`--pretty-log` のファイルには色を付けない |
-| `--dry-run`    | `-n`  | `false`          |                           | 両 listener の同時 bind を含む起動チェックを実施して終了     |
+| `--dry-run`    | `-n`  | `false`          |                           | 両 listener の同時 bind と出力先を検証して終了。既存ログの修復・削除は行わない (未作成の出力先は作成)     |
 | `--proxy-anthropic-endpoint` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_ENDPOINT` | `service.name=claude-code` の受信 payload を転送する上流 OTLP endpoint (詳細は [proxy.ja.md](proxy.ja.md)) |
 | `--proxy-anthropic-transport` | | `grpc` | `OTEL_LOGGER_PROXY_ANTHROPIC_TRANSPORT` | `grpc` / `http-protobuf`                                    |
 | `--proxy-anthropic-header` | | (なし) | `OTEL_LOGGER_PROXY_ANTHROPIC_HEADERS` | `Key=Value` 形式 (`env:VAR_NAME` で環境変数解決)。複数指定可 |

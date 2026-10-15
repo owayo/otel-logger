@@ -62,10 +62,8 @@ fn main() -> Result<()> {
             None
         };
 
-        let router = proxy_handle.as_ref().map(|h| h.router());
-        let sink = Sink::from_settings_with_proxy(&settings, router).await?;
-
         if settings.dry_run {
+            otel_logger::sink::probe_settings(&settings).await?;
             let (grpc, http) = server::probe_binds(settings.grpc_addr, settings.http_addr).await?;
             tracing::info!(
                 grpc = %grpc,
@@ -74,7 +72,6 @@ fn main() -> Result<()> {
                 pretty_log_dir = ?settings.pretty_log_dir,
                 "dry run: probed both listeners successfully, exiting"
             );
-            sink.flush().await?;
             // dry run でも worker は shutdown を通知して join。
             proxy_shutdown.cancel();
             if let Some(handle) = proxy_handle {
@@ -83,6 +80,8 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
+        let router = proxy_handle.as_ref().map(|h| h.router());
+        let sink = Sink::from_settings_with_proxy(&settings, router).await?;
         let run_result = server::run(settings, sink).await;
         // server が終了したので proxy worker にも shutdown を通知して join する。
         proxy_shutdown.cancel();

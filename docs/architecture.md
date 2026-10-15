@@ -32,7 +32,7 @@ How `otel-logger` receives, prints, stores and counts telemetry, and the guarant
 
 ## JSON Lines persistence
 
-- JSON Lines are written to one append-only file or to daily-rotated files, and `fsync`'d on graceful shutdown
+- JSON Lines are written to one append-only file or to daily-rotated files. Daily files are `fsync`'d through their owned handles before rotation, and the current file on graceful shutdown. Existing archives are not reopened
 - Persistence failures surface as HTTP `503 Service Unavailable` / gRPC `Status::unavailable` so OTLP exporters can retry instead of silently dropping payloads. OTLP treats `500` and `Internal` as non-retryable, so those codes would make exporters drop the batch
 - Usage totals are updated only after JSONL persistence succeeds, so retried batches are not counted twice
 - Each batch, including its newline, is written to the kernel before ACK; failed partial appends are truncated back to the batch start. If rollback fails, subsequent writes are rejected until rollback succeeds

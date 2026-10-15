@@ -69,6 +69,22 @@ pub(crate) struct AppendFile {
 
 impl AppendFile {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        let mut file = Self::open_file(path)?;
+        recover_tail(&mut file)?;
+        Ok(Self {
+            writer: TransactionalAppend {
+                file,
+                rollback: None,
+            },
+        })
+    }
+
+    /// 稼働中の writer と並行する検証では、未完了 tail に触れない。
+    pub(crate) fn probe(path: &Path) -> io::Result<()> {
+        Self::open_file(path).map(drop)
+    }
+
+    fn open_file(path: &Path) -> io::Result<File> {
         let mut options = OpenOptions::new();
         options.create(true).read(true);
         // Windows の append-only handle は set_len に必要な FILE_WRITE_DATA を持たない。
@@ -78,14 +94,7 @@ impl AppendFile {
         #[cfg(not(windows))]
         options.append(true);
         crate::path::restrict_new_file_mode(&mut options);
-        let mut file = options.open(path)?;
-        recover_tail(&mut file)?;
-        Ok(Self {
-            writer: TransactionalAppend {
-                file,
-                rollback: None,
-            },
-        })
+        options.open(path)
     }
 
     pub(crate) fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -133,6 +142,7 @@ pub(crate) struct DailyWriter {
     suffix: Option<String>,
     date: NaiveDate,
     file: AppendFile,
+    sync_on_rotate: bool,
 }
 
 impl DailyWriter {
@@ -153,13 +163,28 @@ impl DailyWriter {
             suffix: suffix.map(str::to_string),
             date,
             file,
+            sync_on_rotate: false,
         })
+    }
+
+    /// JSONL は閉じる前のファイルを同期する。best-effort の pretty では使わない。
+    pub(crate) fn with_sync_on_rotate(mut self) -> Self {
+        self.sync_on_rotate = true;
+        self
+    }
+
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
     }
 
     fn append_at(&mut self, bytes: &[u8], date: NaiveDate) -> io::Result<()> {
         if self.date != date {
             // 前日の壊れた tail を残したまま writer を捨てない。
             self.file.writer.repair()?;
+            if self.sync_on_rotate {
+                // 失敗時は旧 handle を保持し、次の batch / shutdown で再試行する。
+                self.file.sync_all()?;
+            }
             let file = AppendFile::open(&daily_path(
                 &self.dir,
                 &self.prefix,
@@ -173,7 +198,12 @@ impl DailyWriter {
     }
 }
 
-fn daily_path(dir: &Path, prefix: &str, suffix: Option<&str>, date: NaiveDate) -> PathBuf {
+pub(crate) fn daily_path(
+    dir: &Path,
+    prefix: &str,
+    suffix: Option<&str>,
+    date: NaiveDate,
+) -> PathBuf {
     let name = format!("{prefix}.{date}");
     dir.join(match suffix {
         Some(suffix) => format!("{name}.{suffix}"),
@@ -195,6 +225,28 @@ impl Write for DailyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_rotation_syncs_owned_files_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let mut writer = DailyWriter::at_date(dir.path(), "otel-logger", None, date)
+            .unwrap()
+            .with_sync_on_rotate();
+        writer.append_at(b"first\n", date).unwrap();
+        let old = daily_path(dir.path(), "otel-logger", None, date);
+        let moved = dir.path().join("archived.jsonl");
+        std::fs::rename(&old, &moved).unwrap();
+        let next = date.succ_opt().unwrap();
+        writer.append_at(b"second\n", next).unwrap();
+        writer.sync_all().unwrap();
+        assert_eq!(std::fs::read(moved).unwrap(), b"first\n");
+        assert_eq!(
+            std::fs::read(daily_path(dir.path(), "otel-logger", None, next)).unwrap(),
+            b"second\n"
+        );
+    }
 
     /// process ごとのファイル上限で、実際の部分 write と EFBIG 後の再送を検証する。
     /// 上限と signal 設定は別 process に閉じ込め、並行テストへ影響させない。

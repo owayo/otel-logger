@@ -32,7 +32,7 @@
 
 ## JSON Lines の永続化
 
-- JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存し、graceful shutdown 時に `fsync`
+- JSON Lines は単一の追記ファイルまたは日次ローテーションファイルへ保存する。日次ファイルは切り替え前に所有 handle で `fsync` し、graceful shutdown では現在のファイルを同期する。保管済みの過去ファイルは開き直さない
 - JSONL の永続化に失敗した場合は HTTP `503 Service Unavailable` / gRPC `Status::unavailable` を返し、OTLP exporter 側に retry させる (受信 payload を黙って捨てない)。OTLP 仕様上 500 や `Internal` は retry されず破棄されるため、retryable な code を返す
 - 累計使用量は JSONL 永続化に成功してから更新するため、retry された batch を二重計上しない
 - 各 batch は改行まで kernel に書き渡してから ACK する。部分書き込みに失敗したら batch 開始位置へ truncate する。取り消しにも失敗した場合は、修復できるまで後続の書き込みを拒否する
