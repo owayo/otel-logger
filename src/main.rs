@@ -172,5 +172,13 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
+        .with_ansi(otel_logger::cli::color_enabled_for_stderr())
+        // stderr へ書けないとき (ディスク満杯の ENOSPC、読み手の消えた pipe の EPIPE)、
+        // `fmt()` の既定では代わりに `eprintln!` で内部エラーを出そうとし、その書き込みも
+        // 失敗して panic する。ログを出した task ごと落ちるため、pretty writer が止まる、
+        // 保存済みの batch に 503 を返して再送で JSONL が重複する、SIGTERM を受けた
+        // task が落ちて以後のシグナルが無視される、という形で受信と終了処理に波及する。
+        // 書けない診断ログは、書けないまま捨てる。
+        .log_internal_errors(false)
         .init();
 }

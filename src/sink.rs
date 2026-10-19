@@ -1,10 +1,11 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use time::OffsetDateTime;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use anyhow::{Context, Result};
@@ -483,8 +484,32 @@ struct PrettyOutput {
     queued_bytes: Arc<AtomicUsize>,
     /// `queued_bytes` の上限。
     max_queued_bytes: usize,
-    /// 追いつかずに捨てた batch 数。
+    /// 捨てた batch 数 (理由を問わない)。
     dropped: AtomicU64,
+    /// writer の停止を報告済みか。停止は再起動まで戻らないので、最初の 1 回は必ず知らせる。
+    writer_stop_reported: AtomicBool,
+}
+
+/// 人が読める出力を queue に積めずに捨てた理由。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropReason {
+    /// writer task が終了している (channel が閉じている)。再起動するまで出力は戻らない。
+    WriterStopped,
+    /// queue の件数が上限に達している (読み手が遅い)。
+    QueueFull,
+    /// queue に積まれた rendered 文字列の合計バイト数が上限を超える。
+    ByteBudget,
+}
+
+impl DropReason {
+    /// 診断ログに載せる理由の名前。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WriterStopped => "writer_stopped",
+            Self::QueueFull => "queue_full",
+            Self::ByteBudget => "byte_budget",
+        }
+    }
 }
 
 impl PrettyOutput {
@@ -507,38 +532,86 @@ impl PrettyOutput {
             queued_bytes,
             max_queued_bytes: PRETTY_QUEUE_MAX_BYTES,
             dropped: AtomicU64::new(0),
+            writer_stop_reported: AtomicBool::new(false),
         }
     }
 
-    /// 1 batch 分を queue に積む。溢れたら待たずに捨てる。
-    fn enqueue(&self, rendered: Arc<str>, want_summary: bool) {
+    /// 1 batch 分を queue に積む。積めなければ待たずに捨て、その理由を返す
+    /// (返り値はテストで検証する)。
+    ///
+    /// 人が読める出力はベストエフォートなので捨てる。JSONL 永続化・累計集計・proxy 転送は
+    /// 既に完了しているため、telemetry の欠測にはならない。
+    fn enqueue(&self, rendered: Arc<str>, want_summary: bool) -> Option<DropReason> {
         let len = rendered.len();
         let queued = self.queued_bytes.fetch_add(len, AtomicOrdering::Relaxed);
         // queue が空でも上限を超える batch は通さない。制御文字を多く含む payload は escape で
         // 数倍に膨らむ (NUL 1 byte → `\u{0000}` 8 byte) ため、32MiB の request 1 つが上限を
         // 大きく超えうる。出力先が止まっている間それを抱え続けると、上限の意味が無くなる。
         let over_budget = queued.saturating_add(len) > self.max_queued_bytes;
-        let job = PrettyJob {
-            rendered,
-            want_summary,
-            sync: None,
+        // 閉じているかを先に見る。バイト上限の判定を先にすると、writer が止まっていても
+        // 「追いつかない」として報告され、再起動まで戻らない停止に気づけない。
+        let reason = if self.tx.is_closed() {
+            Some(DropReason::WriterStopped)
+        } else if over_budget {
+            Some(DropReason::ByteBudget)
+        } else {
+            let job = PrettyJob {
+                rendered,
+                want_summary,
+                sync: None,
+            };
+            match self.tx.try_send(job) {
+                Ok(()) => None,
+                Err(TrySendError::Full(_)) => Some(DropReason::QueueFull),
+                Err(TrySendError::Closed(_)) => Some(DropReason::WriterStopped),
+            }
         };
-        if over_budget || self.tx.try_send(job).is_err() {
-            // queue が詰まっている = 読み手が遅い、または writer が停止した。
-            // 人が読める出力はベストエフォートなので捨てる。JSONL 永続化・累計集計・
-            // proxy 転送は既に完了しているため、telemetry の欠測にはならない。
+        if let Some(reason) = reason {
             self.queued_bytes.fetch_sub(len, AtomicOrdering::Relaxed);
-            let dropped = self.dropped.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            if dropped.is_power_of_two() {
+            self.report_drop(reason);
+        }
+        reason
+    }
+
+    /// 捨てた batch を数え、必要な診断ログを出す。
+    ///
+    /// 追いつかない間の通知は件数が 2 の冪になった時だけに間引く。writer の停止は再起動まで
+    /// 戻らないため、間引きとは別に最初の 1 回を必ず error で知らせる。
+    fn report_drop(&self, reason: DropReason) {
+        let dropped = self.dropped.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if reason == DropReason::WriterStopped {
+            if !self
+                .writer_stop_reported
+                .swap(true, AtomicOrdering::Relaxed)
+            {
+                tracing::error!(
+                    destination = self.name,
+                    dropped_total = dropped,
+                    "human-readable output writer has stopped; output is dropped until \
+                     otel-logger restarts. JSONL persistence, usage aggregation and proxy \
+                     forwarding are unaffected. / 人が読める出力の writer が停止しました。\
+                     再起動するまで出力を捨てます。JSONL 永続化・累計集計・proxy 転送には\
+                     影響しません。"
+                );
+            } else if dropped.is_power_of_two() {
                 tracing::warn!(
                     destination = self.name,
                     dropped_total = dropped,
-                    "human-readable output writer is behind; dropping output. \
-                     JSONL persistence, usage aggregation and proxy forwarding are unaffected. \
-                     / 人が読める出力の書き出しが追いつかないため、出力を捨てています。\
-                     JSONL 永続化・累計集計・proxy 転送には影響しません。"
+                    "human-readable output writer has stopped; still dropping output"
                 );
             }
+            return;
+        }
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                destination = self.name,
+                dropped_total = dropped,
+                reason = reason.as_str(),
+                "human-readable output writer is behind; dropping output. \
+                 JSONL persistence, usage aggregation and proxy forwarding are unaffected. \
+                 / 人が読める出力の書き出しが追いつかないため、出力を捨てています。\
+                 JSONL 永続化・累計集計・proxy 転送には影響しません。"
+            );
         }
     }
 
@@ -559,11 +632,20 @@ impl PrettyOutput {
             sync_rx.await.ok()
         })
         .await;
-        if !matches!(drained, Ok(Some(()))) {
-            tracing::warn!(
+        match drained {
+            Ok(Some(())) => {}
+            // 期限切れと writer の停止を分けて記録する。停止なら稼働中から出力が失われて
+            // いたことになり、追いつかなかっただけの場合とは調べる場所が違う。
+            Ok(None) => tracing::warn!(
+                destination = self.name,
+                dropped_total = self.dropped.load(AtomicOrdering::Relaxed),
+                "human-readable output writer had stopped before shutdown; output queued \
+                 after it stopped was lost"
+            ),
+            Err(_) => tracing::warn!(
                 destination = self.name,
                 "human-readable output did not drain before shutdown; some output was lost"
-            );
+            ),
         }
     }
 }
@@ -1544,6 +1626,10 @@ mod tests {
 
     /// 回帰テスト: queue の件数上限だけでは memory を抑えられないので、rendered の
     /// 合計バイト数でも打ち切る。捨てた batch は計上から巻き戻す。
+    ///
+    /// 捨てた理由も区別する。2026-10-12 の実機では、ディスク満杯で pretty-log の writer が
+    /// 終了した後、再起動までの 1 日半にわたって「writer is behind」だけが出続け、停止に
+    /// 気づけなかった。writer が止まっていれば、バイト上限を超える batch も停止として扱う。
     #[tokio::test]
     async fn enqueue_drops_batches_beyond_the_byte_budget() {
         // writer を起動せず、queue に積まれた状態を観察する。容量 1 で満杯も再現する。
@@ -1555,6 +1641,7 @@ mod tests {
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             max_queued_bytes: 10,
             dropped: AtomicU64::new(0),
+            writer_stop_reported: AtomicBool::new(false),
         };
         let counters = || {
             (
@@ -1563,22 +1650,31 @@ mod tests {
             )
         };
 
-        output.enqueue(Arc::from("0123456789A"), false);
+        assert_eq!(
+            output.enqueue(Arc::from("0123456789A"), false),
+            Some(DropReason::ByteBudget)
+        );
         assert_eq!(
             counters(),
             (1, 0),
             "queue が空でも上限を超える batch は捨て、計上から外す"
         );
 
-        output.enqueue(Arc::from("0123"), false);
+        assert_eq!(output.enqueue(Arc::from("0123"), false), None);
         assert_eq!(counters(), (1, 4));
-        output.enqueue(Arc::from("45"), false);
+        assert_eq!(
+            output.enqueue(Arc::from("45"), false),
+            Some(DropReason::QueueFull)
+        );
         assert_eq!(
             counters(),
             (2, 4),
             "上限内でも channel が満杯なら捨て、計上を巻き戻す"
         );
-        output.enqueue(Arc::from("0123456"), false);
+        assert_eq!(
+            output.enqueue(Arc::from("0123456"), false),
+            Some(DropReason::ByteBudget)
+        );
         assert_eq!(
             counters(),
             (3, 4),
@@ -1587,12 +1683,21 @@ mod tests {
 
         assert_eq!(&*rx.try_recv().unwrap().rendered, "0123");
         drop(rx);
-        output.enqueue(Arc::from("67"), false);
+        assert_eq!(
+            output.enqueue(Arc::from("67"), false),
+            Some(DropReason::WriterStopped)
+        );
         assert_eq!(
             counters(),
             (4, 4),
             "writer が止まった (channel closed) 分も捨てた件数に数え、計上を巻き戻す"
         );
+        assert_eq!(
+            output.enqueue(Arc::from("0123456789AB"), false),
+            Some(DropReason::WriterStopped),
+            "writer が止まっていれば、バイト上限を超える batch も停止として報告する"
+        );
+        assert!(output.writer_stop_reported.load(AtomicOrdering::Relaxed));
     }
 
     /// writer が書き終えた batch は計上から外れ、queue の予算が戻る。

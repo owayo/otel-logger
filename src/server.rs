@@ -78,12 +78,35 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
     Ok(())
 }
 
-/// SIGINT または (Unix では) SIGTERM を待つ。Docker/Kubernetes などの container runtime は
-/// shutdown 時に SIGTERM を送るため、SIGTERM も扱う必要がある。
-pub async fn shutdown_signal() {
+/// 受け取った終了シグナル。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl ShutdownSignal {
+    /// 診断ログに載せるシグナル名。
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+}
+
+/// SIGINT または (Unix では) SIGTERM を待ち、受け取ったシグナルを返す。Docker/Kubernetes などの
+/// container runtime は shutdown 時に SIGTERM を送るため、SIGTERM も扱う必要がある。
+///
+/// 受け取ったことのログは、呼び出し側がシャットダウンを始めた後で出す。ここでログを出すと、
+/// その書き込みの成否がシャットダウンの開始より先に来てしまう。
+pub async fn shutdown_signal() -> ShutdownSignal {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
+            // 登録に失敗しただけで、SIGINT を受け取ったわけではない。ここで完了すると
+            // 起動直後にシャットダウンが始まるため、SIGTERM の側と同じく待ち続ける。
             tracing::warn!(error = %e, "ctrl_c handler failed");
+            std::future::pending::<()>().await;
         }
     };
 
@@ -104,8 +127,8 @@ pub async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => tracing::info!("received SIGINT"),
-        _ = terminate => tracing::info!("received SIGTERM"),
+        _ = ctrl_c => ShutdownSignal::Interrupt,
+        _ = terminate => ShutdownSignal::Terminate,
     }
 }
 
@@ -142,11 +165,18 @@ pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     let signal_token = shutdown.clone();
     let hard_exit_signal = hard_exit.clone();
     let signal_handle = tokio::spawn(async move {
-        shutdown_signal().await;
+        let first = shutdown_signal().await;
+        // ログより先にシャットダウンを始める。tokio はシグナルの既定動作をプロセス全体で
+        // 置き換えるので、この task がログの途中で落ちると以後の SIGTERM / SIGINT は
+        // 誰にも届かず、SIGKILL でしか止められなくなる (最終 fsync も走らない)。
         signal_token.cancel();
-        shutdown_signal().await;
-        tracing::warn!("second shutdown signal received; abandoning in-flight connections");
+        tracing::info!("received {}", first.name());
+        let second = shutdown_signal().await;
         hard_exit_signal.cancel();
+        tracing::warn!(
+            signal = second.name(),
+            "second shutdown signal received; abandoning in-flight connections"
+        );
     });
 
     let grpc_abort = grpc_handle.abort_handle();

@@ -270,15 +270,28 @@ impl ColorMode {
             ColorMode::Always => true,
             ColorMode::Never => false,
             ColorMode::Auto => {
-                // 仕様は "when present and not an empty string"。空文字を無視するのは
-                // `XDG_CONFIG_HOME` / `HOME` の扱い (config.rs / path.rs) とも揃う。
-                if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
-                    return false;
-                }
-                is_terminal::IsTerminal::is_terminal(&std::io::stdout())
+                !no_color_requested() && is_terminal::IsTerminal::is_terminal(&std::io::stdout())
             }
         }
     }
+}
+
+/// 診断ログ (tracing) を stderr へ色付きで出すか判定する。
+///
+/// 診断ログは設定ファイルを読む前に初期化するので `--color` は使えず、常に `Auto` と同じ
+/// 規則で決める。launchd / systemd / Docker は stderr をファイルや pipe へ向けるため、
+/// 端末でなければ色を付けない。tracing-subscriber は `NO_COLOR` を見るが端末かどうかは
+/// 見ないので、判定しないとリダイレクト先のログに ANSI escape が残る。
+pub fn color_enabled_for_stderr() -> bool {
+    !no_color_requested() && is_terminal::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// `NO_COLOR` (https://no-color.org/) で色を止めるよう求められているか。
+///
+/// 仕様は "when present and not an empty string"。空文字を無視するのは
+/// `XDG_CONFIG_HOME` / `HOME` の扱い (config.rs / path.rs) とも揃う。
+fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
 pub const DEFAULT_LOG_KEEP_DAYS: u32 = 10;
