@@ -1189,7 +1189,8 @@ fn sum_pending_for_bucket(g: &AggregatorInner, bucket: &Bucket) -> ModelStats {
 /// conversation の effort バケットへ値を寄せてしまう。`conversation.id` が無い span は
 /// `update_codex_last_effort` で service 単位の fallback だけを更新する。
 ///
-/// 戻り値は、記録や累計が実際に変わったか。
+/// 戻り値は、累計の内訳が変わった (pending を確定バケットへ移した) か。effort を記録し直す
+/// だけでは snapshot も summary も変わらないので数えない。
 fn update_codex_effort_from_request_attrs(
     g: &mut AggregatorInner,
     service: &str,

@@ -1818,15 +1818,23 @@ mod tests {
                 open_gate(&gate);
             })
         };
+        let flushed = sink.flush().await;
+        // gate を開ける前に読む。join の後に読むと、修正前の実装 (drain せずに返す) でも
+        // gate が開いた直後に writer が書き終えて 0 になり、回帰を検出できないことがある。
+        let queued_after_flush = sink
+            .inner
+            .stdout
+            .as_ref()
+            .unwrap()
+            .queued_bytes
+            .load(AtomicOrdering::Relaxed);
+        opener.join().unwrap();
         assert!(
-            sink.flush().await.is_err(),
+            flushed.is_err(),
             "JSONL を同期できなかったことは呼び出し元へ返す"
         );
-        opener.join().unwrap();
-        let stdout = sink.inner.stdout.as_ref().unwrap();
         assert_eq!(
-            stdout.queued_bytes.load(AtomicOrdering::Relaxed),
-            0,
+            queued_after_flush, 0,
             "JSONL の同期に失敗しても、stdout に積んだ出力は書き終えるまで待つ"
         );
     }
