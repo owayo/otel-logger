@@ -70,7 +70,15 @@ async fn run(mut cfg: WorkerConfig) {
                     }
                     Err(e) => {
                         cfg.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(route = %cfg.route_name, error = %e, "proxy send failed after retries");
+                        // 原因は `{:#}` で chain ごと文字列にしてから Debug で記録する。anyhow の
+                        // Display は最外の context (`gRPC logs export` など) しか出さず、status
+                        // code や接続断・TLS の失敗理由が残らない。Debug にするのは、上流由来の
+                        // 文字列に紛れた制御文字をそのまま端末へ出さないため。
+                        tracing::warn!(
+                            route = %cfg.route_name,
+                            error = ?format!("{e:#}"),
+                            "proxy send failed after retries"
+                        );
                     }
                 }
             }
@@ -128,7 +136,7 @@ async fn drain_remaining(cfg: &mut WorkerConfig, interrupted: Option<ExportReque
                 cfg.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     route = %cfg.route_name,
-                    error = %e,
+                    error = ?format!("{e:#}"),
                     "proxy drain send failed"
                 );
             }
@@ -188,7 +196,7 @@ async fn send_with_retry(
                     route = %route_name,
                     attempt = attempt + 1,
                     max = attempts,
-                    error = %e,
+                    error = ?format!("{e:#}"),
                     "proxy send attempt failed"
                 );
                 last_err = Some(e);
@@ -219,7 +227,7 @@ mod tests {
     };
 
     use axum::{Router, extract::State, http::StatusCode, routing::post};
-    use tokio::{net::TcpListener, sync::Notify};
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::Notify};
 
     use super::*;
     use crate::cli::ProxyRoute;
@@ -356,6 +364,131 @@ mod tests {
             .is_err()
         );
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    /// 回帰テスト: 上流から status を受け取る前に接続が切れた gRPC 送信を再送する。
+    ///
+    /// tonic はこの transport 障害を `Unknown` / `Internal` として返すため、code だけで
+    /// 判定すると HTTP の接続断と違って 1 回で failed になっていた。
+    #[tokio::test]
+    async fn grpc_connection_closed_before_status_is_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                    // client が request を書き終えるまで読み、HTTP/2 の応答を何も返さずに閉じる。
+                    // 読まずに閉じると、request を送る前に切断を検知した回だけ hyper が
+                    // `Cancelled` (元から再送対象) を返し、修正前でも通ることがある。
+                    let mut buf = [0u8; 4096];
+                    while let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf))
+                            .await
+                    {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    drop(stream);
+                }
+            }
+        });
+        let route = ProxyRoute {
+            name: "test".to_string(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::Grpc,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 3_000).unwrap();
+
+        let result = send_with_retry(
+            "test",
+            &client,
+            &ExportRequest::Logs(Box::default()),
+            2,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "接続を閉じ続ける上流へは送信できない");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            3,
+            "初回送信に加えて retry_max 回だけ接続し直す"
+        );
+        server.abort();
+    }
+
+    /// 上流が返した `Internal` は transport 障害と区別し、OTLP の仕様どおり再送しない。
+    #[tokio::test]
+    async fn grpc_upstream_internal_status_is_not_retried() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
+            LogsService, LogsServiceServer,
+        };
+        use opentelemetry_proto::tonic::collector::logs::v1::{
+            ExportLogsServiceRequest, ExportLogsServiceResponse,
+        };
+
+        struct InternalUpstream(Arc<AtomicUsize>);
+
+        #[tonic::async_trait]
+        impl LogsService for InternalUpstream {
+            async fn export(
+                &self,
+                _request: tonic::Request<ExportLogsServiceRequest>,
+            ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(tonic::Status::internal("upstream failure"))
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(InternalUpstream(Arc::clone(
+                    &attempts,
+                ))))
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        );
+        let route = ProxyRoute {
+            name: "test".to_string(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::Grpc,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 3_000).unwrap();
+
+        let error = send_with_retry(
+            "test",
+            &client,
+            &ExportRequest::Logs(Box::default()),
+            3,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("上流が Internal を返した送信は失敗する");
+
+        assert_eq!(
+            error
+                .downcast_ref::<tonic::Status>()
+                .map(tonic::Status::code),
+            Some(tonic::Code::Internal)
+        );
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "上流が返した Internal は再送しない"
+        );
         server.abort();
     }
 

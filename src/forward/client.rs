@@ -26,6 +26,18 @@ use super::ExportRequest;
 
 const OTLP_HTTP_PROTOBUF: &str = "application/x-protobuf";
 
+/// OTLP/HTTP の signal 別パス。endpoint の末尾に足して送信先 URL を作る。
+const OTLP_HTTP_LOGS_PATH: &str = "/v1/logs";
+const OTLP_HTTP_TRACES_PATH: &str = "/v1/traces";
+const OTLP_HTTP_METRICS_PATH: &str = "/v1/metrics";
+
+/// gRPC の `grpc-timeout` header で表せる timeout の上限 (99,999,999 時間)。
+///
+/// header の値は 8 桁までの整数と単位で、最大の単位は時間 (`H`) なので、これより長い
+/// timeout は正しく送れない。tonic は 1 億時間以上の値を送信時に
+/// `expect("duration is unrealistically large")` で panic させ、その route の worker が止まる。
+const GRPC_TIMEOUT_MAX: Duration = Duration::from_secs(99_999_999 * 60 * 60);
+
 /// route ごとに 1 個作られる送信クライアント。中は Arc で安く clone できる。
 #[derive(Clone)]
 pub enum RouteClient {
@@ -160,6 +172,16 @@ fn build_grpc_endpoint(url: &str, route: &str, timeout: Duration) -> Result<Endp
     // 検証を欠くと userinfo が HTTP/2 の `:authority` に載り (RFC 9113 §8.3.1 違反)、
     // scheme 無しの endpoint は起動に成功したうえで全送信が恒久的に失敗する。
     validate_proxy_endpoint(url, route)?;
+    // `grpc-timeout` に書けない値は、最初の送信 (`attach_metadata` の `set_timeout`) で
+    // tonic が panic させる。worker が止まると以後その route の batch はすべて捨てられる
+    // ため、queue 容量と同じく起動時の設定エラーにする。
+    if timeout > GRPC_TIMEOUT_MAX {
+        bail!(
+            "proxy timeout-ms {} for route `{route}` exceeds the gRPC maximum of {} ms",
+            timeout.as_millis(),
+            GRPC_TIMEOUT_MAX.as_millis()
+        );
+    }
     let ep = Endpoint::from_shared(url.to_string())
         .with_context(|| format!("build gRPC endpoint for route `{route}`"))?
         .timeout(timeout)
@@ -256,9 +278,9 @@ impl HttpClient {
             reqwest::Url::parse(&format!("{base}{path}"))
                 .with_context(|| format!("build OTLP/HTTP URL `{path}` for route `{}`", route.name))
         };
-        let logs_url = signal_url("/v1/logs")?;
-        let traces_url = signal_url("/v1/traces")?;
-        let metrics_url = signal_url("/v1/metrics")?;
+        let logs_url = signal_url(OTLP_HTTP_LOGS_PATH)?;
+        let traces_url = signal_url(OTLP_HTTP_TRACES_PATH)?;
+        let metrics_url = signal_url(OTLP_HTTP_METRICS_PATH)?;
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -288,10 +310,22 @@ impl HttpClient {
     }
 
     async fn export(&self, request: ExportRequest) -> Result<()> {
-        let (url, body) = match request {
-            ExportRequest::Logs(req) => (&self.urls.logs_url, encode_pb(req.as_ref())),
-            ExportRequest::Traces(req) => (&self.urls.traces_url, encode_pb(req.as_ref())),
-            ExportRequest::Metrics(req) => (&self.urls.metrics_url, encode_pb(req.as_ref())),
+        let (url, signal_path, body) = match request {
+            ExportRequest::Logs(req) => (
+                &self.urls.logs_url,
+                OTLP_HTTP_LOGS_PATH,
+                encode_pb(req.as_ref()),
+            ),
+            ExportRequest::Traces(req) => (
+                &self.urls.traces_url,
+                OTLP_HTTP_TRACES_PATH,
+                encode_pb(req.as_ref()),
+            ),
+            ExportRequest::Metrics(req) => (
+                &self.urls.metrics_url,
+                OTLP_HTTP_METRICS_PATH,
+                encode_pb(req.as_ref()),
+            ),
         };
         let response = self
             .client
@@ -300,9 +334,11 @@ impl HttpClient {
             .body(Bytes::from(body))
             .send()
             .await
-            // URL 全体は出さない。endpoint に userinfo (`https://user:pass@host`) が
-            // 入っていると、送信失敗のたびに資格情報が stderr に残る。
-            .with_context(|| format!("HTTP POST to upstream (signal path {})", url.path()))?;
+            // URL は出さない。reqwest の Display は URL 全体を含み、worker は原因まで
+            // chain ごとログに残す。endpoint の path に秘密を埋める送信先もあるため、
+            // 診断には signal path だけを使う。
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("HTTP POST to upstream (signal path {signal_path})"))?;
         let status = response.status();
         if !status.is_success() {
             // 本文は読まない。`text()` は全量をメモリに展開する (gzip なら展開後のサイズ) ため、
@@ -364,6 +400,12 @@ pub(super) fn retry_delay(error: &anyhow::Error) -> Option<Duration> {
             | tonic::Code::Unavailable
             | tonic::Code::DataLoss => Some(grpc_retry_info(status).unwrap_or_default()),
             tonic::Code::ResourceExhausted => grpc_retry_info(status),
+            // 上流から status を受け取る前に接続が切れても (接続直後の FIN / RST、GOAWAY)、
+            // tonic は `Unknown` / `Internal` を作る。code だけで判定すると、HTTP の接続断と
+            // 違って 1 回で failed になる。
+            tonic::Code::Unknown | tonic::Code::Internal if is_grpc_transport_failure(status) => {
+                Some(Duration::ZERO)
+            }
             _ => None,
         };
     }
@@ -371,6 +413,17 @@ pub(super) fn retry_delay(error: &anyhow::Error) -> Option<Duration> {
     error
         .downcast_ref::<reqwest::Error>()
         .map(|_| Duration::ZERO)
+}
+
+/// 上流が返した status ではなく、tonic が channel の transport 障害から作った status か判定する。
+///
+/// 応答ヘッダーより前の失敗は、`Channel` が返す `tonic::transport::Error` が source に付く。
+/// 上流が返した status は source を持たない。応答ヘッダーを受け取った後の body の失敗は
+/// source が hyper の error になるが、unary RPC の応答ヘッダーは上流が処理を終えてから
+/// 届くため、再送すると二重に取り込ませるおそれがあり対象にしない (HTTP 経路も
+/// 応答ヘッダーを受け取ったら status code だけで判定する)。
+fn is_grpc_transport_failure(status: &tonic::Status) -> bool {
+    std::error::Error::source(status).is_some_and(|source| source.is::<tonic::transport::Error>())
 }
 
 /// google.rpc.Status / Any / RetryInfo の必要な field だけを読む。
@@ -545,6 +598,43 @@ mod tests {
             let status =
                 tonic::Status::with_details(tonic::Code::ResourceExhausted, "busy", details.into());
             assert_eq!(retry_delay(&status.into()), expected);
+        }
+    }
+
+    /// tonic は上流から status を受け取る前の transport 障害も `Unknown` / `Internal` にする。
+    /// その場合は source に `tonic::transport::Error` が付くので、それだけを再送する。
+    /// source を持たない status (上流が返したもの) は上の test で code だけで判定している。
+    #[test]
+    fn grpc_retry_policy_retries_unknown_and_internal_only_for_transport_failures() {
+        let with_source = |code, source: Arc<dyn std::error::Error + Send + Sync>| {
+            let mut status = tonic::Status::new(code, "untrusted message");
+            status.set_source(source);
+            anyhow::Error::new(status).context("export")
+        };
+        for code in 1..=16 {
+            let code = tonic::Code::from_i32(code);
+            let retryable = matches!(
+                code,
+                tonic::Code::Cancelled
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Aborted
+                    | tonic::Code::OutOfRange
+                    | tonic::Code::Unavailable
+                    | tonic::Code::DataLoss
+            );
+            let transport = Endpoint::from_shared("not a uri").expect_err("空白を含む URI は不正");
+            assert_eq!(
+                retry_delay(&with_source(code, Arc::new(transport))),
+                (retryable || matches!(code, tonic::Code::Unknown | tonic::Code::Internal))
+                    .then_some(Duration::ZERO),
+                "{code:?} (transport 障害)"
+            );
+            let other = std::io::Error::other("not a transport failure");
+            assert_eq!(
+                retry_delay(&with_source(code, Arc::new(other))).is_some(),
+                retryable,
+                "{code:?} (transport 以外の source)"
+            );
         }
     }
 
@@ -724,6 +814,47 @@ mod tests {
         assert!(err.to_string().contains("500"), "got: {err}");
     }
 
+    /// 送信失敗の chain に原因を残しつつ、URL は載せない。
+    ///
+    /// reqwest の Display は URL 全体を含むため、そのまま包むと worker のログに endpoint が
+    /// 残る。endpoint の path に秘密を埋める送信先もあるので、診断には signal path だけを使う。
+    #[tokio::test]
+    async fn http_send_error_keeps_the_cause_without_the_url() {
+        // bind した listener をすぐ閉じ、接続を受け付けない port を作る。
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let route = ProxyRoute {
+            name: "openai".to_string(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}/ingest/path-secret/"),
+            headers: vec![],
+        };
+        let client = RouteClient::build(&route, 3_000).unwrap();
+
+        let error = client
+            .export(ExportRequest::Logs(Box::default()))
+            .await
+            .expect_err("接続を受け付けない port へは送信できない");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("signal path /v1/logs") && rendered.contains("error sending request"),
+            "signal path と送信失敗の原因を含む必要がある: {rendered}"
+        );
+        assert!(
+            !rendered.contains("http://127.0.0.1:") && !rendered.contains("path-secret"),
+            "URL や endpoint の path を載せてはいけない: {rendered}"
+        );
+        assert!(
+            retry_delay(&error).is_some(),
+            "上流の応答を受け取る前の失敗は再送できる"
+        );
+    }
+
     #[test]
     fn http_client_rejects_invalid_endpoint_at_startup() {
         for endpoint in INVALID_ENDPOINTS {
@@ -773,6 +904,47 @@ mod tests {
         assert!(
             !rendered.contains("s3cr3tPASSWORD") && !rendered.contains("tenant=example"),
             "endpoint 由来の資格情報や query をエラーへ載せてはいけない: {rendered}"
+        );
+    }
+
+    /// 回帰テスト: tonic は `grpc-timeout` header に書けない timeout を送信時に panic させ、
+    /// その route の worker が止まっていた。起動時に route 名付きのエラーで拒否する。
+    #[tokio::test]
+    async fn grpc_timeout_beyond_the_header_limit_is_rejected_at_startup() {
+        // bind した listener をすぐ閉じ、接続を受け付けない port を作る。
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let route = ProxyRoute {
+            name: "openai".to_string(),
+            service_names: vec![],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::Grpc,
+            endpoint: format!("http://{addr}"),
+            headers: vec![],
+        };
+        let max_ms = u64::try_from(GRPC_TIMEOUT_MAX.as_millis()).unwrap();
+        // 360,000,000,000,000 ms (1 億時間) は tonic が panic させる最小の値。
+        for timeout_ms in [max_ms + 1, 360_000_000_000_000, u64::MAX] {
+            let error = match RouteClient::build(&route, timeout_ms) {
+                Ok(_) => panic!("gRPC で表せない timeout {timeout_ms} ms を受理した"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("openai"),
+                "route 名を含むエラーを返す必要がある: {error}"
+            );
+        }
+
+        let client =
+            RouteClient::build(&route, max_ms).expect("上限ちょうどの timeout は受け付ける");
+        // 送信時に `grpc-timeout` header を組み立てても panic せず、接続の失敗として返る。
+        assert!(
+            client
+                .export(ExportRequest::Logs(Box::default()))
+                .await
+                .is_err()
         );
     }
 

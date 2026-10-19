@@ -74,6 +74,6 @@ route ごとの送信累計は `GET /stats` の `proxy` フィールドで観測
 
 ## 再送できる失敗
 
-HTTP は `429` / `502` / `503` / `504` だけを再送します。`3xx`、`400`、`401`、`413`、`500` などは再送しません。gRPC は `Cancelled` / `DeadlineExceeded` / `Aborted` / `OutOfRange` / `Unavailable` / `DataLoss`、および有効な `google.rpc.RetryInfo` 付きの `ResourceExhausted` を再送します。HTTP の `Retry-After` (秒数または HTTP-date) と gRPC RetryInfo が指定する待機時間が backoff より長い場合は、上流の指定を尊重します。詳細は [OTLP の失敗処理仕様](https://opentelemetry.io/docs/specs/otlp/#failures)を参照してください。
+HTTP は `429` / `502` / `503` / `504` だけを再送します。`3xx`、`400`、`401`、`413`、`500` などは再送しません。gRPC は `Cancelled` / `DeadlineExceeded` / `Aborted` / `OutOfRange` / `Unavailable` / `DataLoss`、および有効な `google.rpc.RetryInfo` 付きの `ResourceExhausted` を再送します。上流から応答が届く前の失敗 (接続の拒否や切断、timeout) は、HTTP と gRPC のどちらでも再送します。gRPC クライアントは、応答の前に切れた接続を `Unknown` / `Internal` として報告することがあり、この場合も再送します。上流が返した `Unknown` / `Internal` は再送しません。HTTP の `Retry-After` (秒数または HTTP-date) と gRPC RetryInfo が指定する待機時間が backoff より長い場合は、上流の指定を尊重します。詳細は [OTLP の失敗処理仕様](https://opentelemetry.io/docs/specs/otlp/#failures)を参照してください。
 
 shutdown で中断した batch は drain の結果で一度だけ件数へ反映します。期限を超えた分は `dropped`、恒久的な送信失敗は `failed` です。payload は JSONL に残りますが、Phase A では自動再生しません。
