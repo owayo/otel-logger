@@ -263,8 +263,7 @@ fn render_logs(
                 let body = log
                     .body
                     .as_ref()
-                    .map(any_value_to_string)
-                    .unwrap_or_default();
+                    .map_or_else(|| quote_for_pretty(""), pretty_any_value);
                 let _ = writeln!(
                     out,
                     "{tag} {ts} service={service} scope={scope} severity={severity} body={body}",
@@ -273,7 +272,6 @@ fn render_logs(
                     service = p.bold(&quote_for_pretty(&service)),
                     scope = quote_for_pretty(scope),
                     severity = severity_painted,
-                    body = quote_for_pretty(&body),
                 );
                 if !log.attributes.is_empty() {
                     let attrs = format_attrs(&log.attributes);
@@ -358,6 +356,31 @@ fn any_value_to_string(v: &AnyValue) -> String {
     }
 }
 
+/// pretty 出力向けに値を描く。文字列の葉だけを `quote_for_pretty` で 1 回 escape し、
+/// 配列と kvlist は区切りをそのまま描く。
+///
+/// 入れ子を文字列にしてから外側でもう一度 quote すると、内側の `"` と `\` が層ごとに
+/// escape し直されて倍になる。深さ 24 の kvlist だけで 32MiB を超え、数百 byte の request
+/// で数 GB を確保させられた (既定の bind は 0.0.0.0 で、render は ACK より前に走る)。
+fn pretty_any_value(v: &AnyValue) -> String {
+    match v.value.as_ref() {
+        Some(OtlpValue::StringValue(s)) => quote_for_pretty(s),
+        Some(OtlpValue::ArrayValue(arr)) => {
+            let parts: Vec<String> = arr.values.iter().map(pretty_any_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Some(OtlpValue::KvlistValue(kv)) => format_attrs(&kv.values),
+        // 数値・真偽値・16 進の bytes は escape の要る文字を含まない。
+        Some(
+            OtlpValue::BoolValue(_)
+            | OtlpValue::IntValue(_)
+            | OtlpValue::DoubleValue(_)
+            | OtlpValue::BytesValue(_),
+        ) => any_value_to_string(v),
+        Some(OtlpValue::StringValueStrindex(_)) | None => quote_for_pretty(""),
+    }
+}
+
 fn format_attrs(attrs: &[KeyValue]) -> String {
     let parts: Vec<String> = attrs
         .iter()
@@ -365,9 +388,8 @@ fn format_attrs(attrs: &[KeyValue]) -> String {
             let value = kv
                 .value
                 .as_ref()
-                .map(any_value_to_string)
-                .unwrap_or_default();
-            format!("{}={}", quote_for_pretty(&kv.key), quote_for_pretty(&value))
+                .map_or_else(|| quote_for_pretty(""), pretty_any_value);
+            format!("{}={}", quote_for_pretty(&kv.key), value)
         })
         .collect();
     format!("{{{}}}", parts.join(", "))
@@ -577,6 +599,75 @@ mod tests {
         assert!(rendered.contains("scope=\"scope\\u{001b}]0;bad\""));
         assert!(rendered.contains("severity=\"BAD\\u{001b}[0M\""));
         assert!(rendered.contains("\"bad\\u{001b}key\"=value"));
+    }
+
+    /// 回帰テスト: 入れ子の kvlist / 配列を描いても、出力は深さに比例して伸びるだけにする。
+    ///
+    /// 入れ子を文字列にしてから外側でもう一度 quote すると、内側の `"` と `\` が層ごとに
+    /// escape し直されて倍になり、深さ 20 で 18MB を超えた。protobuf は深さ 31 まで decode
+    /// できるので、数百 byte の request で数 GB を確保させられる。escape は葉で 1 回だけ行う。
+    #[test]
+    fn render_logs_keeps_nested_values_linear_and_escaped() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let mut nested = AnyValue {
+            value: Some(OtlpValue::StringValue("leaf \x1b[31m\"q\"".to_string())),
+        };
+        for depth in 0..20 {
+            nested = if depth % 2 == 0 {
+                AnyValue {
+                    value: Some(OtlpValue::KvlistValue(KeyValueList {
+                        values: vec![KeyValue {
+                            key: "k".to_string(),
+                            value: Some(nested),
+                            key_strindex: 0,
+                        }],
+                    })),
+                }
+            } else {
+                AnyValue {
+                    value: Some(OtlpValue::ArrayValue(ArrayValue {
+                        values: vec![nested],
+                    })),
+                }
+            };
+        }
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![LogRecord {
+                        body: Some(nested.clone()),
+                        attributes: vec![KeyValue {
+                            key: "a".to_string(),
+                            value: Some(nested),
+                            key_strindex: 0,
+                        }],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let rendered = render(&TelemetryRecord::Logs(Box::new(req)), false);
+
+        assert!(
+            rendered.len() < 2048,
+            "入れ子の深さに対して出力を指数的に伸ばさない: {} bytes",
+            rendered.len()
+        );
+        assert!(!rendered.contains('\x1b'), "葉の制御文字は escape する");
+        assert!(
+            rendered.contains("[{k=[{k=\"leaf \\u{001b}[31m\\\"q\\\"\"}]}]"),
+            "{rendered}"
+        );
+        // 最も外側は配列 (深さ 19)。入れ子の区切りは quote し直さない。
+        assert!(rendered.contains("body=[{k=[{k="), "{rendered}");
+        assert!(rendered.contains("attrs: {a=[{k=[{k="), "{rendered}");
     }
 
     #[test]
