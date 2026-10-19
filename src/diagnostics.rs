@@ -117,17 +117,19 @@ fn spawn<W: Write + Send + 'static>(
 }
 
 fn run<W: Write>(rx: Receiver<Message>, mut out: W, dropped: &AtomicU64) {
+    // 直前の行を途中まで書いたところで失敗したか。
+    let mut torn = false;
     while let Ok(message) = rx.recv() {
         match message {
             Message::Line(line) => {
                 // 捨てた件数を、次に書ける時に知らせる。知らせる行が書けなければ、
                 // その件数と今回の行を数え直して次の機会に回す。
                 let lost = dropped.swap(0, Ordering::Relaxed);
-                if lost > 0 && out.write_all(dropped_note(lost).as_bytes()).is_err() {
+                if lost > 0 && !write_line(&mut out, dropped_note(lost).as_bytes(), &mut torn) {
                     dropped.fetch_add(lost.saturating_add(1), Ordering::Relaxed);
                     continue;
                 }
-                if out.write_all(&line).is_err() {
+                if !write_line(&mut out, &line, &mut torn) {
                     dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -137,6 +139,41 @@ fn run<W: Write>(rx: Receiver<Message>, mut out: W, dropped: &AtomicU64) {
             }
         }
     }
+}
+
+/// 1 行を書き切ったか。前の行が途中で切れていれば、先に改行を補う。
+///
+/// ディスクが埋まると write(2) は書ける分だけ書いてから ENOSPC を返すので、改行の無い
+/// 断片が残る。改行を補わないと、空きが戻った後の最初の行 (捨てた件数の知らせ) が断片の
+/// 続きに連結され、行頭の時刻で探せなくなる。
+fn write_line<W: Write>(out: &mut W, line: &[u8], torn: &mut bool) -> bool {
+    if *torn {
+        if write_counting(out, b"\n").is_err() {
+            return false;
+        }
+        *torn = false;
+    }
+    match write_counting(out, line) {
+        Ok(()) => true,
+        Err(written) => {
+            *torn = written > 0;
+            false
+        }
+    }
+}
+
+/// `buf` を書き切る。失敗した時は、それまでに書けた byte 数を返す (`write_all` は返さない)。
+fn write_counting<W: Write>(out: &mut W, buf: &[u8]) -> Result<(), usize> {
+    let mut written = 0;
+    while written < buf.len() {
+        match out.write(&buf[written..]) {
+            Ok(0) => return Err(written),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(written),
+        }
+    }
+    Ok(())
 }
 
 /// 捨てた件数を知らせる 1 行。tracing の行と並べて読めるよう、時刻と水準を先頭に置く。
@@ -288,6 +325,64 @@ mod tests {
         assert_eq!(lines.len(), 2, "{written}");
         assert!(lines[0].contains(" WARN 2 diagnostic log line(s) were dropped"));
         assert_eq!(lines[1], "recovered");
+    }
+
+    /// 残りの容量だけ書いてから ENOSPC で失敗する出力先 (空きの尽きかけたディスクの代わり)。
+    /// `room` が `None` の間は全部書ける。
+    #[derive(Clone, Default)]
+    struct ShortWriteOutput {
+        room: Arc<Mutex<Option<usize>>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for ShortWriteOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut room = self.room.lock().unwrap();
+            let n = match *room {
+                None => buf.len(),
+                Some(0) => return Err(io::Error::other("no space left on device")),
+                Some(left) => {
+                    let n = left.min(buf.len());
+                    *room = Some(left - n);
+                    n
+                }
+            };
+            self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 回帰テスト: 行の途中まで書いて失敗した後は、次の行の前に改行を補う。
+    ///
+    /// 修正前は `write_all` が途中まで書いた断片をそのまま残し、空きが戻った後の最初の行
+    /// (捨てた件数の知らせ) が断片の後ろに連結されて、行頭の時刻で探せなかった。補う改行
+    /// 自体が書けない間は、その行も捨てて数える。
+    #[test]
+    fn torn_line_is_terminated_before_the_next_line() {
+        let output = ShortWriteOutput::default();
+        let (mut writer, guard) = spawn(output.clone(), 16, Duration::from_secs(5)).unwrap();
+        *output.room.lock().unwrap() = Some(4);
+        writer.write_all(b"partial-line\n").unwrap();
+        writer.write_all(b"while full\n").unwrap();
+        assert!(guard.flush_until(Instant::now() + Duration::from_secs(5)));
+        assert_eq!(*output.written.lock().unwrap(), b"part");
+
+        *output.room.lock().unwrap() = None;
+        writer.write_all(b"recovered\n").unwrap();
+        assert!(guard.flush_until(Instant::now() + Duration::from_secs(5)));
+        let written = String::from_utf8(output.written.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 3, "{written:?}");
+        assert_eq!(lines[0], "part", "断片はそこで行を終える");
+        assert!(
+            lines[1].contains(" WARN 2 diagnostic log line(s) were dropped"),
+            "知らせは新しい行から始まる: {written:?}"
+        );
+        assert_eq!(lines[2], "recovered");
     }
 
     /// gate が開くまで止まり、開いた後は `failing` の間だけ失敗する出力先。
