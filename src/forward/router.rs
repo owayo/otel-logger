@@ -477,6 +477,133 @@ mod tests {
         assert_eq!(router.snapshot()[0].1.queue_depth, 0);
     }
 
+    /// 目印の属性 `marker` を付けた ResourceLogs。
+    fn marked_resource_logs(service: &str, marker: &str) -> ResourceLogs {
+        let mut resource_logs = resource_logs_for(service);
+        resource_logs
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .push(kv_str("marker", marker));
+        resource_logs
+    }
+
+    fn markers(request: ExportRequest) -> Vec<String> {
+        let ExportRequest::Logs(request) = request else {
+            panic!("logs 以外の signal が配送された");
+        };
+        request
+            .resource_logs
+            .iter()
+            .map(|rl| {
+                let attrs = &rl.resource.as_ref().unwrap().attributes;
+                match attrs.iter().find(|kv| kv.key == "marker") {
+                    Some(KeyValue {
+                        value:
+                            Some(AnyValue {
+                                value: Some(OtlpValue::StringValue(marker)),
+                            }),
+                        ..
+                    }) => marker.clone(),
+                    _ => panic!("marker が無い"),
+                }
+            })
+            .collect()
+    }
+
+    /// 1 つの batch に複数 route の resource が混ざっていても、各 route にはその route の
+    /// resource だけを、受信した順のまま 1 batch で渡す。route の 2 番目以降の
+    /// service.name (`Codex Desktop` など) も、最初の名前と同じ route に載せる。
+    #[test]
+    fn each_lane_receives_only_its_resources_in_the_received_order() {
+        let (anthropic, mut anthropic_rx) = make_lane("anthropic", vec!["claude-code"]);
+        let (openai, mut openai_rx) = make_lane(
+            "openai",
+            vec!["codex_cli_rs", "codex_exec", "Codex Desktop"],
+        );
+        let router = ProxyRouter::new(vec![anthropic, openai]);
+
+        router.notify(&TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![
+                marked_resource_logs("claude-code", "c1"),
+                marked_resource_logs("Codex Desktop", "o1"),
+                marked_resource_logs("unknown-service", "u1"),
+                marked_resource_logs("claude-code", "c2"),
+                marked_resource_logs("codex_exec", "o2"),
+                marked_resource_logs("codex_cli_rs", "o3"),
+            ],
+        })));
+
+        assert_eq!(markers(anthropic_rx.try_recv().unwrap()), ["c1", "c2"]);
+        assert_eq!(markers(openai_rx.try_recv().unwrap()), ["o1", "o2", "o3"]);
+        assert!(
+            anthropic_rx.try_recv().is_err(),
+            "route ごとに 1 batch だけ"
+        );
+        assert!(openai_rx.try_recv().is_err(), "route ごとに 1 batch だけ");
+    }
+
+    /// service.name は完全一致で照合する (OTLP の service.name は大文字小文字を区別する)。
+    /// 文字列でない service.name は名前が無いのと同じ扱いで、どの route にも載せない。
+    /// どちらも転送の対象外なので drop にも数えない。
+    #[test]
+    fn service_names_match_exactly_and_only_as_strings() {
+        let (anthropic, mut rx) = make_lane("anthropic", vec!["claude-code"]);
+        let router = ProxyRouter::new(vec![anthropic.clone()]);
+        let mut non_string = resource_logs_for("claude-code");
+        non_string.resource.as_mut().unwrap().attributes = vec![KeyValue {
+            key: "service.name".to_string(),
+            value: Some(AnyValue {
+                value: Some(OtlpValue::IntValue(1)),
+            }),
+            key_strindex: 0,
+        }];
+        let mut without_value = resource_logs_for("claude-code");
+        without_value.resource.as_mut().unwrap().attributes[0].value = None;
+
+        router.notify(&TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![
+                resource_logs_for("Claude-Code"),
+                resource_logs_for("claude-code "),
+                resource_logs_for(" claude-code"),
+                resource_logs_for(""),
+                non_string,
+                without_value,
+            ],
+        })));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "一致しない resource だけなら送らない"
+        );
+        assert_eq!(anthropic.metrics.dropped_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// resource を 1 つも持たない batch と、route が受け付けない signal は、channel に
+    /// 何も積まない (空の export を上流へ送らない)。
+    #[test]
+    fn empty_batches_are_not_forwarded() {
+        let (anthropic, mut rx) = make_lane("anthropic", vec!["claude-code"]);
+        let router = ProxyRouter::new(vec![anthropic.clone()]);
+        router.notify(&TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![],
+        })));
+        router.notify(&TelemetryRecord::Traces(Box::new(
+            ExportTraceServiceRequest {
+                resource_spans: vec![],
+            },
+        )));
+        router.notify(&TelemetryRecord::Metrics(Box::new(
+            ExportMetricsServiceRequest {
+                resource_metrics: vec![],
+            },
+        )));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(router.snapshot()[0].1.queue_depth, 0);
+        assert_eq!(anthropic.metrics.dropped_total.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn drops_when_channel_is_closed() {
         let (lane, rx) = make_lane("anthropic", vec!["claude-code"]);

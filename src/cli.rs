@@ -1255,6 +1255,47 @@ mod tests {
         }
     }
 
+    /// 受信の同時数は `Semaphore` が作れる上限ちょうどまで受け付け、上限 + 1 は起動時の
+    /// エラーにする (`Semaphore::new` の panic で異常終了させない)。期限は u64 のミリ秒の
+    /// 最大値でも受け付け、受信の枠の期限の計算を溢れさせない。
+    #[test]
+    fn merge_receive_limits_accept_the_largest_values_and_reject_beyond() {
+        use crate::admission::{MAX_INFLIGHT_REQUESTS, ReceiveLimits};
+
+        let mut largest = empty_cli();
+        largest.max_inflight_requests = Some(MAX_INFLIGHT_REQUESTS);
+        largest.receive_timeout_ms = Some(u64::MAX);
+        let settings = Settings::merge_with_home(largest, Config::default(), None).unwrap();
+        assert_eq!(settings.max_inflight_requests, MAX_INFLIGHT_REQUESTS);
+        assert_eq!(settings.receive_timeout, Duration::from_millis(u64::MAX));
+        let limits = ReceiveLimits::new(settings.max_inflight_requests, settings.receive_timeout);
+        let _ = limits.deadline();
+
+        // 設定ファイル側の値も同じ範囲で検査する。
+        for (cli, config) in [
+            (
+                Cli {
+                    max_inflight_requests: Some(MAX_INFLIGHT_REQUESTS + 1),
+                    ..empty_cli()
+                },
+                Config::default(),
+            ),
+            (
+                empty_cli(),
+                Config {
+                    max_inflight_requests: Some(MAX_INFLIGHT_REQUESTS + 1),
+                    ..Config::default()
+                },
+            ),
+        ] {
+            let error = Settings::merge_with_home(cli, config, None).unwrap_err();
+            assert!(
+                error.to_string().contains("max-inflight-requests"),
+                "{error}"
+            );
+        }
+    }
+
     /// 回帰テスト: proxy header のパースエラーに値を載せない。
     ///
     /// `Authorization=Bearer ...` を直接指定した場合や、`value_delimiter = ','` で
@@ -1873,6 +1914,92 @@ mod tests {
                 .checkpoint_dir,
             PathBuf::from("/cli-checkpoints")
         );
+    }
+
+    /// checkpoint の予約先は、指定が無ければ JSONL の出力先の隣 (`log-file` の親か `log-dir`)
+    /// に置き、親を持たない相対パスでも空のパスにしない。設定ファイル・CLI の指定は `~` を
+    /// 展開する。queue 容量と timeout の 0 は「指定なし」として既定値に置き換えるが、
+    /// `retry-max = 0` は「再試行しない」という正当な指定なのでそのまま使う。
+    #[test]
+    fn merge_proxy_defaults_follow_the_jsonl_outbox() {
+        let with_anthropic = |mut cli: Cli| {
+            cli.proxy_anthropic_endpoint = Some("https://collector.example:4317".to_string());
+            cli
+        };
+        let proxy_of = |cli: Cli, config: Config, home: Option<&Path>| {
+            Settings::merge_with_home(cli, config, home)
+                .unwrap()
+                .proxy
+                .expect("proxy should be configured")
+        };
+
+        let config: Config =
+            toml::from_str("[proxy]\nqueue-capacity = 0\ntimeout-ms = 0\nretry-max = 0\n").unwrap();
+        let proxy = proxy_of(with_anthropic(cli_with_log_file()), config, None);
+        assert_eq!(
+            proxy.checkpoint_dir,
+            PathBuf::from("/tmp/.otel-logger-proxy")
+        );
+        assert_eq!(proxy.queue_capacity, DEFAULT_PROXY_QUEUE_CAPACITY);
+        assert_eq!(proxy.timeout_ms, DEFAULT_PROXY_TIMEOUT_MS);
+        assert_eq!(proxy.retry_max, 0, "再試行しない指定は既定値に戻さない");
+
+        let mut in_dir = empty_cli();
+        in_dir.log_dir = Some(PathBuf::from("/var/log/otel"));
+        let proxy = proxy_of(with_anthropic(in_dir), Config::default(), None);
+        assert_eq!(
+            proxy.checkpoint_dir,
+            PathBuf::from("/var/log/otel/.otel-logger-proxy")
+        );
+        assert_eq!(proxy.retry_max, DEFAULT_PROXY_RETRY_MAX);
+
+        let mut bare = empty_cli();
+        bare.log_file = Some(PathBuf::from("otel.jsonl"));
+        let proxy = proxy_of(with_anthropic(bare), Config::default(), None);
+        assert_eq!(proxy.checkpoint_dir, PathBuf::from(".otel-logger-proxy"));
+
+        let home = PathBuf::from("/home/alice");
+        let config: Config = toml::from_str("[proxy]\ncheckpoint-dir = \"~/ckpt\"\n").unwrap();
+        let proxy = proxy_of(
+            with_anthropic(cli_with_log_file()),
+            config.clone(),
+            Some(&home),
+        );
+        assert_eq!(proxy.checkpoint_dir, PathBuf::from("/home/alice/ckpt"));
+        let mut from_cli = with_anthropic(cli_with_log_file());
+        from_cli.proxy_checkpoint_dir = Some(PathBuf::from("~/cli-ckpt"));
+        let proxy = proxy_of(from_cli, config, Some(&home));
+        assert_eq!(proxy.checkpoint_dir, PathBuf::from("/home/alice/cli-ckpt"));
+    }
+
+    /// header 値の制御文字は tab だけを許し、NUL・DEL・C1 (U+0085 など) は位置だけを示して
+    /// 拒否する。値はエラーに載せない (認証ヘッダの値が stderr に残る)。
+    #[test]
+    fn merge_proxy_header_values_allow_only_tab_among_control_characters() {
+        let merge = |value: &str| {
+            let mut cli = cli_with_log_file();
+            cli.proxy_anthropic_endpoint = Some("https://collector.example:4317".to_string());
+            cli.proxy_anthropic_headers = vec![format!("X-Token={value}")];
+            Settings::merge_with_home(cli, Config::default(), None)
+        };
+        let accepted = merge("secret\twith-tab").unwrap();
+        assert_eq!(
+            accepted.proxy.unwrap().routes[0].headers,
+            vec![("x-token".to_string(), "secret\twith-tab".to_string())]
+        );
+        for (value, position) in [
+            ("secret\0", 6),
+            ("secret\u{7f}", 6),
+            ("se\u{85}cret", 2),
+            ("\u{1b}[31msecret", 0),
+        ] {
+            let error = format!("{:#}", merge(value).unwrap_err());
+            assert!(
+                error.contains(&format!("control character at position {position}")),
+                "{value:?}: {error}"
+            );
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 
     /// RFC 7230 の token を外れた header key は送信前に拒否する。

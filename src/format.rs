@@ -810,4 +810,299 @@ mod tests {
         // 通常の文字は quote されないままにする (既存の見た目を壊さない)。
         assert_eq!(quote_for_pretty("plain-value"), "plain-value");
     }
+
+    /// escape する範囲 (C0 / DEL / C1 / 双方向制御文字) の端と、そのすぐ外側の文字。
+    /// 範囲を 1 つずらすと、端の制御文字が端末へ素通りするか、普通の文字まで escape される。
+    #[test]
+    fn quote_for_pretty_escape_ranges_have_exact_bounds() {
+        for code in [
+            0x00_u32, 0x1f, 0x7f, 0x80, 0x85, 0x9f, 0x061c, 0x200e, 0x200f, 0x202a, 0x202e, 0x2066,
+            0x2069,
+        ] {
+            let c = char::from_u32(code).unwrap();
+            assert_eq!(
+                quote_for_pretty(&format!("a{c}b")),
+                format!("\"a\\u{{{code:04x}}}b\""),
+                "U+{code:04X} は escape する"
+            );
+        }
+        for code in [
+            0x7e_u32, 0xa0, 0x061b, 0x061d, 0x200d, 0x2010, 0x2029, 0x202f, 0x2065, 0x206a,
+        ] {
+            let raw = format!("a{}b", char::from_u32(code).unwrap());
+            assert_eq!(quote_for_pretty(&raw), raw, "U+{code:04X} はそのまま出す");
+        }
+        // 空文字は quote して、値が無いことを見えるようにする。
+        assert_eq!(quote_for_pretty(""), "\"\"");
+    }
+
+    /// 受信した時刻 (外部入力) が 0・最小・最大でも panic せずに描く。0 は未設定の印。
+    #[test]
+    fn format_unix_nanos_handles_zero_and_extreme_timestamps() {
+        assert_eq!(format_unix_nanos(0), "-");
+        assert_eq!(format_unix_nanos(1), "1970-01-01T00:00:00.000000001Z");
+        assert_eq!(format_unix_nanos(1_500_000_000), "1970-01-01T00:00:01.5Z");
+        assert_eq!(
+            format_unix_nanos(u64::MAX),
+            "2554-07-21T23:34:33.709551615Z"
+        );
+    }
+
+    /// 単位はちょうど 1000 倍の境界で切り替える。最大値でも溢れずに描く。
+    #[test]
+    fn format_duration_ns_switches_units_at_exact_boundaries() {
+        for (ns, expected) in [
+            (0, "0ns"),
+            (1, "1ns"),
+            (999, "999ns"),
+            (1_000, "1.00µs"),
+            (1_500, "1.50µs"),
+            (1_000_000, "1.00ms"),
+            (1_000_000_000, "1.000s"),
+            (u64::MAX, "18446744073.710s"),
+        ] {
+            assert_eq!(format_duration_ns(ns), expected, "{ns}ns");
+        }
+    }
+
+    /// 終了が開始より前の span (時計のずれや壊れた telemetry) でも、所要時間を 0 に倒して描く。
+    /// ID が空・status が未知の値でも、決まった印で描く。
+    #[test]
+    fn render_traces_clamps_spans_that_end_before_they_start() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+
+        let span = |start, end, code| Span {
+            name: "s".to_string(),
+            start_time_unix_nano: start,
+            end_time_unix_nano: end,
+            status: Some(Status {
+                message: String::new(),
+                code,
+            }),
+            ..Default::default()
+        };
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span(2_000_000_000, 1_000_000_000, 1), span(u64::MAX, 0, 99)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let rendered = render(&TelemetryRecord::Traces(Box::new(req)), false);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        for line in &lines {
+            assert!(line.contains(" dur=0ns "), "{line}");
+            assert!(line.contains(" trace=- span_id=-"), "{line}");
+            assert!(line.contains("service=unknown"), "{line}");
+        }
+        assert!(lines[0].contains(" status=OK "), "{}", lines[0]);
+        assert!(lines[1].contains(" status=UNSET "), "{}", lines[1]);
+    }
+
+    /// severity_text があればそれを (大文字で) 使い、無ければ SeverityNumber の範囲から決める。
+    /// 範囲外の値 (外部入力) は UNSPECIFIED にする。
+    #[test]
+    fn severity_label_prefers_text_and_maps_numbers_by_range() {
+        for (number, label) in [
+            (0, "UNSPECIFIED"),
+            (1, "TRACE"),
+            (4, "TRACE"),
+            (5, "DEBUG"),
+            (8, "DEBUG"),
+            (9, "INFO"),
+            (12, "INFO"),
+            (13, "WARN"),
+            (16, "WARN"),
+            (17, "ERROR"),
+            (20, "ERROR"),
+            (21, "FATAL"),
+            (24, "FATAL"),
+            (25, "UNSPECIFIED"),
+            (-1, "UNSPECIFIED"),
+            (i32::MAX, "UNSPECIFIED"),
+            (i32::MIN, "UNSPECIFIED"),
+        ] {
+            assert_eq!(severity_label(number, ""), label, "{number}");
+        }
+        assert_eq!(
+            severity_label(17, "warn"),
+            "WARN",
+            "severity_text を優先する"
+        );
+        assert_eq!(severity_label(0, "Info"), "INFO");
+    }
+
+    /// 色付きの出力でも、色を付けるのは escape した後の文字列だけにする。自前の SGR を
+    /// 取り除いた後に ESC が残るなら、payload の制御文字が端末へ素通りしている。
+    #[test]
+    fn colored_render_paints_only_escaped_payload_text() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{
+            ResourceSpans, ScopeSpans, Span, Status, span,
+        };
+
+        let resource = || {
+            Some(Resource {
+                attributes: vec![kv_str("service.name", "svc\x1b[31m")],
+                ..Default::default()
+            })
+        };
+        let scope = || {
+            Some(InstrumentationScope {
+                name: "scope\x1b]0;x".to_string(),
+                ..Default::default()
+            })
+        };
+        let logs = TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(),
+                scope_logs: vec![ScopeLogs {
+                    scope: scope(),
+                    log_records: vec![LogRecord {
+                        severity_number: 17,
+                        body: Some(AnyValue {
+                            value: Some(OtlpValue::StringValue("body\x1b[2J".to_string())),
+                        }),
+                        attributes: vec![kv_str("key\x1b", "value\x1b")],
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }));
+        let traces = TelemetryRecord::Traces(Box::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: resource(),
+                scope_spans: vec![ScopeSpans {
+                    scope: scope(),
+                    spans: vec![Span {
+                        name: "span\x1b[2J".to_string(),
+                        attributes: vec![kv_str("key\x1b", "value\x1b")],
+                        events: vec![span::Event {
+                            name: "event\x1b[2J".to_string(),
+                            attributes: vec![kv_str("key\x1b", "value\x1b")],
+                            ..Default::default()
+                        }],
+                        status: Some(Status {
+                            message: String::new(),
+                            code: 2,
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+        let metrics = TelemetryRecord::Metrics(Box::new(ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: resource(),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: scope(),
+                    metrics: vec![Metric {
+                        name: "metric\x1b[2J".to_string(),
+                        description: "description\x1b".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }));
+
+        for record in [&logs, &traces, &metrics] {
+            let rendered = render(record, true);
+            let mut stripped = rendered.clone();
+            for code in [RESET, DIM, BOLD, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN] {
+                stripped = stripped.replace(code, "");
+            }
+            assert!(
+                !stripped.contains('\x1b'),
+                "{} の payload の ESC が素通りしている: {rendered:?}",
+                record.kind()
+            );
+            assert!(
+                rendered.contains(&format!("{BOLD}\"svc\\u{{001b}}[31m\"{RESET}")),
+                "強調するのは escape 後の service 名: {rendered:?}"
+            );
+        }
+        let rendered = render(&logs, true);
+        assert!(
+            rendered.contains(&format!("severity={RED}ERROR{RESET}")),
+            "{rendered:?}"
+        );
+    }
+
+    /// 累計の所要時間は ms → ns の換算で溢れさせず、最大値に張り付けて描く。
+    /// 集計対象が 1 つも無ければ何も出さない。
+    #[test]
+    fn render_summary_saturates_huge_durations() {
+        use crate::aggregator::{AgentStats, BucketStats, ModelStats, UsageSnapshot};
+        use std::collections::BTreeMap;
+
+        let empty = UsageSnapshot {
+            started_at: "2026-08-20T00:00:00Z".to_string(),
+            last_updated: None,
+            agents: BTreeMap::new(),
+        };
+        assert_eq!(render_summary(&empty, false), "");
+
+        let huge = ModelStats {
+            request_count: u64::MAX,
+            duration_ms: u64::MAX,
+            cost_usd: 0.000_001,
+            ..Default::default()
+        };
+        let snapshot = UsageSnapshot {
+            agents: BTreeMap::from([(
+                "claude-code".to_string(),
+                AgentStats {
+                    total: ModelStats {
+                        // 1 ms 増えるだけで ns 換算が u64 を超える値。
+                        duration_ms: u64::MAX / 1_000_000 + 1,
+                        ..Default::default()
+                    },
+                    buckets: BTreeMap::from([(
+                        "bucket".to_string(),
+                        BucketStats {
+                            provider: "anthropic".to_string(),
+                            model: "claude-opus-5".to_string(),
+                            effort: "max".to_string(),
+                            stats: huge,
+                        },
+                    )]),
+                },
+            )]),
+            ..empty
+        };
+        let rendered = render_summary(&snapshot, false);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(
+            lines[0].contains(" cost=$0 duration=18446744073.710s "),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(&format!("requests={} ", u64::MAX)),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].ends_with(" cost=$0.000001 duration=18446744073.710s"),
+            "{}",
+            lines[1]
+        );
+    }
 }

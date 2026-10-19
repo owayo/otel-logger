@@ -1474,6 +1474,164 @@ mod tests {
         );
     }
 
+    /// 日次ファイルと同じ名前のディレクトリは消さず、cleanup も失敗させない。
+    ///
+    /// `remove_file` をディレクトリへ呼ぶと失敗し、その失敗は起動時のエラーになる
+    /// (receiver が上がらず全件欠測する)。
+    #[test]
+    fn cleanup_skips_directories_named_like_rotated_logs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let three_days_ago = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        for name in [
+            "otel-logger.2020-01-01",
+            "otel-logger.pretty.2020-01-01.log",
+        ] {
+            let nested = dir.path().join(name);
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(nested.join("inner"), b"keep").unwrap();
+        }
+        let old = dir.path().join("otel-logger.2020-01-02");
+        std::fs::write(&old, b"{}\n").unwrap();
+        touch_mtime(&old, three_days_ago);
+
+        cleanup_old_rotated_logs(dir.path(), 1).unwrap();
+
+        assert!(
+            dir.path()
+                .join("otel-logger.2020-01-01")
+                .join("inner")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("otel-logger.pretty.2020-01-01.log")
+                .join("inner")
+                .exists()
+        );
+        assert!(!old.exists(), "通常の古い日次ファイルは同じ走査で消す");
+    }
+
+    /// 非 UTF-8 の名前のファイルは日次ファイルではないので、消さずに走査を続ける。
+    ///
+    /// APFS のように非 UTF-8 の名前を作れないファイルシステムでは、その部分だけ確かめない
+    /// (Linux の CI で確かめる)。
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_non_utf8_file_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let three_days_ago = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        let old = dir.path().join("otel-logger.2020-01-01");
+        std::fs::write(&old, b"{}\n").unwrap();
+        touch_mtime(&old, three_days_ago);
+        let non_utf8 = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"otel-logger.2020-01-01\xff"));
+        let created = std::fs::write(&non_utf8, b"{}\n").is_ok();
+        if created {
+            touch_mtime(&non_utf8, three_days_ago);
+        }
+
+        cleanup_old_rotated_logs(dir.path(), 1).unwrap();
+
+        assert!(!old.exists());
+        if created {
+            assert!(non_utf8.exists(), "非 UTF-8 の名前は日次ファイルではない");
+        }
+    }
+
+    /// 保持日数の最大値 (u32::MAX 日) でも期限の計算を溢れさせず、何も消さない。
+    /// まだ作られていないディレクトリの cleanup は何もせず成功する。
+    #[test]
+    fn cleanup_handles_the_longest_retention_and_a_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ancient = dir.path().join("otel-logger.1970-01-02");
+        std::fs::write(&ancient, b"{}\n").unwrap();
+        touch_mtime(
+            &ancient,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(24 * 60 * 60),
+        );
+
+        cleanup_old_rotated_logs(dir.path(), u32::MAX).unwrap();
+        assert!(ancient.exists(), "保持日数の内側なので消さない");
+
+        cleanup_old_rotated_logs(&dir.path().join("missing"), 1).unwrap();
+        assert!(!dir.path().join("missing").exists(), "cleanup は作らない");
+    }
+
+    /// 日次 writer が作る名前は、どの日付でも cleanup が日次ファイルとして読める。
+    ///
+    /// 書く側の書式と cleanup の判定がずれると、保持期間が効かずにディスクを使い切るか、
+    /// 逆に別の種類として扱われる。月末・うるう日・年の境目を含む 1 年分と、桁の境目の年で確かめる。
+    #[test]
+    fn daily_writer_names_are_recognized_by_cleanup() {
+        let dir = Path::new("logs");
+        let mut dates: Vec<chrono::NaiveDate> = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .iter_days()
+            .take(366)
+            .collect();
+        for (y, m, d) in [(999, 12, 31), (1000, 1, 1), (2000, 2, 29), (9999, 12, 31)] {
+            dates.push(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap());
+        }
+        for date in dates {
+            let name_of = |path: PathBuf| path.file_name().unwrap().to_str().unwrap().to_string();
+            let jsonl = name_of(daily_path(dir, ROTATION_PREFIX, None, date));
+            let pretty = name_of(daily_path(
+                dir,
+                PRETTY_LOG_PREFIX,
+                Some(PRETTY_LOG_SUFFIX),
+                date,
+            ));
+            assert_eq!(daily_log_kind(&jsonl), Some(DailyLogKind::Jsonl), "{jsonl}");
+            assert_eq!(
+                daily_log_kind(&pretty),
+                Some(DailyLogKind::Pretty),
+                "{pretty}"
+            );
+        }
+    }
+
+    /// 回帰テスト: `log-dir` に新しく作るディレクトリと日次ファイル (JSONL・pretty-log) は
+    /// 所有者だけが読める権限にし、既存ディレクトリの mode は変えない。
+    ///
+    /// JSONL には受信した telemetry (`user.email` やプロンプト本文を含みうる) がそのまま入る。
+    /// umask は権限を減らす方向にしか効かないので、group / other の bit で判定する。
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_outputs_are_owner_only_and_keep_existing_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::TempDir::new().unwrap();
+        let fresh = root.path().join("fresh").join("logs");
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        for dir in [&fresh, &shared] {
+            let rotated = open_rotated_sync(dir, 1).unwrap();
+            rotated.roller.lock().unwrap().write_all(b"{}\n").unwrap();
+            let mut pretty = open_pretty_log_sync(dir).unwrap();
+            pretty.write_all(b"pretty\n").unwrap();
+            // 日付は書き込み時に決まるので、名前ではなく種類で数える (日付の変わり目でも揺れない)。
+            assert!(!files_of_kind(dir, DailyLogKind::Jsonl).is_empty());
+            assert!(!files_of_kind(dir, DailyLogKind::Pretty).is_empty());
+            for file in std::fs::read_dir(dir).unwrap() {
+                let file = file.unwrap().path();
+                assert_eq!(mode_of(&file) & 0o077, 0, "{}", file.display());
+            }
+        }
+        assert_eq!(mode_of(&fresh) & 0o077, 0);
+        assert_eq!(mode_of(fresh.parent().unwrap()) & 0o077, 0);
+        assert_eq!(
+            mode_of(&shared),
+            0o750,
+            "既存ディレクトリの mode は変えない"
+        );
+    }
+
     #[test]
     fn write_pretty_to_appends_summary_after_the_record() {
         let mut buf: Vec<u8> = Vec::new();

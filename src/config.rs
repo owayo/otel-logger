@@ -748,4 +748,133 @@ mystery-key = 1
             assert!(format!("{error:#}").contains("line "));
         }
     }
+
+    /// 値を伏せたエラーに残す位置は、toml 自身が指す位置 (値・キーの先頭) と一致させる。
+    ///
+    /// 元のエラーは値を含むので捨て、位置だけを自前で計算し直している。位置がずれると、
+    /// 伏せた後のエラーからは誤りの場所を探せない。行末が CRLF でも、ファイル末尾で
+    /// 途切れた値でも同じ。
+    #[test]
+    fn config_error_position_matches_what_toml_points_at() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        for (body, line, column) in [
+            // 型の誤り (値の先頭)。
+            ("summary = true\nmax-inflight-requests = \"8\"\n", 2, 25),
+            // 未知のキー (キーの先頭)。
+            ("summary = true\nunknown-key = 1\n", 2, 1),
+            // table の中の値。
+            ("[[proxy.routes]]\nname = \"a\"\nendpoint = 1\n", 3, 12),
+            // ファイル末尾で途切れた文字列 (末尾の次の位置)。
+            ("summary = \"abc", 1, 15),
+            // CRLF の行末。
+            ("summary = true\r\nmax-inflight-requests = \"8\"\r\n", 2, 25),
+        ] {
+            let position = format!("at line {line}, column {column}");
+            let from_toml = toml::from_str::<Config>(body).unwrap_err().to_string();
+            assert!(
+                from_toml.contains(&format!("error {position}")),
+                "前提: toml 自身も同じ位置を指す: {from_toml}"
+            );
+            std::fs::write(&path, body).unwrap();
+            let error = format!("{:#}", Config::load(Some(&path)).unwrap_err());
+            assert!(error.contains(&position), "{body:?}: {error}");
+        }
+    }
+
+    /// 明示したパスがディレクトリなら、空の設定として起動せず読み取りエラーにする。
+    /// 空の設定で起動すると `log-file` / `log-dir` を失い、JSONL に保存しないまま 200 を返す。
+    #[test]
+    fn load_reports_a_read_error_when_the_config_path_is_a_directory() {
+        let dir = TempDir::new().unwrap();
+        let error = Config::load(Some(dir.path())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read config file"),
+            "{error:#}"
+        );
+    }
+
+    /// テンプレートがコメントで案内する受信の上限と期限は、外せばそのまま読めて、
+    /// コードの既定値と同じ値になる。案内と既定値がずれると、コメントを外しただけで
+    /// 挙動が変わる。
+    #[test]
+    fn templates_document_the_receive_limit_defaults_as_they_parse() {
+        for profile in [InitProfile::Default, InitProfile::Daemon] {
+            let template = render_config_template(profile);
+            let as_written: Config = toml::from_str(&template).unwrap();
+            assert_eq!(as_written.max_inflight_requests, None, "{profile:?}");
+            assert_eq!(as_written.receive_timeout_ms, None, "{profile:?}");
+
+            let enabled = template
+                .replace("\n# max-inflight-requests = ", "\nmax-inflight-requests = ")
+                .replace("\n# receive-timeout-ms = ", "\nreceive-timeout-ms = ");
+            let enabled: Config = toml::from_str(&enabled).unwrap();
+            assert_eq!(
+                enabled.max_inflight_requests,
+                Some(crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS),
+                "{profile:?}"
+            );
+            assert_eq!(
+                enabled
+                    .receive_timeout_ms
+                    .map(std::time::Duration::from_millis),
+                Some(crate::admission::DEFAULT_RECEIVE_TIMEOUT),
+                "{profile:?}"
+            );
+        }
+    }
+
+    /// 負の値や型の合わない値は、受信の上限・期限として受け付けない (0 の拒否は merge 側)。
+    #[test]
+    fn load_rejects_negative_receive_limits() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        for body in [
+            "max-inflight-requests = -1\n",
+            "receive-timeout-ms = -1\n",
+            "receive-timeout-ms = 1.5\n",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(Config::load(Some(&path)).is_err(), "{body:?}");
+        }
+        // TOML の整数の上限 (i64::MAX) までは読める。
+        std::fs::write(&path, format!("receive-timeout-ms = {}\n", i64::MAX)).unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.receive_timeout_ms, Some(i64::MAX as u64));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// 回帰テスト: 新しく書く設定ファイルとその親ディレクトリは所有者だけが読める権限にし、
+    /// `--force` で上書きする既存ファイルの mode は変えない。
+    ///
+    /// 設定ファイルには proxy の認証ヘッダを書ける。既定の umask 022 では 0644 になり、
+    /// 同じホストの他ユーザーから読める。
+    #[cfg(unix)]
+    #[test]
+    fn written_config_is_owner_only_and_overwrite_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("otel-logger").join("config.toml");
+        write_with_profile(&path, false, InitProfile::Daemon).unwrap();
+        assert_eq!(mode_of(&path) & 0o077, 0);
+        assert_eq!(mode_of(path.parent().unwrap()) & 0o077, 0);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            write_with_profile(&path, true, InitProfile::Default).unwrap(),
+            InitOutcome::Overwrote
+        );
+        assert_eq!(mode_of(&path), 0o640, "上書きでは mode を変えない");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            render_config_template(InitProfile::Default),
+            "上書きは前の内容を残さない (truncate する)"
+        );
+    }
 }

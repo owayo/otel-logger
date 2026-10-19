@@ -401,4 +401,37 @@ mod tests {
 
         assert!(accepted.nodelay().unwrap());
     }
+
+    /// shutdown 中に合流する結果は、最初のエラーを残す。後から来たエラー (flush の失敗など)
+    /// で上書きすると、bind 失敗や panic のような診断の第一報が消える。
+    #[test]
+    fn merge_task_result_keeps_the_first_error() {
+        let mut result: Result<()> = Ok(());
+        merge_task_result(&mut result, Ok(()));
+        assert!(result.is_ok());
+        merge_task_result(&mut result, Err(anyhow::anyhow!("first")));
+        merge_task_result(&mut result, Err(anyhow::anyhow!("second")));
+        merge_task_result(&mut result, Ok(()));
+        assert_eq!(result.unwrap_err().to_string(), "first");
+    }
+
+    async fn panicking_listener() -> Result<()> {
+        panic!("listener task panicked on purpose");
+    }
+
+    /// listener task の panic を正常終了と取り違えず、エラーとして返す。task のエラーは
+    /// 包み直さずにそのまま返す (bind 失敗のアドレスなど、chain の中身を残す)。
+    #[tokio::test]
+    async fn join_result_reports_panics_and_keeps_task_errors() {
+        let panicked = tokio::spawn(panicking_listener());
+        let error = wait_for(panicked.id(), panicked).await.unwrap_err();
+        assert!(error.to_string().contains("task panicked"), "{error:#}");
+
+        let failed = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("bind 127.0.0.1:4318")) });
+        let error = wait_for(failed.id(), failed).await.unwrap_err();
+        assert_eq!(error.to_string(), "bind 127.0.0.1:4318");
+
+        let completed = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        wait_for(completed.id(), completed).await.unwrap();
+    }
 }

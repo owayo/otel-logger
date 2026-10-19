@@ -479,6 +479,135 @@ mod tests {
         );
     }
 
+    /// 末尾から 8192 byte ずつ最後の改行を探す境界で、完了した行を 1 byte も削らない。
+    ///
+    /// 改行がちょうど読み取り単位の端 (前の単位の最後の byte / 後の単位の最初の byte) に
+    /// あっても位置を取り違えない。改行の無いファイルは全体が未完了の batch なので空にする。
+    #[test]
+    fn reopening_keeps_complete_lines_at_chunk_boundaries() {
+        const CHUNK: usize = 8192;
+        let line_of = |len: usize| {
+            let mut line = vec![b'x'; len - 1];
+            line.push(b'\n');
+            line
+        };
+        let cases: Vec<(&str, Vec<u8>, usize)> = vec![
+            ("空のファイル", Vec::new(), 0),
+            ("改行だけ", b"\n".to_vec(), 1),
+            ("ちょうど 1 単位で完了した行", line_of(CHUNK), CHUNK),
+            (
+                "1 単位 + 1 byte で完了した行",
+                line_of(CHUNK + 1),
+                CHUNK + 1,
+            ),
+            (
+                "改行が前の単位の最後の byte",
+                [line_of(CHUNK), vec![b'y'; CHUNK]].concat(),
+                CHUNK,
+            ),
+            (
+                "改行が後の単位の最初の byte",
+                [line_of(CHUNK + 1), vec![b'y'; CHUNK - 1]].concat(),
+                CHUNK + 1,
+            ),
+            ("改行が無い (3 単位を超える)", vec![b'z'; 3 * CHUNK + 5], 0),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content, valid_len) in cases {
+            let path = dir.path().join("test.jsonl");
+            std::fs::write(&path, &content).unwrap();
+            AppendFile::open(&path).unwrap().append(b"{}\n").unwrap();
+            let mut expected = content[..valid_len].to_vec();
+            expected.extend_from_slice(b"{}\n");
+            assert!(
+                std::fs::read(&path).unwrap() == expected,
+                "{name}: 完了した {valid_len} byte だけを残す"
+            );
+        }
+    }
+
+    /// 日付は 0 埋めの `YYYY-MM-DD` で、suffix はその後ろに付く (cleanup が読む名前の形)。
+    #[test]
+    fn daily_path_zero_pads_the_date_and_appends_the_suffix() {
+        let dir = Path::new("logs");
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        assert_eq!(
+            daily_path(dir, "otel-logger", None, date),
+            dir.join("otel-logger.2026-01-05")
+        );
+        assert_eq!(
+            daily_path(dir, "otel-logger.pretty", Some("log"), date),
+            dir.join("otel-logger.pretty.2026-01-05.log")
+        );
+    }
+
+    /// 時計が日付をまたいで戻った (NTP の補正など) 後の書き込みは、その時点の暦日のファイルへ
+    /// 追記し、どちらの日のファイルの完了した行も消さない。
+    #[test]
+    fn daily_writer_appends_to_an_earlier_date_after_the_clock_goes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let later = earlier.succ_opt().unwrap();
+        let earlier_path = daily_path(dir.path(), "otel-logger", None, earlier);
+        let later_path = daily_path(dir.path(), "otel-logger", None, later);
+        let mut writer = DailyWriter::at_date(dir.path(), "otel-logger", None, earlier).unwrap();
+        writer.append_at(b"{\"day\":1}\n", earlier).unwrap();
+        writer.append_at(b"{\"day\":2}\n", later).unwrap();
+
+        writer.append_at(b"{\"back\":1}\n", earlier).unwrap();
+        writer.append_at(b"{\"again\":2}\n", later).unwrap();
+
+        assert_eq!(
+            std::fs::read(earlier_path).unwrap(),
+            b"{\"day\":1}\n{\"back\":1}\n"
+        );
+        assert_eq!(
+            std::fs::read(later_path).unwrap(),
+            b"{\"day\":2}\n{\"again\":2}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// 回帰テスト: 新しく作る JSONL (単体・日次、検証用の probe を含む) は所有者だけが
+    /// 読める権限にし、既存ファイルの mode は変えない。
+    ///
+    /// JSONL には受信した telemetry (`user.email` やプロンプト本文を含みうる) がそのまま入る。
+    /// umask は権限を減らす方向にしか効かないので、group / other の bit で判定する。
+    #[cfg(unix)]
+    #[test]
+    fn new_jsonl_files_are_owner_only_and_existing_modes_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("single.jsonl");
+        AppendFile::open(&single).unwrap().append(b"{}\n").unwrap();
+        let probed = dir.path().join("probed.jsonl");
+        AppendFile::probe(&probed).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let mut daily = DailyWriter::at_date(dir.path(), "otel-logger", None, date).unwrap();
+        daily.append_at(b"{}\n", date.succ_opt().unwrap()).unwrap();
+        for path in [
+            single,
+            probed,
+            daily_path(dir.path(), "otel-logger", None, date),
+            daily_path(dir.path(), "otel-logger", None, date.succ_opt().unwrap()),
+        ] {
+            assert_eq!(mode_of(&path) & 0o077, 0, "{}", path.display());
+        }
+
+        let shared = dir.path().join("shared.jsonl");
+        std::fs::write(&shared, b"{}\n").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o640)).unwrap();
+        AppendFile::open(&shared).unwrap().append(b"{}\n").unwrap();
+        AppendFile::probe(&shared).unwrap();
+        assert_eq!(mode_of(&shared), 0o640, "既存ファイルの mode は変えない");
+    }
+
     #[test]
     fn daily_writer_uses_current_date_after_idle_and_recovers_its_tail() {
         let dir = tempfile::tempdir().unwrap();

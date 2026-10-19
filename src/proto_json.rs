@@ -358,4 +358,409 @@ mod tests {
         // 値の無い optional は従来どおり null のまま (NaN と区別できる)。
         assert!(histogram[0]["max"].is_null());
     }
+
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
+    use opentelemetry_proto::tonic::metrics::v1::summary_data_point::ValueAtQuantile;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Sum, Summary,
+        SummaryDataPoint, exemplar,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+
+    fn kv(key: &str, value: OtlpValue) -> KeyValue {
+        KeyValue {
+            key: key.into(),
+            value: Some(AnyValue { value: Some(value) }),
+            key_strindex: 0,
+        }
+    }
+
+    /// AnyValue の全種類を並べ、double は配列・kvlist の入れ子の奥にも入れた属性。
+    fn any_values_with(v: f64) -> Vec<KeyValue> {
+        let double = || OtlpValue::DoubleValue(v);
+        vec![
+            kv("s", OtlpValue::StringValue("text".into())),
+            kv("b", OtlpValue::BoolValue(true)),
+            kv("i", OtlpValue::IntValue(-7)),
+            kv("d", double()),
+            kv("bytes", OtlpValue::BytesValue(vec![0, 255])),
+            kv(
+                "arr",
+                OtlpValue::ArrayValue(ArrayValue {
+                    values: vec![
+                        AnyValue {
+                            value: Some(double()),
+                        },
+                        AnyValue {
+                            value: Some(OtlpValue::ArrayValue(ArrayValue {
+                                values: vec![AnyValue {
+                                    value: Some(double()),
+                                }],
+                            })),
+                        },
+                    ],
+                }),
+            ),
+            kv(
+                "kv",
+                OtlpValue::KvlistValue(KeyValueList {
+                    values: vec![
+                        kv("inner", double()),
+                        kv(
+                            "deeper",
+                            OtlpValue::KvlistValue(KeyValueList {
+                                values: vec![kv("leaf", double())],
+                            }),
+                        ),
+                    ],
+                }),
+            ),
+        ]
+    }
+
+    fn resource() -> Option<Resource> {
+        Some(Resource {
+            attributes: vec![kv("service.name", OtlpValue::StringValue("svc".into()))],
+            ..Default::default()
+        })
+    }
+
+    fn logs_with(v: f64) -> TelemetryRecord {
+        TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: resource(),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "scope".into(),
+                        attributes: any_values_with(v),
+                        ..Default::default()
+                    }),
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_760_000_000_123_456_789,
+                        observed_time_unix_nano: 1_760_000_000_223_456_789,
+                        severity_number: 9,
+                        severity_text: "INFO".into(),
+                        body: Some(AnyValue {
+                            value: Some(OtlpValue::KvlistValue(KeyValueList {
+                                values: any_values_with(v),
+                            })),
+                        }),
+                        attributes: any_values_with(v),
+                        flags: 1,
+                        trace_id: vec![1; 16],
+                        span_id: vec![2; 8],
+                        event_name: "event".into(),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }))
+    }
+
+    fn traces_with(v: f64) -> TelemetryRecord {
+        TelemetryRecord::Traces(Box::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: resource(),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![2; 8],
+                        parent_span_id: vec![3; 8],
+                        name: "span".into(),
+                        kind: 2,
+                        start_time_unix_nano: 1_760_000_000_000_000_000,
+                        end_time_unix_nano: 1_760_000_001_000_000_000,
+                        attributes: any_values_with(v),
+                        events: vec![span::Event {
+                            time_unix_nano: 1_760_000_000_500_000_000,
+                            name: "event".into(),
+                            attributes: any_values_with(v),
+                            dropped_attributes_count: 0,
+                        }],
+                        links: vec![span::Link {
+                            trace_id: vec![4; 16],
+                            span_id: vec![5; 8],
+                            attributes: any_values_with(v),
+                            ..Default::default()
+                        }],
+                        status: Some(Status {
+                            message: "boom".into(),
+                            code: 2,
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }))
+    }
+
+    /// `metrics_with` に無い種類 (sum の整数点、summary、exponential histogram、exemplar)。
+    fn other_metrics_with(v: f64) -> TelemetryRecord {
+        TelemetryRecord::Metrics(Box::new(ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: resource(),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "sum".into(),
+                            data: Some(Data::Sum(Sum {
+                                data_points: vec![NumberDataPoint {
+                                    value: Some(NumberValue::AsInt(-3)),
+                                    exemplars: vec![Exemplar {
+                                        value: Some(exemplar::Value::AsDouble(v)),
+                                        time_unix_nano: 1_760_000_000_000_000_001,
+                                        span_id: vec![2; 8],
+                                        trace_id: vec![1; 16],
+                                        filtered_attributes: any_values_with(v),
+                                    }],
+                                    ..Default::default()
+                                }],
+                                aggregation_temporality: 1,
+                                is_monotonic: true,
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "summary".into(),
+                            data: Some(Data::Summary(Summary {
+                                data_points: vec![SummaryDataPoint {
+                                    count: 2,
+                                    sum: v,
+                                    quantile_values: vec![ValueAtQuantile {
+                                        quantile: 0.5,
+                                        value: v,
+                                    }],
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "exponential".into(),
+                            data: Some(Data::ExponentialHistogram(ExponentialHistogram {
+                                data_points: vec![ExponentialHistogramDataPoint {
+                                    count: 1,
+                                    sum: Some(v),
+                                    min: Some(v),
+                                    max: None,
+                                    scale: 1,
+                                    zero_threshold: v,
+                                    positive: Some(Buckets {
+                                        offset: -1,
+                                        bucket_counts: vec![1],
+                                    }),
+                                    ..Default::default()
+                                }],
+                                aggregation_temporality: 1,
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }))
+    }
+
+    /// JSON 中の数値 `from` をすべて文字列 `to` に置き換え、置き換えた個数を返す。
+    fn replace_number(value: &mut serde_json::Value, from: f64, to: &str) -> usize {
+        match value {
+            serde_json::Value::Number(n) if n.as_f64() == Some(from) => {
+                *value = serde_json::Value::from(to);
+                1
+            }
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .map(|item| replace_number(item, from, to))
+                .sum(),
+            serde_json::Value::Object(fields) => fields
+                .values_mut()
+                .map(|field| replace_number(field, from, to))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    /// logs / traces / metrics のどれでも、有限値だけなら `serde_json::to_vec` と 1 byte も
+    /// 変えない。0 の符号・最小の非正規化数・最大値のような境界の値も同じ書き方にする。
+    #[test]
+    fn finite_values_of_every_signal_are_written_exactly_as_before() {
+        for v in [
+            0.0,
+            -0.0,
+            0.1,
+            1.5,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            f64::MIN,
+        ] {
+            for record in [
+                logs_with(v),
+                traces_with(v),
+                other_metrics_with(v),
+                metrics_with(&[v]),
+            ] {
+                assert_eq!(
+                    to_vec(&record).unwrap(),
+                    serde_json::to_vec(&record).unwrap(),
+                    "{} の {v:e}",
+                    record.kind()
+                );
+            }
+        }
+    }
+
+    /// 回帰テスト: 入れ子の配列・kvlist の奥、span の event / link、exemplar、summary、
+    /// exponential histogram にある非有限値も、すべて proto3 JSON mapping の文字列で残す。
+    ///
+    /// 有限の目印 (1.5) で書いた JSON の数値を文字列へ置き換えたものと一致させることで、
+    /// double の位置を 1 つも取りこぼさず、それ以外の部分 (null や他の値) も変えないことを
+    /// 確かめる。summary の分位点は opentelemetry-proto 自身が文字列にするので、二重に
+    /// 変換しないことも同時に確かめる。
+    #[test]
+    fn non_finite_doubles_deep_in_every_signal_become_strings() {
+        /// 同じ double を全部の位置に入れた record を作る関数。
+        type Builder = fn(f64) -> TelemetryRecord;
+        const MARKER: f64 = 1.5;
+        // 属性 1 組に double が 5 個 (直下・配列の中・配列の中の配列・kvlist・kvlist の中の kvlist)。
+        let builders: [(Builder, usize); 3] = [
+            // scope の属性・body・record の属性。
+            (logs_with, 15),
+            // span・event・link の属性。
+            (traces_with, 15),
+            // exemplar の値と属性、summary の sum と分位点、exponential histogram の 3 項目。
+            (other_metrics_with, 11),
+        ];
+        for (special, name) in [
+            (f64::NAN, "NaN"),
+            // 符号付きの NaN も、proto3 JSON mapping に無い "-NaN" にはしない。
+            (-f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            for (with, at_least) in builders {
+                let mut expected: serde_json::Value =
+                    serde_json::from_slice(&serde_json::to_vec(&with(MARKER)).unwrap()).unwrap();
+                let replaced = replace_number(&mut expected, MARKER, name);
+                assert!(replaced >= at_least, "目印は {replaced} 箇所");
+                let record = with(special);
+                let written: serde_json::Value =
+                    serde_json::from_slice(&to_vec(&record).unwrap()).unwrap();
+                assert_eq!(written, expected, "{} の {name}", record.kind());
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct Newtype(f64);
+
+    #[derive(Serialize)]
+    struct Pair(f64, f32);
+
+    #[derive(Serialize)]
+    enum Variant {
+        Newtype(f64),
+        Tuple(f64, f32),
+        Struct { value: f64 },
+        Unit,
+    }
+
+    /// serde のあらゆる形 (f32、Option、入れ子の Vec / map、tuple、newtype、enum の各
+    /// variant、flatten) を通る double を持つ型。opentelemetry-proto の型が将来変わっても、
+    /// どの形で届いた非有限値も文字列にすることを固定する。
+    #[derive(Serialize)]
+    struct Shapes {
+        single: f32,
+        optional_none: Option<f64>,
+        optional_nan: Option<f64>,
+        optional_finite: Option<f64>,
+        nested: Vec<Vec<f64>>,
+        map: BTreeMap<String, Vec<f32>>,
+        tuple: (f64, f32),
+        newtype: Newtype,
+        tuple_struct: Pair,
+        variants: Vec<Variant>,
+        #[serde(flatten)]
+        flattened: BTreeMap<String, f64>,
+    }
+
+    /// 非有限の `f32` と、`Option<f64>` の `None` (null) と `Some(NaN)` ("NaN") を区別する。
+    /// どの入れ子の形でも同じ扱いにする。
+    #[test]
+    fn non_finite_values_in_every_serde_shape_become_strings() {
+        let shapes = Shapes {
+            single: f32::NAN,
+            optional_none: None,
+            optional_nan: Some(f64::NAN),
+            optional_finite: Some(2.5),
+            nested: vec![vec![f64::INFINITY, 1.0], vec![f64::NEG_INFINITY]],
+            map: BTreeMap::from([("k".to_string(), vec![f32::NEG_INFINITY, 0.5])]),
+            tuple: (f64::NAN, f32::INFINITY),
+            newtype: Newtype(f64::NEG_INFINITY),
+            tuple_struct: Pair(f64::NAN, f32::NEG_INFINITY),
+            variants: vec![
+                Variant::Newtype(f64::NAN),
+                Variant::Tuple(f64::INFINITY, f32::NAN),
+                Variant::Struct {
+                    value: f64::NEG_INFINITY,
+                },
+                Variant::Unit,
+            ],
+            flattened: BTreeMap::from([("flat".to_string(), f64::INFINITY)]),
+        };
+        let written: serde_json::Value = serde_json::from_slice(&to_vec(&shapes).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "single": "NaN",
+                "optional_none": null,
+                "optional_nan": "NaN",
+                "optional_finite": 2.5,
+                "nested": [["Infinity", 1.0], ["-Infinity"]],
+                "map": {"k": ["-Infinity", 0.5]},
+                "tuple": ["NaN", "Infinity"],
+                "newtype": "-Infinity",
+                "tuple_struct": ["NaN", "-Infinity"],
+                "variants": [
+                    {"Newtype": "NaN"},
+                    {"Tuple": ["Infinity", "NaN"]},
+                    {"Struct": {"value": "-Infinity"}},
+                    "Unit"
+                ],
+                "flat": "Infinity"
+            })
+        );
+    }
+
+    /// 有限の `f32` は serde_json の `f32` 用の書き方 (`0.1` を `0.10000000149011612` に
+    /// しない) のまま変えない。
+    #[test]
+    fn finite_f32_values_are_written_exactly_as_before() {
+        let values = [
+            0.1_f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            1.0e-45,
+        ];
+        assert_eq!(
+            to_vec(&values).unwrap(),
+            serde_json::to_vec(&values).unwrap()
+        );
+        assert_eq!(to_vec(&0.1_f32).unwrap(), b"0.1");
+    }
 }

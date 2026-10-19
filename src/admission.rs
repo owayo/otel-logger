@@ -204,4 +204,185 @@ mod tests {
             waiter.abort();
         }
     }
+
+    /// 枠が空くのを待っている request の数。
+    fn waiting(limits: &ReceiveLimits) -> usize {
+        limits.inner.waiting.load(Ordering::Acquire)
+    }
+
+    /// 巨大な期限でも、受け付け時の期限の計算を溢れさせない (panic させない)。
+    ///
+    /// `--receive-timeout-ms` は u64 のミリ秒をそのまま受け付けるので、`Instant` への加算が
+    /// 溢れる値も渡りうる。溢れたら実質的に期限なしとして扱い、待っている request は
+    /// 枠が空けば通す (遠い期限を「期限切れ」と取り違えない)。
+    #[tokio::test(start_paused = true)]
+    async fn huge_timeouts_do_not_overflow_the_deadline() {
+        let one_year = Duration::from_secs(60 * 60 * 24 * 365);
+        // `Duration::MAX` は `Instant` への加算が溢れる。`u64::MAX` ミリ秒は CLI で渡せる最大値。
+        for timeout in [Duration::MAX, Duration::from_millis(u64::MAX)] {
+            let limits = ReceiveLimits::new(1, timeout);
+            let deadline = limits.deadline();
+            assert!(
+                deadline.saturating_duration_since(Instant::now()) >= one_year,
+                "{timeout:?} の期限は実質的に期限なしになる"
+            );
+
+            let held = limits.admit(deadline).await.unwrap();
+            let waiter = {
+                let limits = limits.clone();
+                tokio::spawn(async move { limits.admit(limits.deadline()).await })
+            };
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished(), "{timeout:?}: 枠が空くまで待つ");
+
+            let started = Instant::now();
+            drop(held);
+            assert!(
+                waiter.await.unwrap().is_ok(),
+                "{timeout:?}: 枠が空けば待っていた request が通る"
+            );
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    /// 待機の上限ちょうどまでは待たせ、上限 + 1 件目だけを Busy で返す。
+    ///
+    /// 断った request の分は待機中の件数に残さない。残すと、断るたびに待てる件数が減り、
+    /// やがて空きを待つだけで済む request まで Busy になる。
+    #[tokio::test(start_paused = true)]
+    async fn waiting_limit_admits_exactly_the_limit_and_rejects_one_more() {
+        const INFLIGHT: usize = 2;
+        let max_waiting = INFLIGHT * WAITING_PER_INFLIGHT;
+        let limits = ReceiveLimits::new(INFLIGHT, Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut held = Vec::new();
+        for _ in 0..INFLIGHT {
+            held.push(limits.admit(deadline).await.unwrap());
+        }
+        assert_eq!(limits.available(), 0);
+
+        let spawn_waiter = || {
+            let limits = limits.clone();
+            tokio::spawn(async move { limits.admit(deadline).await })
+        };
+        let mut waiters: Vec<_> = (0..max_waiting).map(|_| spawn_waiter()).collect();
+        tokio::task::yield_now().await;
+        assert_eq!(waiting(&limits), max_waiting, "上限ちょうどまでは待たせる");
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+
+        for _ in 0..3 {
+            assert_eq!(limits.admit(deadline).await.unwrap_err(), Rejected::Busy);
+            assert_eq!(
+                waiting(&limits),
+                max_waiting,
+                "断った request は待機中に数えない"
+            );
+        }
+
+        // 1 件分の枠が空くと、待っていた request の 1 件が通り、待てる件数も 1 件戻る。
+        drop(held.pop());
+        tokio::task::yield_now().await;
+        let finished: Vec<_> = waiters
+            .iter()
+            .enumerate()
+            .filter(|(_, waiter)| waiter.is_finished())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(finished.len(), 1, "枠 1 つで通るのは 1 件だけ");
+        let admitted = waiters.remove(finished[0]).await.unwrap();
+        assert!(admitted.is_ok());
+        assert_eq!(waiting(&limits), max_waiting - 1);
+
+        let late = spawn_waiter();
+        tokio::task::yield_now().await;
+        assert!(
+            !late.is_finished(),
+            "空いた待機の枠には、新しい request が Busy にならずに入れる"
+        );
+        assert_eq!(waiting(&limits), max_waiting);
+        for waiter in waiters.into_iter().chain([late]) {
+            waiter.abort();
+        }
+    }
+
+    /// 期限切れと cancel (接続断で handler の future が drop された場合) のどちらでも、
+    /// 待機中の件数を戻し、枠を消費しない。
+    ///
+    /// 件数が戻らないと、待機の上限が埋まったまま以後の request がすべて Busy になる。
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_or_cancelled_waiters_release_their_waiting_slots() {
+        let limits = ReceiveLimits::new(1, Duration::from_millis(200));
+        let held = limits.admit(limits.deadline()).await.unwrap();
+
+        let timed_out: Vec<_> = (0..WAITING_PER_INFLIGHT)
+            .map(|_| {
+                let limits = limits.clone();
+                tokio::spawn(async move { limits.admit(limits.deadline()).await })
+            })
+            .collect();
+        for waiter in timed_out {
+            assert_eq!(waiter.await.unwrap().unwrap_err(), Rejected::TimedOut);
+        }
+        assert_eq!(waiting(&limits), 0, "期限切れの request は待機中に残さない");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let cancelled: Vec<_> = (0..WAITING_PER_INFLIGHT)
+            .map(|_| {
+                let limits = limits.clone();
+                tokio::spawn(async move { limits.admit(deadline).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert_eq!(waiting(&limits), WAITING_PER_INFLIGHT);
+        for waiter in cancelled {
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(
+            waiting(&limits),
+            0,
+            "cancel した request は待機中に残さない"
+        );
+
+        // cancel した request は枠を取っていないので、保持中の枠を返せば全部空く。
+        drop(held);
+        assert_eq!(limits.available(), 1);
+        assert!(limits.admit(limits.deadline()).await.is_ok());
+    }
+
+    /// 枠は、受け付けた request の clone をすべて drop した時に 1 回だけ戻る。
+    ///
+    /// handler・保存の task・gRPC の request extension がそれぞれ clone を持つ。どれか 1 つの
+    /// drop で戻すと、保存中の request が残ったまま次の request を受け付けて上限を超える。
+    /// 逆に clone ごとに戻すと、枠が上限より増える。
+    #[tokio::test]
+    async fn permit_returns_its_slot_once_after_every_clone_is_dropped() {
+        let limits = ReceiveLimits::new(2, Duration::from_secs(5));
+        let permit = limits.admit(limits.deadline()).await.unwrap();
+        let in_extension = permit.clone();
+        let in_save_task = permit.clone();
+        assert_eq!(limits.available(), 1);
+
+        drop(permit);
+        drop(in_extension);
+        assert_eq!(limits.available(), 1, "保存の task が持つ間は戻さない");
+
+        // 保存の task が終わって最後の clone が drop された時に戻る。
+        tokio::spawn(async move { drop(in_save_task) })
+            .await
+            .unwrap();
+        assert_eq!(limits.available(), 2, "戻すのは 1 枠だけで、上限を超えない");
+    }
+
+    /// 設定で許す最大の同時数でも作れる (`Semaphore::new` の上限ちょうど)。待機の上限の
+    /// 計算 (同時数 × 倍率) も溢れさせない。
+    #[test]
+    fn the_largest_inflight_limit_can_be_constructed() {
+        let limits = ReceiveLimits::new(MAX_INFLIGHT_REQUESTS, DEFAULT_RECEIVE_TIMEOUT);
+        assert_eq!(limits.available(), MAX_INFLIGHT_REQUESTS);
+        assert_eq!(
+            limits.inner.max_waiting,
+            MAX_INFLIGHT_REQUESTS * WAITING_PER_INFLIGHT
+        );
+    }
 }

@@ -3798,6 +3798,74 @@ mod tests {
         assert_eq!(bucket.stats.duration_ms, 0, "サチる duration は 0 に倒す");
     }
 
+    /// 外部から届く数値の境界: 負の値・-0.0・NaN・±Infinity・範囲外は 0 (属性は `None`) に
+    /// 倒し、2^53 のような範囲内の大きな値は丸めずに採用する。文字列の数値も有限値だけを読む。
+    #[test]
+    fn numeric_helpers_clamp_untrusted_values_at_their_bounds() {
+        for (dp, expected) in [
+            (make_int_dp(vec![], -1), 0),
+            (make_int_dp(vec![], i64::MIN), 0),
+            (make_int_dp(vec![], i64::MAX), i64::MAX as u64),
+            (make_double_dp(vec![], -0.0), 0),
+            (make_double_dp(vec![], -1.5), 0),
+            (make_double_dp(vec![], f64::NAN), 0),
+            (make_double_dp(vec![], f64::INFINITY), 0),
+            (make_double_dp(vec![], f64::NEG_INFINITY), 0),
+            (make_double_dp(vec![], 0.999), 0),
+            (
+                make_double_dp(vec![], 9_007_199_254_740_992.0),
+                9_007_199_254_740_992,
+            ),
+        ] {
+            assert_eq!(number_value_as_u64(&dp), expected, "{:?}", dp.value);
+        }
+        for (dp, expected) in [
+            (make_double_dp(vec![], -2.0), 0.0),
+            (make_double_dp(vec![], f64::NAN), 0.0),
+            (make_double_dp(vec![], f64::INFINITY), 0.0),
+            (make_int_dp(vec![], -3), 0.0),
+            (make_double_dp(vec![], 0.25), 0.25),
+        ] {
+            assert_eq!(number_value_as_f64(&dp), expected, "{:?}", dp.value);
+        }
+
+        let mut no_sum = make_hist_dp(vec![], 1.0);
+        no_sum.sum = None;
+        assert_eq!(histogram_sum_as_u64(&no_sum), 0);
+        assert_eq!(histogram_sum_as_u64(&make_hist_dp(vec![], -1.0)), 0);
+        assert_eq!(histogram_sum_as_u64(&make_hist_dp(vec![], f64::NAN)), 0);
+
+        let attrs = vec![
+            kv_str("nan", "NaN"),
+            kv_str("inf", "inf"),
+            kv_str("overflow", "1e400"),
+            kv_str("text", "1.5"),
+            kv_str("negative", "-5"),
+            kv_double("negative_double", -2.5),
+            kv_int("int", 7),
+        ];
+        assert_eq!(f64_attr(&attrs, "nan"), None);
+        assert_eq!(f64_attr(&attrs, "inf"), None);
+        assert_eq!(
+            f64_attr(&attrs, "overflow"),
+            None,
+            "文字列から溢れた Infinity も弾く"
+        );
+        assert_eq!(f64_attr(&attrs, "text"), Some(1.5));
+        assert_eq!(f64_attr(&attrs, "int"), Some(7.0));
+        assert_eq!(f64_attr(&attrs, "missing"), None);
+        assert_eq!(int_attr(&attrs, "negative"), Some(-5));
+        assert_eq!(u64_attr(&attrs, "negative"), 0, "負の値は 0 に倒す");
+        assert_eq!(u64_attr(&attrs, "negative_double"), 0);
+        assert_eq!(u64_attr(&attrs, "missing"), 0);
+
+        // 加算: 非有限・負の値は 0 として扱い、和が溢れたら f64::MAX に張り付ける。
+        assert_eq!(finite_saturating_add_f64(f64::NAN, 1.0), 1.0);
+        assert_eq!(finite_saturating_add_f64(-1.0, 2.0), 2.0);
+        assert_eq!(finite_saturating_add_f64(1.0, f64::NEG_INFINITY), 1.0);
+        assert_eq!(finite_saturating_add_f64(f64::MAX, f64::MAX), f64::MAX);
+    }
+
     /// 実ログでは `handle_responses` span が `gen_ai.usage.*` を持ち、その値は
     /// `codex.turn.token_usage` metric と完全一致する (同一 usage の別表現)。
     /// span 経路は effort 補完専用であり、ここから token を計上すると三重計上になる。

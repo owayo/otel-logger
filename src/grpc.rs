@@ -320,6 +320,31 @@ mod tests {
         );
     }
 
+    /// 応答を返し終えたら枠を返し、同時数 1 でも次の request を通す。CLI で渡せる最大の期限
+    /// (u64 のミリ秒の最大値) でも、body に掛ける期限の計算を溢れさせない。
+    #[tokio::test(start_paused = true)]
+    async fn admission_layer_returns_the_slot_after_each_response() {
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let saw_permit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = ReceiveLimits::new(1, std::time::Duration::from_millis(u64::MAX));
+        let mut service =
+            AdmissionLayer::new(limits).layer(reading_service(std::sync::Arc::clone(&saw_permit)));
+        for _ in 0..3 {
+            let started = tokio::time::Instant::now();
+            let request =
+                http::Request::new(tonic::body::Body::new(axum::body::Body::from("payload")));
+            let response = service.ready().await.unwrap().call(request).await.unwrap();
+            assert_eq!(grpc_status(&response), Some(tonic::Code::Ok as i32));
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::ZERO,
+                "前の request の枠を待たない"
+            );
+        }
+        assert!(saw_permit.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// JSONL 永続化失敗は gRPC で必ず retryable な `Unavailable` を返し、exporter 側に
     /// retry させる契約を固定する。`Internal` は OTLP 上 non-retryable で、client が
     /// payload を drop してしまうため使わない。

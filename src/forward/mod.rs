@@ -170,3 +170,79 @@ pub struct RouteMetricsSnapshot {
 
 /// route metrics の共有ハンドル。router / worker / stats で共有する。
 pub type RouteMetricsHandle = Arc<RouteMetrics>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::ProxyRoute;
+    use crate::config::ProxyTransport;
+
+    fn settings_with_capacity(queue_capacity: usize) -> ProxySettings {
+        ProxySettings {
+            queue_capacity,
+            timeout_ms: 1000,
+            retry_max: 0,
+            checkpoint_dir: std::path::PathBuf::from(".otel-logger-proxy"),
+            routes: vec![ProxyRoute {
+                name: "test".to_string(),
+                service_names: vec!["claude-code".to_string()],
+                signals: ProxySignal::ALL.to_vec(),
+                transport: ProxyTransport::HttpProtobuf,
+                // 送信はしない (起動して止めるだけ)。
+                endpoint: "http://127.0.0.1:9".to_string(),
+                headers: Vec::new(),
+            }],
+        }
+    }
+
+    /// queue の容量は 0 なら 1 に繰り上げ、channel が作れる上限 (`Semaphore::MAX_PERMITS`)
+    /// ちょうどまでは起動する。上限 + 1 は panic ではなく設定エラーにする。
+    ///
+    /// `mpsc::channel` は 0 でも上限超えでも panic するので、検査が外れると設定ミスひとつで
+    /// 起動時に異常終了する。
+    #[tokio::test]
+    async fn spawn_router_accepts_capacities_up_to_the_channel_limit() {
+        for capacity in [0, 1, tokio::sync::Semaphore::MAX_PERMITS] {
+            let shutdown = CancellationToken::new();
+            let handle = spawn_router(&settings_with_capacity(capacity), shutdown.clone())
+                .await
+                .unwrap_or_else(|e| panic!("容量 {capacity} で起動できない: {e:#}"));
+            let snapshot = handle.router().snapshot();
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].0, "test");
+            assert_eq!(snapshot[0].1.queue_depth, 0);
+            shutdown.cancel();
+            handle.join().await;
+        }
+
+        let error = spawn_router(
+            &settings_with_capacity(tokio::sync::Semaphore::MAX_PERMITS + 1),
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("上限を超える容量は起動前に拒否する");
+        assert!(
+            error.to_string().contains("exceeds the maximum"),
+            "{error:#}"
+        );
+    }
+
+    /// 空の request (route に一致した resource が 0 件) は送信不要と判定する。
+    /// worker はこれを見て上流へ空の export を送らない。
+    #[test]
+    fn export_request_reports_its_signal_and_emptiness() {
+        let logs = ExportRequest::Logs(Box::default());
+        let traces = ExportRequest::Traces(Box::default());
+        let metrics = ExportRequest::Metrics(Box::default());
+        assert_eq!(logs.signal(), ProxySignal::Logs);
+        assert_eq!(traces.signal(), ProxySignal::Traces);
+        assert_eq!(metrics.signal(), ProxySignal::Metrics);
+        assert!(logs.is_empty() && traces.is_empty() && metrics.is_empty());
+
+        let non_empty = ExportRequest::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![Default::default()],
+        }));
+        assert!(!non_empty.is_empty());
+    }
+}

@@ -635,6 +635,135 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Content-Type / Content-Encoding で断る request は、受信の枠を待たずにすぐ 415 を返す。
+    ///
+    /// 枠を取る前に判定するので、上限が埋まっていても期限まで待たせない。待たせてから
+    /// 503 を返すと、retry しても通らない request を exporter に再送させ続ける。
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_media_is_rejected_without_waiting_for_a_slot() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let limits = ReceiveLimits::new(1, std::time::Duration::from_millis(200));
+        let app = router(sink, limits.clone());
+        let _held = limits.admit(limits.deadline()).await.unwrap();
+
+        for (content_type, content_encoding) in [("text/plain", None), (PROTOBUF_CT, Some("br"))] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/logs")
+                .header(header::CONTENT_TYPE, content_type);
+            if let Some(encoding) = content_encoding {
+                request = request.header(header::CONTENT_ENCODING, encoding);
+            }
+            let started = tokio::time::Instant::now();
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from("x")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type} / {content_encoding:?}"
+            );
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO, "枠を待たない");
+        }
+    }
+
+    /// decode できない body・上限を超える body で断った request も、受信の枠を返す。
+    ///
+    /// 枠が戻らないと、壊れた request を上限の数だけ送るだけで、以後の正常な request が
+    /// すべて期限切れの 503 になる。
+    #[tokio::test(start_paused = true)]
+    async fn rejected_bodies_return_their_slot() {
+        use std::io::Write as _;
+
+        use axum::http::Request;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let app = router(
+            sink,
+            ReceiveLimits::new(1, std::time::Duration::from_millis(200)),
+        );
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&vec![0u8; crate::server::OTLP_MAX_REQUEST_BYTES + 1])
+            .unwrap();
+        let too_large = encoder.finish().unwrap();
+        let rejected = [
+            (
+                PROTOBUF_CT,
+                None,
+                Body::from(vec![0xFF_u8; 16]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (JSON_CT, None, Body::from("{"), StatusCode::BAD_REQUEST),
+            (
+                PROTOBUF_CT,
+                Some("gzip"),
+                Body::from(too_large),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+        for (content_type, content_encoding, body, status) in rejected {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/logs")
+                .header(header::CONTENT_TYPE, content_type);
+            if let Some(encoding) = content_encoding {
+                request = request.header(header::CONTENT_ENCODING, encoding);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, JSON_CT)
+            .body(Body::from(r#"{"resourceLogs":[]}"#))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::OK,
+            "断った request の枠は戻っている"
+        );
+    }
+
+    /// body の上限はちょうど `OTLP_MAX_REQUEST_BYTES` までを含む。1 byte 手前で断ると、
+    /// 上限ちょうどの batch が retry できない 413 で失われる。
+    #[tokio::test]
+    async fn body_of_exactly_the_request_limit_is_not_rejected_by_size() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let app = router(sink, test_limits());
+        // 中身は不正な protobuf なので、size の上限を通れば decode 失敗の 400 になる。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .body(Body::from(vec![
+                0xFF_u8;
+                crate::server::OTLP_MAX_REQUEST_BYTES
+            ]))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     /// `/v1/traces` と `/v1/metrics` も実際に配線されていること。logs だけを叩く
     /// テストしか無いと、handler を取り違えて配線しても気づけない。
     #[tokio::test]

@@ -132,4 +132,120 @@ mod tests {
             PathBuf::from("~"),
         );
     }
+
+    /// `~/` だけ・区切りの重複・先頭が `./` のパスの境界。`~` は先頭の component の
+    /// ときだけ展開し、`./~/x` (CWD 直下の `~` を明示した指定) は展開しない。
+    #[test]
+    fn expand_user_path_handles_separator_edge_cases() {
+        let home = PathBuf::from("/Users/alice");
+        assert_eq!(
+            expand_user_path(PathBuf::from("~/"), Some(&home)),
+            PathBuf::from("/Users/alice"),
+        );
+        assert_eq!(
+            expand_user_path(PathBuf::from("~//x"), Some(&home)),
+            PathBuf::from("/Users/alice/x"),
+        );
+        assert_eq!(
+            expand_user_path(PathBuf::from("~/~"), Some(&home)),
+            PathBuf::from("/Users/alice/~"),
+            "展開は先頭の 1 つだけ"
+        );
+        assert_eq!(
+            expand_user_path(PathBuf::from("./~/x"), Some(&home)),
+            PathBuf::from("./~/x"),
+        );
+        assert_eq!(
+            expand_user_path(PathBuf::new(), Some(&home)),
+            PathBuf::new()
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// 回帰テスト: 途中の階層も含め、新しく作るディレクトリは所有者だけが辿れる権限にする。
+    ///
+    /// JSONL には受信した telemetry (`user.email` やプロンプト本文を含みうる) がそのまま入る。
+    /// 既定の umask 022 で作ると 0755 になり、共有 CI runner や多人数ログインサーバの
+    /// 他ユーザーから読める。umask は権限を減らす方向にしか効かないので、group / other の
+    /// bit が立っていないことを確かめる。
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_creates_every_missing_level_for_the_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("a").join("b").join("c");
+        create_private_dir(&leaf).unwrap();
+        for dir in [
+            root.path().join("a"),
+            root.path().join("a").join("b"),
+            leaf.clone(),
+        ] {
+            let mode = mode_of(&dir);
+            assert_eq!(mode & 0o077, 0, "{} が {mode:o}", dir.display());
+            assert_eq!(mode & 0o700, 0o700, "所有者は読み書き・走査できる");
+        }
+        // 既にあるディレクトリでは何もせず成功する (起動のたびに呼ぶため)。
+        create_private_dir(&leaf).unwrap();
+    }
+
+    /// 既存ディレクトリの mode は変えない。意図して group 共有にしている構成を
+    /// 起動のたびに壊さないため。
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_keeps_the_mode_of_an_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        create_private_dir(&shared).unwrap();
+        create_private_dir(&shared.join("child")).unwrap();
+
+        assert_eq!(mode_of(&shared), 0o750);
+        assert_eq!(mode_of(&shared.join("child")) & 0o077, 0);
+    }
+
+    /// 同じ名前の通常ファイルがある場所はディレクトリとして使えないので、成功扱いにせず
+    /// エラーを返す (`log-dir` の取り違えを起動時に止める)。
+    #[test]
+    fn create_private_dir_fails_when_a_file_is_in_the_way() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(create_private_dir(&file).is_err());
+        assert!(create_private_dir(&file.join("child")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"x", "ファイルは壊さない");
+    }
+
+    /// 新しく作るファイルだけを所有者限定 (0600) にし、既存ファイルの mode は変えない。
+    #[cfg(unix)]
+    #[test]
+    fn restrict_new_file_mode_applies_only_to_newly_created_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let open = |path: &Path| {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            restrict_new_file_mode(&mut options);
+            options.open(path).unwrap()
+        };
+
+        let created = root.path().join("created.jsonl");
+        drop(open(&created));
+        assert_eq!(mode_of(&created) & 0o077, 0);
+        assert_eq!(mode_of(&created) & 0o600, 0o600);
+
+        let existing = root.path().join("existing.jsonl");
+        std::fs::write(&existing, b"{}\n").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        drop(open(&existing));
+        assert_eq!(mode_of(&existing), 0o640);
+    }
 }

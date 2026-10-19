@@ -290,6 +290,158 @@ mod tests {
         assert_eq!(lines[1], "recovered");
     }
 
+    /// gate が開くまで止まり、開いた後は `failing` の間だけ失敗する出力先。
+    /// 「読まれない pipe で溢れた」後に「ディスクが埋まって書けない」が続く状況の代わり。
+    #[derive(Clone, Default)]
+    struct StalledThenFailingOutput {
+        stalled: StalledOutput,
+        failing: Arc<Mutex<bool>>,
+    }
+
+    impl Write for StalledThenFailingOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // gate が開くまで止まり、開いた後の失敗の有無はその時点の設定で決める。
+            let (state, changed) = &*self.stalled.state;
+            let mut guard = state.lock().unwrap();
+            guard.blocked = !guard.open;
+            changed.notify_all();
+            while !guard.open {
+                guard = changed.wait(guard).unwrap();
+            }
+            guard.blocked = false;
+            if *self.failing.lock().unwrap() {
+                return Err(io::Error::other("no space left on device"));
+            }
+            guard.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// queue が溢れて捨てた行と、書き込みに失敗した行 (知らせる行自体が書けなかった場合を
+    /// 含む) を、それぞれ 1 回ずつ数えて 1 行で知らせる。
+    ///
+    /// 知らせる行が書けなかった時に件数を数え直さないと、溢れた分の件数が消える。逆に
+    /// 二重に数えると、実際より多く捨てたように見える。
+    #[test]
+    fn full_queue_and_failed_writes_are_counted_once_each() {
+        let output = StalledThenFailingOutput::default();
+        let (mut writer, guard) = spawn(output.clone(), 2, Duration::from_secs(5)).unwrap();
+        writer.write_all(b"in-flight\n").unwrap();
+        output.stalled.wait_until_blocked();
+        for line in ["queued-1\n", "queued-2\n", "overflow-1\n", "overflow-2\n"] {
+            writer.write_all(line.as_bytes()).unwrap();
+        }
+        assert_eq!(
+            writer.dropped.load(Ordering::Relaxed),
+            2,
+            "queue (2 件) に入らない分だけを捨てる"
+        );
+
+        // 止まっていた行も、queue の 2 行 (と、その前に知らせる行) も書けない。
+        *output.failing.lock().unwrap() = true;
+        output.stalled.open();
+        assert!(guard.flush_until(Instant::now() + Duration::from_secs(5)));
+        assert!(output.stalled.written().is_empty());
+
+        *output.failing.lock().unwrap() = false;
+        writer.write_all(b"recovered\n").unwrap();
+        assert!(guard.flush_until(Instant::now() + Duration::from_secs(5)));
+        let written = output.stalled.written();
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 2, "{written}");
+        // 溢れた 2 行 + 書けなかった 3 行 (in-flight / queued-1 / queued-2) = 5 行。
+        assert!(
+            lines[0].contains(" WARN 5 diagnostic log line(s) were dropped"),
+            "{written}"
+        );
+        assert_eq!(lines[1], "recovered");
+        assert_eq!(
+            writer.dropped.load(Ordering::Relaxed),
+            0,
+            "知らせた件数は持ち越さない"
+        );
+    }
+
+    /// queue が満杯で書き出しの依頼すら積めない時も、終了時の書き出し待ちは期限で打ち切る。
+    #[test]
+    fn flush_gives_up_at_the_deadline_when_the_queue_is_full() {
+        let output = StalledOutput::default();
+        let (mut writer, guard) = spawn(output.clone(), 1, Duration::from_millis(50)).unwrap();
+        writer.write_all(b"stuck\n").unwrap();
+        output.wait_until_blocked();
+        writer.write_all(b"fills-the-queue\n").unwrap();
+        writer.write_all(b"dropped\n").unwrap();
+        assert_eq!(writer.dropped.load(Ordering::Relaxed), 1);
+
+        let started = Instant::now();
+        assert!(!guard.flush_until(Instant::now() + Duration::from_millis(50)));
+        drop(guard);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        output.open();
+    }
+
+    /// 1 行ずつ時間の掛かる出力先 (遅いが止まってはいない端末や pipe の代わり)。
+    #[derive(Clone, Default)]
+    struct SlowOutput {
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SlowOutput {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(10));
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// guard を drop すると、それまでに積んだ行を書き終えてから戻る。
+    ///
+    /// main の終わりで guard が落ちた直後にプロセスが終わるため、待たずに戻ると、
+    /// 終了直前の診断ログ (shutdown の経過や失敗の理由) が stderr に残らない。
+    #[test]
+    fn dropping_the_guard_writes_out_queued_lines_before_returning() {
+        let output = SlowOutput::default();
+        let (mut writer, guard) = spawn(output.clone(), 16, Duration::from_secs(5)).unwrap();
+        for i in 0..5 {
+            writer.write_all(format!("line-{i}\n").as_bytes()).unwrap();
+        }
+        drop(guard);
+        let written = String::from_utf8(output.written.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            written.lines().collect::<Vec<_>>(),
+            ["line-0", "line-1", "line-2", "line-3", "line-4"]
+        );
+    }
+
+    /// 捨てた件数の知らせは、tracing の行と同じ形 (先頭に RFC 3339 の時刻と水準) の 1 行にする。
+    /// 改行を含めると、行単位で読む log driver や grep で知らせが分断される。
+    #[test]
+    fn dropped_note_is_a_single_timestamped_warn_line() {
+        for lost in [1, u64::MAX] {
+            let note = dropped_note(lost);
+            assert!(note.ends_with('\n'), "{note:?}");
+            assert_eq!(note.matches('\n').count(), 1, "{note:?}");
+            let (timestamp, rest) = note.split_once("  ").unwrap();
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(timestamp).is_ok(),
+                "{timestamp:?} は RFC 3339 の時刻"
+            );
+            assert!(rest.starts_with(&format!("WARN {lost} ")), "{note:?}");
+            assert!(
+                rest.contains(&format!("診断ログを {lost} 行捨てました")),
+                "{note:?}"
+            );
+        }
+    }
+
     /// 出力先が止まったままでも、終了時の書き出し待ちは期限で打ち切る。
     #[test]
     fn flush_gives_up_at_the_deadline_when_output_is_stalled() {
