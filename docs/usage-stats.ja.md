@@ -33,7 +33,7 @@ tracing exporter によっては span event の name が source location にな�
 
 Codex 0.144.1+ の SSE completion に含まれる `model_reasoning_effort` を直接採用し、session 到着前でも実測した `gpt-5.6-terra` の high/xhigh を保持します。Codex token log が `conversation_starts` より先に届いた場合は、一時的な `effort=unknown` bucket を、後から届いた provider/model/effort bucket へ統合します。pending usage は provider/model/effort/conversation 単位で保留し、遅れて `codex.conversation_starts` が届いた時は、当該 conversation だけを確定 provider (Azure や OpenAI-compatible endpoint) へ移します。既知の SSE effort は保持し、SSE に effort が無い場合だけ session の値で補完します。
 
-`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。`handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊しません。
+`conversation.id` が付与された SSE 完了ログは、対応する `codex.conversation_starts` メタデータにだけ紐付け、別 conversation の直近 session には決してフォールバックしません。メタデータがまだ届いていない場合は一旦 `effort=unknown` バケットに格納し、後から到着した時点で正しい effort バケットへ統合します。これにより、複数 conversation が混在したり、日をまたいだ継続セッションでも token usage が誤った effort バケットに移動しません。`handle_responses` span から effort を再取得する際も `conversation.id` を尊重し、別 conversation の session を壊しません。Codex 0.163.0 以降、この span は `conversation.id` を持ちません (親の `codex.sampling` span が持ちます)。どの conversation の span か分からないので、更新するのは service ごとの fallback (次の段落) だけです。conversation ごとの session や、メタデータを待っている usage には触れません。
 
 `conversation.id` / effort を持たない Codex turn metrics は、同じ `service.name` で最後に観測した session だけを fallback に使います。TUI (`codex_cli_rs`) と Exec (`codex_exec`) が同時稼働しても、片方の provider / effort がもう片方の metrics に混入しません。
 
