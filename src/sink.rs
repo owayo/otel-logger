@@ -918,17 +918,20 @@ impl Sink {
     /// drain の上限を過ぎても shutdown が無期限に止まっていた。
     pub async fn flush(&self) -> Result<()> {
         let inner = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let jsonl = tokio::task::spawn_blocking(move || -> Result<()> {
             if let Some(writer) = inner.file.as_ref() {
                 writer.flush()?;
             }
             Ok(())
         })
         .await
-        .context("join JSONL flush task")??;
+        .context("join JSONL flush task")
+        .and_then(|result| result);
+        // JSONL の同期に失敗しても、独立した人が読める出力先は期限まで drain する。
+        // 先に `?` で返すと、queue に残った出力と末尾の summary をそのまま捨てる。
         self.drain_pretty_until(tokio::time::Instant::now() + PRETTY_FLUSH_TIMEOUT)
             .await;
-        Ok(())
+        jsonl
     }
 
     /// 全出力先の writer が queue 済みの出力を書き終えるのを、共有の期限まで並行に待つ。
@@ -1760,6 +1763,57 @@ mod tests {
 
         // blocking thread を解放する (runtime の drop が完了を待ち続けないように)。
         open_gate(&gate);
+    }
+
+    /// 回帰テスト: JSONL の最終同期に失敗しても、人が読める出力は期限まで drain する。
+    ///
+    /// 同期の失敗で先に返すと、queue に残った出力と末尾の summary を捨てる。JSONL と
+    /// stdout / pretty-log は独立した出力先なので、片方の失敗でもう片方を諦めない。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn flush_drains_pretty_output_even_when_jsonl_sync_fails() {
+        let gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let aggregator = Arc::new(Aggregator::new());
+        // /dev/null は書けるが fsync できない。最終同期の失敗だけを注入する。
+        let unsyncable = AppendFile::open(Path::new("/dev/null")).unwrap();
+        let sink = Sink {
+            inner: Arc::new(SinkInner {
+                admission: Arc::new(RwLock::new(true)),
+                jsonl_health: StdMutex::new(WriteHealth::default()),
+                summary_enabled: false,
+                file: Some(JsonlWriter::File(StdMutex::new(unsyncable))),
+                stdout: Some(PrettyOutput::spawn(
+                    PrettyTarget::Stall(Arc::clone(&gate)),
+                    false,
+                    Arc::clone(&aggregator),
+                )),
+                pretty_log: None,
+                aggregator,
+                proxy: None,
+            }),
+        };
+        sink.record(TelemetryRecord::Logs(Box::new(claude_api_request_log())))
+            .await
+            .unwrap();
+
+        let opener = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                open_gate(&gate);
+            })
+        };
+        assert!(
+            sink.flush().await.is_err(),
+            "JSONL を同期できなかったことは呼び出し元へ返す"
+        );
+        opener.join().unwrap();
+        let stdout = sink.inner.stdout.as_ref().unwrap();
+        assert_eq!(
+            stdout.queued_bytes.load(AtomicOrdering::Relaxed),
+            0,
+            "JSONL の同期に失敗しても、stdout に積んだ出力は書き終えるまで待つ"
+        );
     }
 
     /// `--pretty-log` は log-dir に色なしの日次ファイルを書き、`--summary` の累計も載せる。
