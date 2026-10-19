@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::server::TcpIncoming;
 
 use crate::cli::Settings;
 use crate::grpc::OtlpService;
@@ -37,8 +38,27 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// 打ち消すため、設定しないと gRPC だけが真に無制限になる。
 const MAX_CONCURRENT_STREAMS: u32 = 16;
 
+/// `addr` に OTLP/gRPC の listener を bind する。
+///
+/// bind を `serve_with_shutdown(addr, ..)` に任せると、「listening」のログが bind より前に
+/// 要求したアドレスのまま出る。`--grpc-addr 127.0.0.1:0` では割り当てられた port が
+/// 分からず、使用中の port では「listening」の直後に `Address already in use` で終わり、
+/// エラーの chain にアドレスが残らない。先に bind して、失敗にはアドレスを付ける。
+///
+/// accept した接続の設定は `serve_with_shutdown` の既定 (`TCP_NODELAY` を有効、TCP keepalive
+/// は付けない) に揃える。`serve_with_incoming_shutdown` は `Server` 側の TCP 設定を
+/// 無視するため、ここで付けないと既定から黙って外れる。`TcpIncoming::bind` は tokio の
+/// reactor へ登録するので、runtime の中で呼ぶこと。
+fn bind_grpc(addr: SocketAddr) -> Result<TcpIncoming> {
+    let incoming = TcpIncoming::bind(addr).with_context(|| format!("bind gRPC {addr}"))?;
+    Ok(incoming.with_nodelay(Some(true)))
+}
+
 /// `shutdown` が cancel されるまで、`addr` で OTLP/gRPC server を動かす。
 pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
+    // bind してから「listening」を出す (HTTP 側の `http::serve` と同じ順序)。
+    let incoming = bind_grpc(addr)?;
+    let local = incoming.local_addr()?;
     let (trace_srv, metrics_srv, logs_srv) = OtlpService::new(sink).into_servers();
     // 既定 (4MiB) では大きな batch が decode 前に拒否されるため、上限を明示的に引き上げる。
     // gzip も受け付ける。`OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter が gRPC で
@@ -55,7 +75,7 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
     let logs_srv = logs_srv
         .accept_compressed(gzip)
         .max_decoding_message_size(OTLP_MAX_REQUEST_BYTES);
-    tracing::info!(%addr, max_request_bytes = OTLP_MAX_REQUEST_BYTES, "OTLP/gRPC server listening");
+    tracing::info!(addr = %local, max_request_bytes = OTLP_MAX_REQUEST_BYTES, "OTLP/gRPC server listening");
     tonic::transport::Server::builder()
         // tonic は hyper の既定 (200 streams/connection) を `None` で打ち消すため、
         // 明示しないと 1 本の TCP 接続から無制限にストリームを開ける。1 リクエストの
@@ -72,7 +92,7 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
         .add_service(trace_srv)
         .add_service(metrics_srv)
         .add_service(logs_srv)
-        .serve_with_shutdown(addr, async move { shutdown.cancelled().await })
+        .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
         .context("OTLP/gRPC server")?;
     Ok(())
@@ -325,5 +345,47 @@ mod tests {
         let result = probe_binds(addr, addr).await;
 
         assert!(result.is_err(), "同じ固定 port は dry-run でも失敗すること");
+    }
+
+    /// 回帰テスト: gRPC の listener は「listening」を出す前に bind し、`:0` では割り当てられた
+    /// port を返す。修正前は bind より前に、要求したアドレス (`127.0.0.1:0`) をログへ出していた。
+    #[tokio::test]
+    async fn bind_grpc_reports_the_assigned_port() {
+        let incoming = bind_grpc("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        assert_ne!(incoming.local_addr().unwrap().port(), 0);
+    }
+
+    /// 回帰テスト: 使用中の port では、エラーの chain に衝突したアドレスを残す。
+    /// 修正前は `Address already in use` だけで、どのアドレスか分からなかった。
+    #[tokio::test]
+    async fn bind_grpc_error_names_the_address_in_use() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let error = bind_grpc(addr).unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&addr.to_string()), "{rendered}");
+    }
+
+    /// 自前で bind しても、accept した接続には `serve_with_shutdown` の既定と同じく
+    /// `TCP_NODELAY` を付ける。`serve_with_incoming_shutdown` は `Server` 側の TCP 設定を
+    /// 無視するため、`bind_grpc` で付け忘れると既定から黙って外れる。
+    #[tokio::test]
+    async fn bind_grpc_keeps_tonic_default_nodelay_on_accepted_connections() {
+        use tonic::codegen::tokio_stream::StreamExt as _;
+
+        let mut incoming = bind_grpc("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let accepted = incoming
+            .next()
+            .await
+            .expect("listener は接続を受け付けること")
+            .unwrap();
+
+        assert!(accepted.nodelay().unwrap());
     }
 }

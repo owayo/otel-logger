@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use anyhow::Context as _;
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -215,12 +216,22 @@ pub fn router(sink: Sink) -> Router {
         .layer(RequestDecompressionLayer::new().gzip(true))
 }
 
+/// `addr` に OTLP/HTTP の listener を bind する。
+///
+/// 失敗にはアドレスを付ける (gRPC 側の `server::bind_grpc` と同じ)。付けないと
+/// `Address already in use` だけが残り、どのアドレスで衝突したか分からない。
+async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind HTTP {addr}"))
+}
+
 pub async fn serve(
     addr: SocketAddr,
     sink: Sink,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "OTLP/HTTP server listening");
     let app = router(sink);
@@ -638,5 +649,26 @@ mod tests {
             StatusCode::OK,
             "gzip した OTLP request を解凍して受け付けること"
         );
+    }
+
+    /// `:0` では割り当てられた port を返す (「listening」のログに出すのはこの値)。
+    #[tokio::test]
+    async fn bind_reports_the_assigned_port() {
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
+
+    /// 回帰テスト: 使用中の port では、エラーの chain に衝突したアドレスを残す。
+    /// 修正前は `Address already in use` だけで、どのアドレスか分からなかった。
+    #[tokio::test]
+    async fn bind_error_names_the_address_in_use() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let error = bind(addr).await.unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&addr.to_string()), "{rendered}");
     }
 }
