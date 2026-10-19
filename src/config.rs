@@ -367,8 +367,11 @@ impl Config {
                 let position = e.span().map(|span| {
                     let prefix = &body.as_bytes()[..span.start.min(body.len())];
                     let line = prefix.iter().filter(|byte| **byte == b'\n').count() + 1;
-                    let column = prefix.iter().rposition(|byte| *byte == b'\n')
-                        .map_or(prefix.len() + 1, |index| prefix.len() - index);
+                    // 列は toml 自身の表示と同じく文字数で数える。byte 数で数えると、同じ行の
+                    // 前に日本語などの多バイト文字があるだけで、伏せた後のエラーの位置がずれる。
+                    let line_start = prefix.iter().rposition(|byte| *byte == b'\n')
+                        .map_or(0, |index| index + 1);
+                    let column = String::from_utf8_lossy(&prefix[line_start..]).chars().count() + 1;
                     format!(" at line {line}, column {column}")
                 }).unwrap_or_default();
                 anyhow::anyhow!("invalid TOML configuration{position}: check syntax and value types (values omitted)")
@@ -769,6 +772,12 @@ mystery-key = 1
             ("summary = \"abc", 1, 15),
             // CRLF の行末。
             ("summary = true\r\nmax-inflight-requests = \"8\"\r\n", 2, 25),
+            // 同じ行の前に多バイト文字がある (回帰テスト: 修正前は byte 数で数えて 44 になった)。
+            (
+                "[proxy]\nroutes = [{ name = \"日本語\", endpoint = 1 }]\n",
+                2,
+                38,
+            ),
         ] {
             let position = format!("at line {line}, column {column}");
             let from_toml = toml::from_str::<Config>(body).unwrap_err().to_string();
