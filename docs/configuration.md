@@ -58,6 +58,8 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 `--daemon` writes a different starter file, tuned for long-lived instances: `no-stdout = true` plus daily-rotated JSONL with retention. See [daemon.md](daemon.md).
@@ -74,9 +76,13 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 Both files carry `pretty-log = true` commented out. When enabled, it writes the human-readable stream to daily files in `log-dir` as well, independently of `no-stdout`; [daemon.md](daemon.md#keeping-the-human-readable-stream) lists how the two settings combine.
+
+`max-inflight-requests` and `receive-timeout-ms` bound how many OTLP requests are received and saved at once (HTTP and gRPC combined) and how long receiving one may take, including the wait for a free slot. `0` for either key fails at startup, as does a `max-inflight-requests` above the limit of `tokio`'s semaphore. [architecture.md](architecture.md#request-limits) explains the defaults.
 
 ## Proxy routes
 

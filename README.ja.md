@@ -37,6 +37,7 @@
 ## 機能
 
 - **OTLP の 2 経路を 1 プロセスで受信**: OTLP/gRPC (4317) と OTLP/HTTP (4318)。HTTP は `application/x-protobuf` と `application/json` の両方を、gzip 圧縮の有無を問わず受け付ける。1 リクエストの上限 32 MiB は解凍後のサイズで判定する
+- **受信量の上限**: 2 経路を合わせて、同時に受信・保存する request は 8 件まで、1 件の受信は 5 秒以内。上限を超えた request は空きを待ち、間に合わなければ retry できる `503` / `Unavailable` を返す。body を送り切らない client がいくつあっても、メモリを使い切らない
 - **読みやすい stdout**: severity 別に色分けする (リダイレクト時や `NO_COLOR` の設定時は色を付けない)。受信した payload の制御文字は terminal に届く前に escape する。`--pretty-log` を付けると、同じ出力を色なしの日次ファイルとして `--log-dir` にも残す
 - **欠落のない JSON Lines**: 単一の追記ファイルか日次ローテーションのファイルに保存し、graceful shutdown 時に `fsync` する。書き込みに失敗したら HTTP `503` / gRPC `Unavailable` を返し、exporter に batch を捨てさせず再送させる
 - **Claude Code と Codex (Codex Desktop を含む) の累計使用量**: token・コスト・所要時間を provider/model/effort ごとに累計し、`GET /stats` と `--summary` で出す。logs と metrics の二重計上はしない
@@ -212,6 +213,8 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 パスの展開、`log-dir` の保持期間の規則、常駐向けのプリセット: [docs/configuration.ja.md](docs/configuration.ja.md)

@@ -37,6 +37,7 @@ By default it does **not** forward to Jaeger/Honeycomb/etc. — the goal is to c
 ## Features
 
 - **Both OTLP transports in one process**: OTLP/gRPC (4317) and OTLP/HTTP (4318); HTTP accepts both `application/x-protobuf` and `application/json`, gzip-compressed or not. The 32 MiB request limit applies after decompression.
+- **Bounded intake**: at most 8 requests are received and saved at once across both transports, and receiving one must finish within 5 seconds. Requests over the limit wait for a slot and then get a retryable `503` / `Unavailable`, so clients that never finish their uploads cannot exhaust memory
 - **Readable stdout**: severity-based colors (turned off when redirected or when `NO_COLOR` is set), with control characters in incoming payloads escaped before they reach the terminal; `--pretty-log` also keeps the stream as uncolored daily files in `--log-dir`
 - **Lossless JSON Lines**: one append-only file or daily-rotated files, `fsync`'d on graceful shutdown; a failed write returns HTTP `503` / gRPC `Unavailable` so exporters retry instead of dropping the batch
 - **Usage totals for Claude Code and Codex (including Codex Desktop)**: cumulative tokens, cost and duration per provider/model/effort via `GET /stats` and `--summary`, de-duplicated between logs and metrics
@@ -212,6 +213,8 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 Path expansion, the retention rules of `log-dir` and the daemon preset: [docs/configuration.md](docs/configuration.md)

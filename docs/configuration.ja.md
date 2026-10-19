@@ -58,6 +58,8 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 `--daemon` は常駐運用向けに調整した別のテンプレートを生成します (`no-stdout = true` と、保持設定付きの日次ローテーション JSONL)。詳細は [daemon.ja.md](daemon.ja.md) を参照してください。
@@ -74,9 +76,13 @@ summary = false
 color = "auto"  # "auto" | "always" | "never"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
 ```
 
 どちらのファイルにも `pretty-log = true` がコメントアウトした状態で入っています。有効にすると、人が読める出力を `log-dir` の日次ファイルにも書き出します。`no-stdout` とは独立した設定で、2 つの組み合わせは [daemon.ja.md](daemon.ja.md#人が読める出力を残す) にまとめています。
+
+`max-inflight-requests` と `receive-timeout-ms` は、同時に受信・保存する OTLP request の数 (HTTP と gRPC の合計) と、1 件の受信にかけてよい時間 (空きを待つ時間を含む) の上限です。どちらも `0` を書くと起動時にエラーになります。`max-inflight-requests` は `tokio` の semaphore の上限を超える値もエラーです。既定値の理由は [architecture.ja.md](architecture.ja.md#リクエストの上限) にあります。
 
 ## proxy の route
 

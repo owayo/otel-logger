@@ -18,6 +18,8 @@ otel-logger init [--path <PATH>] [--config <PATH>] [--force] [--daemon]
 | `--config`     |       | (自動)           | `OTEL_LOGGER_CONFIG`      | TOML 設定ファイルのパス ([configuration.ja.md](configuration.ja.md) を参照) |
 | `--grpc-addr`  |       | `0.0.0.0:4317`   | `OTEL_LOGGER_GRPC_ADDR`   | gRPC バインドアドレス                                       |
 | `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP バインドアドレス (protobuf / JSON 両対応)             |
+| `--max-inflight-requests` | | `8` | `OTEL_LOGGER_MAX_INFLIGHT_REQUESTS` | 同時に受信・保存する request 数 (HTTP と gRPC の合計)。超えた分は `--receive-timeout-ms` まで空きを待ち、間に合わなければ retry できる `503` / `UNAVAILABLE` を返す ([architecture.ja.md](architecture.ja.md#リクエストの上限) を参照) |
+| `--receive-timeout-ms` | | `5000` | `OTEL_LOGGER_RECEIVE_TIMEOUT_MS` | request を受け付けてから body を読み終えるまでの期限 (空きを待つ時間を含む)。保存の処理はこの期限で打ち切らない |
 | `--log-file`   |       | (なし)           | `OTEL_LOGGER_LOG_FILE`    | 受信内容を JSON Lines で追記出力 (`--log-dir` と排他)        |
 | `--log-dir`    |       | (なし)           | `OTEL_LOGGER_LOG_DIR`     | 指定ディレクトリに日次ローテーションで JSONL を出力 (`otel-logger.YYYY-MM-DD`、ローカルタイム) |
 | `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | `--log-dir` 利用時に日次ファイル (JSONL と `--pretty-log` のファイル) を保持する日数 (`0` を渡しても最低 1 日は残す) |
@@ -61,3 +63,5 @@ otel-logger init --daemon                 # 常駐運用向けのプリセット
 ## 診断ログ
 
 サーバ自身の診断ログは **stderr** に出ます。`OTEL_LOGGER_LOG=debug` のように `tracing-subscriber` の env filter 文法でフィルタ可能です。
+
+診断ログは専用のスレッドから書きます。stderr が読まれていない (pager を止めた、log driver が詰まった) ときや、書けない (ディスクが満杯、pipe が閉じた) ときでも、OTLP の応答と終了処理は止まりません。書けなかった行は捨てて数え、次に書けた行の前に件数を `WARN` の 1 行で知らせます。色は、stderr が端末で `NO_COLOR` が設定されていないときだけ付けます。

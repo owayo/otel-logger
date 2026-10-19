@@ -18,6 +18,8 @@ Without a subcommand, `otel-logger` runs the OTLP receiver.
 | `--config`     |       | (auto)           | `OTEL_LOGGER_CONFIG`      | Path to a TOML config file (see [configuration.md](configuration.md)) |
 | `--grpc-addr`  |       | `0.0.0.0:4317`   | `OTEL_LOGGER_GRPC_ADDR`   | gRPC bind address (OTLP/gRPC)                            |
 | `--http-addr`  |       | `0.0.0.0:4318`   | `OTEL_LOGGER_HTTP_ADDR`   | HTTP bind address (OTLP/HTTP, both protobuf and JSON)    |
+| `--max-inflight-requests` | | `8` | `OTEL_LOGGER_MAX_INFLIGHT_REQUESTS` | Requests received and saved at once, HTTP and gRPC combined. Requests over it wait for a free slot until `--receive-timeout-ms`, then get a retryable `503` / `UNAVAILABLE` (see [architecture.md](architecture.md#request-limits)) |
+| `--receive-timeout-ms` | | `5000` | `OTEL_LOGGER_RECEIVE_TIMEOUT_MS` | Time from accepting a request until its body has been read, including the wait for a slot. Saving the batch is not cut short |
 | `--log-file`   |       | (none)           | `OTEL_LOGGER_LOG_FILE`    | Append received telemetry as JSON Lines (mutually exclusive with `--log-dir`) |
 | `--log-dir`    |       | (none)           | `OTEL_LOGGER_LOG_DIR`     | Write daily-rotated JSONL into this directory: `otel-logger.YYYY-MM-DD` (local time) |
 | `--log-keep-days` |    | `10`             | `OTEL_LOGGER_LOG_KEEP_DAYS` | Days of daily files to keep in `--log-dir`, both JSONL and `--pretty-log` files (`0` is clamped to a 1-day minimum) |
@@ -61,3 +63,5 @@ otel-logger init --daemon                 # preset for long-lived services
 ## Diagnostics
 
 Internal logs (the receiver's own diagnostics) go to **stderr** and respect `OTEL_LOGGER_LOG=debug` (`tracing-subscriber` env filter syntax).
+
+They are written by a background thread, so a stderr that is not being read (a stopped pager, a stuck log driver) or cannot be written (a full disk, a closed pipe) never delays OTLP responses or shutdown. Lines that cannot be written are dropped and counted; the next line that gets through is preceded by one `WARN` line with the count. Colors are used only when stderr is a terminal and `NO_COLOR` is unset.
