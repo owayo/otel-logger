@@ -32,12 +32,19 @@ fn main() -> Result<()> {
         daemon,
     }) = cli.command.as_ref()
     {
+        // `--dry-run` は受信側の起動を検証するフラグで、`init` には書かずに終える経路が無い。
+        // 無視すると「何も変えないはず」の指定で既存の設定を雛形に上書きするため、
+        // 何も書かずに失敗させる。
+        if cli.dry_run {
+            anyhow::bail!("`--dry-run` cannot be combined with `init`; no config file was written");
+        }
         let profile = if *daemon {
             InitProfile::Daemon
         } else {
             InitProfile::Default
         };
-        return run_init(path.as_deref(), *force, profile);
+        // `--path` が無ければ、受信側が読むパス (`--config` / `OTEL_LOGGER_CONFIG`) へ書く。
+        return run_init(path.as_deref().or(cli.config.as_deref()), *force, profile);
     }
 
     let config = Config::load(cli.config.as_deref())?;
@@ -124,11 +131,19 @@ fn warn_if_stdout_unrotated(settings: &Settings) {
     );
 }
 
+/// 設定の雛形を `path` へ書き出す。`path` が無ければ受信側と同じ既定パスへ書く。
+///
+/// 呼び出し側は `--path` > `--config` / `OTEL_LOGGER_CONFIG` の順で `path` を決める。
+/// `--config` は global なので `init --help` にも出る。これを無視して既定パスへ書くと、
+/// 指定したファイルは作られないまま既定パスの設定が雛形で上書きされ、
+/// `OTEL_LOGGER_CONFIG` を設定した環境では続く起動が「configuration file does not exist」で
+/// 失敗する。`~` の展開は `Config::load` と揃える。
 fn run_init(path: Option<&Path>, force: bool, profile: InitProfile) -> Result<()> {
     let dest: PathBuf = match path {
         Some(p) => expand_current_user_path(p.to_path_buf()),
         None => config::default_config_path().context(
-            "cannot determine default config path: set $XDG_CONFIG_HOME or $HOME, or pass --path",
+            "cannot determine default config path: set $XDG_CONFIG_HOME or $HOME, \
+             or pass --path or --config",
         )?,
     };
     let outcome = config::write_with_profile(&dest, force, profile)?;

@@ -133,8 +133,8 @@ color = "auto"
 # `log-dir`) が必須です (両方未設定なら proxy 起動時にエラーになります)。
 #
 # 組み込み既定 route:
-#   - name = "anthropic" → service_names = ["claude-code"]
-#   - name = "openai"    → service_names = ["codex_cli_rs", "codex_exec",
+#   - name = "anthropic" → service-names = ["claude-code"]
+#   - name = "openai"    → service-names = ["codex_cli_rs", "codex_exec",
 #                                           "codex-app-server", "codex_mcp_server",
 #                                           "Codex Desktop", "codex-exec-server"]
 #
@@ -149,7 +149,7 @@ color = "auto"
 #
 # [[proxy.routes]]
 # name = "anthropic"
-# # service_names を省略すると組み込み既定を継承します。
+# # service-names を省略すると組み込み既定を継承します。
 # transport = "grpc"                    # "grpc" | "http-protobuf"
 # endpoint = "https://collector.example.com:4317"
 # [proxy.routes.headers]
@@ -600,6 +600,33 @@ color = "never"
             let enabled: Config = toml::from_str(&enabled).unwrap();
             assert_eq!(enabled.pretty_log, Some(true));
         }
+    }
+
+    /// 回帰テスト: テンプレートは route のキーを設定ファイルの表記 (`service-names`) で案内する。
+    ///
+    /// `ProxyRouteConfig` は kebab-case + `deny_unknown_fields` なので、修正前に案内していた
+    /// Rust のフィールド名 (`service_names`) の通りに書くと parse エラーになっていた。
+    #[test]
+    fn templates_guide_proxy_route_keys_as_they_parse() {
+        for profile in [InitProfile::Default, InitProfile::Daemon] {
+            let template = render_config_template(profile);
+            assert!(template.contains("service-names"), "{profile:?}");
+            assert!(!template.contains("service_names"), "{profile:?}");
+        }
+
+        // 組み込み既定 route の案内 (`service-names = [...]`) を、そのまま route に書いて通す。
+        let template = render_config_template(InitProfile::Default);
+        let guidance = template
+            .lines()
+            .find_map(|line| line.strip_prefix("#   - name = \"anthropic\" → "))
+            .expect("anthropic route の組み込み既定を案内している");
+        let config: Config = toml::from_str(&format!(
+            "[[proxy.routes]]\nname = \"anthropic\"\n{guidance}\n\
+             endpoint = \"https://collector.example.com:4317\"\n"
+        ))
+        .unwrap();
+        let routes = config.proxy.expect("proxy section parsed").routes;
+        assert_eq!(routes[0].service_names, vec!["claude-code".to_string()]);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 ```bash
 otel-logger [OPTIONS]
-otel-logger init [--path <PATH>] [--force] [--daemon]
+otel-logger init [--path <PATH>] [--config <PATH>] [--force] [--daemon]
 ```
 
 サブコマンドを付けなければ OTLP 受信サーバとして起動します。
@@ -42,19 +42,20 @@ otel-logger init [--path <PATH>] [--force] [--daemon]
 
 ## `init`
 
-`otel-logger init` はコメント入りの設定ファイルのテンプレートを書き出します。既存のファイルは `--force` を付けない限り上書きしません。
+`otel-logger init` は、コメント入りの設定ファイルのテンプレートを受信サーバが読むパスへ書き出します。同じ `--config` / `OTEL_LOGGER_CONFIG` で起動した `otel-logger` は、そのファイルを読みます。既存のファイルは `--force` を付けない限り上書きしません。`--dry-run` と組み合わせた場合は、何も書かずにエラーで終了します。
 
 | オプション | 短縮形 | 説明 |
 |---|---|---|
-| `--path` | `-p` | 出力先のパス (既定は受信サーバが読むパスと同じ `$XDG_CONFIG_HOME/otel-logger/config.toml`、未設定なら `~/.config/otel-logger/config.toml`) |
+| `--path` | `-p` | 出力先のパス。省略すると、受信サーバが読むパスへ書く。`--config` / `OTEL_LOGGER_CONFIG` があればそのパス、無ければ `$XDG_CONFIG_HOME/otel-logger/config.toml` (未設定なら `~/.config/otel-logger/config.toml`) |
 | `--force` | `-f` | 既存のファイルを上書きする |
 | `--daemon` | | 常駐運用向けのプリセット (`no-stdout = true` と日次ローテーションの JSONL。`pretty-log = true` はコメントアウトした状態で入る) を書き出す。書き出すのは設定ファイルだけで、サービス登録もバックグラウンド化も行わない |
 
 ```bash
-otel-logger init                    # → ~/.config/otel-logger/config.toml
-otel-logger init -p /etc/foo.toml   # → 任意のパス
-otel-logger init -f                 # 既存ファイルを上書き
-otel-logger init --daemon           # 常駐運用向けのプリセット
+otel-logger init                          # → ~/.config/otel-logger/config.toml
+otel-logger init -p /etc/foo.toml         # → 任意のパス
+otel-logger init --config /etc/foo.toml   # → /etc/foo.toml (`otel-logger --config /etc/foo.toml` が読むファイル)
+otel-logger init -f                       # 既存ファイルを上書き
+otel-logger init --daemon                 # 常駐運用向けのプリセット
 ```
 
 ## 診断ログ

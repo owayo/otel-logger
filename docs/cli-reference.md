@@ -6,7 +6,7 @@ Every option of `otel-logger` and of its `init` subcommand. The config file keys
 
 ```bash
 otel-logger [OPTIONS]
-otel-logger init [--path <PATH>] [--force] [--daemon]
+otel-logger init [--path <PATH>] [--config <PATH>] [--force] [--daemon]
 ```
 
 Without a subcommand, `otel-logger` runs the OTLP receiver.
@@ -42,19 +42,20 @@ Values coming from `OTEL_LOGGER_PROXY_*` are never printed by `--help`; they can
 
 ## `init`
 
-`otel-logger init` writes a fully-commented starter config file. It refuses to overwrite an existing file unless `--force` is given.
+`otel-logger init` writes a fully-commented starter config file to the path the receiver reads, so `otel-logger` started with the same `--config` / `OTEL_LOGGER_CONFIG` picks it up. It refuses to overwrite an existing file unless `--force` is given. Combined with `--dry-run`, it fails without writing anything.
 
 | Option | Short | Description |
 |---|---|---|
-| `--path` | `-p` | Destination path (default: the path the receiver reads, `$XDG_CONFIG_HOME/otel-logger/config.toml` or `~/.config/otel-logger/config.toml`) |
+| `--path` | `-p` | Destination path. When omitted, `init` writes to the path the receiver reads: `--config` / `OTEL_LOGGER_CONFIG` if set, otherwise `$XDG_CONFIG_HOME/otel-logger/config.toml` or `~/.config/otel-logger/config.toml` |
 | `--force` | `-f` | Overwrite an existing file |
 | `--daemon` | | Write the preset for long-lived services (`no-stdout = true` and daily-rotated JSONL, with `pretty-log = true` present but commented out). It only writes the file; it does not register a service or put anything in the background |
 
 ```bash
-otel-logger init                    # → ~/.config/otel-logger/config.toml
-otel-logger init -p /etc/foo.toml   # → custom path
-otel-logger init -f                 # overwrite an existing file
-otel-logger init --daemon           # preset for long-lived services
+otel-logger init                          # → ~/.config/otel-logger/config.toml
+otel-logger init -p /etc/foo.toml         # → custom path
+otel-logger init --config /etc/foo.toml   # → /etc/foo.toml, the file `otel-logger --config /etc/foo.toml` reads
+otel-logger init -f                       # overwrite an existing file
+otel-logger init --daemon                 # preset for long-lived services
 ```
 
 ## Diagnostics

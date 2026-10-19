@@ -21,9 +21,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Path to a TOML configuration file.
+    /// Path to a TOML configuration file. `init` writes here unless `--path` is given.
     /// TOML 設定ファイルのパス。既定では
     /// `$XDG_CONFIG_HOME/otel-logger/config.toml` (または `~/.config/otel-logger/config.toml`)。
+    /// `init` は `--path` が無ければこのパスへ書く。
     #[arg(long, env = "OTEL_LOGGER_CONFIG", value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
@@ -230,12 +231,13 @@ impl From<ProxyTransportArg> for ProxyTransport {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
-    /// Generate a default configuration file.
-    /// 既定の設定ファイルを生成する (既定の出力先は
-    /// `~/.config/otel-logger/config.toml`)。
+    /// Generate a default configuration file where the receiver reads it.
+    /// 既定の設定ファイルを、受信側が読むパス (`--path` で変更できる) に生成する。
     Init {
-        /// Destination path. Omit to use the XDG default location.
-        /// 出力先パス。省略時は XDG の既定パスを使う。
+        /// Destination path. Omit to write where the receiver reads its config
+        /// (`--config` / `OTEL_LOGGER_CONFIG`, else the XDG default location).
+        /// 出力先パス。省略時は受信側が読むパスへ書く。
+        /// `--config` / `OTEL_LOGGER_CONFIG` が無ければ XDG の既定パスを使う。
         #[arg(long, short = 'p', value_name = "PATH")]
         path: Option<PathBuf>,
 
@@ -420,13 +422,17 @@ impl Settings {
                 dir: expand(dir),
                 keep_days,
             }),
+            // 設定ファイルの値を採用するときだけ空文字を拒否する。CLI / 環境変数が勝つ
+            // 場合は、採用しない下位の値で起動を止めない (相互排他の判定と同じ規則)。
             (None, None) => match (config.log_file, config.log_dir) {
                 (Some(_), Some(_)) => {
                     anyhow::bail!("`log-file` and `log-dir` are mutually exclusive");
                 }
-                (Some(file), None) => Some(LogSink::File(expand(file))),
+                (Some(file), None) => Some(LogSink::File(expand(non_empty_config_path(
+                    "log-file", file,
+                )?))),
                 (None, Some(dir)) => Some(LogSink::Directory {
-                    dir: expand(dir),
+                    dir: expand(non_empty_config_path("log-dir", dir)?),
                     keep_days,
                 }),
                 (None, None) => None,
@@ -473,6 +479,22 @@ impl Settings {
             proxy,
         })
     }
+}
+
+/// 設定ファイルから採用するパスが空文字でないことを確かめる。
+///
+/// CLI と環境変数の空パスは clap が拒否し、空の `OTEL_LOGGER_*` は main が未設定に戻すが、
+/// 設定ファイルの空文字だけは検証されずに通っていた。`create_dir_all("")` は成功し、
+/// `Path::new("").try_exists()` は `Ok(false)` を返すため、`log-dir = ""` では日次ファイルが
+/// CWD 直下に開かれ、保持期間による削除も効かない。同じ設定の `--dry-run` は失敗するので、
+/// healthcheck は落ちるのに本体は動くという食い違いにもなる。
+///
+/// エラーにはキー名だけを載せる (値は空なので、載せる情報が無い)。
+fn non_empty_config_path(key: &str, path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("`{key}` in the config file is empty; set a path or remove the key");
+    }
+    Ok(path)
 }
 
 /// `--pretty-log` の書き出し先を、優先順位を解決した後の JSONL 出力先から決める。
@@ -576,15 +598,18 @@ fn resolve_proxy_settings(
         for svc in &route.service_names {
             // service.name が無い resource は空文字として扱われるため、空の設定値を
             // 許すと「未分類 resource」を意図せず転送してしまう。
+            // エラーには設定ファイルに書くキー名 (`service-names`) を載せる。`ProxyRouteConfig`
+            // は kebab-case + `deny_unknown_fields` なので、Rust のフィールド名を案内すると
+            // その通りに直した設定が parse エラーになる。
             if svc.is_empty() {
                 anyhow::bail!(
-                    "proxy route `{}` contains an empty `service_names` entry",
+                    "proxy route `{}` contains an empty `service-names` entry",
                     route.name
                 );
             }
             if let Some(prev) = seen.insert(svc.clone(), route.name.clone()) {
                 anyhow::bail!(
-                    "proxy service_names `{svc}` is claimed by both routes `{prev}` and `{cur}`",
+                    "proxy `service.name` `{svc}` is claimed by both routes `{prev}` and `{cur}`",
                     cur = route.name,
                 );
             }
@@ -601,9 +626,14 @@ fn resolve_proxy_settings(
     }
     let log_sink = log_sink.expect("checked non-empty above");
 
-    let checkpoint_dir = match cli.checkpoint_dir.or(config.checkpoint_dir) {
-        Some(dir) => expand_user_path(dir, home),
-        None => default_checkpoint_dir(log_sink),
+    // `log-dir` と同じく、設定ファイルの値を採用するときだけ空文字を拒否する。
+    // 空のままだと Phase B の checkpoint が CWD 直下に置かれる。
+    let checkpoint_dir = match (cli.checkpoint_dir, config.checkpoint_dir) {
+        (Some(dir), _) => expand_user_path(dir, home),
+        (None, Some(dir)) => {
+            expand_user_path(non_empty_config_path("proxy.checkpoint-dir", dir)?, home)
+        }
+        (None, None) => default_checkpoint_dir(log_sink),
     };
 
     Ok(Some(ProxySettings {
@@ -706,7 +736,7 @@ fn build_custom_route(cfg: ProxyRouteConfig) -> anyhow::Result<ProxyRoute> {
     let signals = normalize_signals(cfg.signal_types);
     let service_names = if cfg.service_names.is_empty() {
         anyhow::bail!(
-            "custom proxy route `{name}` must specify at least one `service_names` entry",
+            "custom proxy route `{name}` must specify at least one `service-names` entry",
             name = cfg.name
         );
     } else {
@@ -1055,6 +1085,52 @@ mod tests {
         match settings.log_sink {
             Some(LogSink::Directory { dir, .. }) => assert_eq!(dir, PathBuf::from("/cli-dir")),
             other => panic!("unexpected log_sink: {other:?}"),
+        }
+    }
+
+    /// 回帰テスト: 設定ファイルの空の `log-file` / `log-dir` は、キー名を挙げて起動時に拒否する。
+    ///
+    /// CLI と環境変数の空パスは clap と main が弾くが、設定ファイルの空文字だけが素通りして
+    /// いた。`log-dir = ""` では日次ファイルが CWD 直下に開かれ、保持期間による削除も効かない。
+    #[test]
+    fn merge_rejects_empty_sink_paths_from_the_config_file() {
+        for (key, body) in [
+            ("log-file", "log-file = \"\"\n"),
+            ("log-dir", "log-dir = \"\"\n"),
+        ] {
+            let config: Config = toml::from_str(body).unwrap();
+            let error = Settings::merge_with_home(empty_cli(), config, None).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(&format!("`{key}` in the config file is empty")),
+                "設定ファイルのキー名で指摘する: {rendered}"
+            );
+        }
+    }
+
+    /// CLI / 環境変数の出力先が勝つ場合は、採用しない設定ファイルの空パスで起動を止めない。
+    #[test]
+    fn merge_cli_sink_wins_over_empty_config_sink_paths() {
+        for body in ["log-file = \"\"\n", "log-dir = \"\"\n"] {
+            let config: Config = toml::from_str(body).unwrap();
+
+            let mut cli = empty_cli();
+            cli.log_dir = Some(PathBuf::from("/cli-dir"));
+            let settings = Settings::merge_with_home(cli, config.clone(), None).unwrap();
+            match settings.log_sink {
+                Some(LogSink::Directory { dir, .. }) => {
+                    assert_eq!(dir, PathBuf::from("/cli-dir"));
+                }
+                other => panic!("unexpected log_sink for {body:?}: {other:?}"),
+            }
+
+            let mut cli = empty_cli();
+            cli.log_file = Some(PathBuf::from("/cli.jsonl"));
+            let settings = Settings::merge_with_home(cli, config, None).unwrap();
+            match settings.log_sink {
+                Some(LogSink::File(path)) => assert_eq!(path, PathBuf::from("/cli.jsonl")),
+                other => panic!("unexpected log_sink for {body:?}: {other:?}"),
+            }
         }
     }
 
@@ -1581,7 +1657,7 @@ mod tests {
         };
 
         let err = Settings::merge_with_home(cli, config, None).unwrap_err();
-        assert!(err.to_string().contains("empty `service_names`"));
+        assert!(err.to_string().contains("empty `service-names`"));
     }
 
     /// custom route は endpoint 必須。空 endpoint を許すと worker 起動後の全送信が
@@ -1636,8 +1712,79 @@ mod tests {
 
         let err = Settings::merge_with_home(cli, config, None).unwrap_err();
         assert!(
-            err.to_string().contains("at least one `service_names`"),
-            "service_names 未指定の custom route は拒否する: {err}"
+            err.to_string().contains("at least one `service-names`"),
+            "service-names 未指定の custom route は拒否する: {err}"
+        );
+    }
+
+    /// 回帰テスト: `service-names` のエラーは、設定ファイルに書くキー名で案内する。
+    ///
+    /// `ProxyRouteConfig` は kebab-case + `deny_unknown_fields` なので、修正前に案内していた
+    /// Rust のフィールド名 (`service_names`) の通りに直すと、設定ファイルの parse で落ちていた。
+    #[test]
+    fn proxy_service_names_errors_name_the_config_key_that_parses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let load_route = |service_names: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "[[proxy.routes]]\nname = \"custom\"\nendpoint = \"https://collector.example\"\n\
+                     {service_names}\n"
+                ),
+            )
+            .unwrap();
+            Config::load(Some(&path))
+        };
+
+        for (case, service_names) in [
+            ("empty entry", "service-names = [\"\"]"),
+            ("missing entry", ""),
+        ] {
+            let config = load_route(service_names).unwrap();
+            let error = Settings::merge_with_home(cli_with_log_file(), config, None).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("`service-names`"), "{case}: {rendered}");
+            assert!(!rendered.contains("service_names"), "{case}: {rendered}");
+        }
+
+        // 案内どおりに書いた route は parse と merge を通る。
+        let config = load_route("service-names = [\"my-service\"]").unwrap();
+        let settings = Settings::merge_with_home(cli_with_log_file(), config, None).unwrap();
+        let routes = settings.proxy.expect("proxy should be configured").routes;
+        assert_eq!(routes[0].service_names, vec!["my-service".to_string()]);
+
+        // 修正前の案内 (Rust のフィールド名) は、設定ファイルのキーとしては通らない。
+        assert!(load_route("service_names = [\"my-service\"]").is_err());
+    }
+
+    /// 回帰テスト: `[proxy]` の空の `checkpoint-dir` も、設定ファイルから採用するときだけ拒否する。
+    #[test]
+    fn merge_proxy_rejects_empty_checkpoint_dir_from_the_config_file() {
+        let config: Config = toml::from_str(
+            "[proxy]\ncheckpoint-dir = \"\"\n\n[[proxy.routes]]\nname = \"anthropic\"\n\
+             endpoint = \"https://collector.example:4317\"\n",
+        )
+        .unwrap();
+
+        let error =
+            Settings::merge_with_home(cli_with_log_file(), config.clone(), None).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("`proxy.checkpoint-dir` in the config file is empty"),
+            "{rendered}"
+        );
+
+        // CLI / 環境変数の指定が勝つなら、設定ファイルの空文字は採用されないので起動を止めない。
+        let mut cli = cli_with_log_file();
+        cli.proxy_checkpoint_dir = Some(PathBuf::from("/cli-checkpoints"));
+        let settings = Settings::merge_with_home(cli, config, None).unwrap();
+        assert_eq!(
+            settings
+                .proxy
+                .expect("proxy should be configured")
+                .checkpoint_dir,
+            PathBuf::from("/cli-checkpoints")
         );
     }
 
