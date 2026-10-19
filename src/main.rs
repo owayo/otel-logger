@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use otel_logger::cli::{Cli, Commands, Settings};
 use otel_logger::config::{self, Config, InitOutcome, InitProfile};
+use otel_logger::diagnostics::{self, DiagnosticGuard};
 use otel_logger::forward;
 use otel_logger::path::expand_current_user_path;
 use otel_logger::server;
@@ -22,7 +23,8 @@ const BLOCKING_TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 fn main() -> Result<()> {
     clear_empty_otel_logger_env();
     let cli = Cli::parse();
-    init_tracing();
+    // drop した時点で、溜まっている診断ログを書き出す (main のどの経路で返っても通る)。
+    let _diagnostics = init_tracing()?;
 
     if let Some(Commands::Init {
         path,
@@ -160,7 +162,9 @@ fn clear_empty_otel_logger_env() {
     }
 }
 
-fn init_tracing() {
+/// 診断ログ (tracing) を stderr へ出す設定をする。返した guard を `main` の終わりまで
+/// 持っておくと、終了時に溜まっている診断ログを期限まで書き出す。
+fn init_tracing() -> Result<DiagnosticGuard> {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
 
@@ -168,17 +172,21 @@ fn init_tracing() {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // stderr へは専用スレッドから書く。受信処理が出す診断ログが、読まれない stderr の
+    // write(2) で ACK を止めないようにする (diagnostics モジュールの説明を参照)。
+    let (writer, guard) = diagnostics::stderr().context("start the diagnostics writer thread")?;
     fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(move || writer.clone())
         .with_ansi(otel_logger::cli::color_enabled_for_stderr())
-        // stderr へ書けないとき (ディスク満杯の ENOSPC、読み手の消えた pipe の EPIPE)、
-        // `fmt()` の既定では代わりに `eprintln!` で内部エラーを出そうとし、その書き込みも
-        // 失敗して panic する。ログを出した task ごと落ちるため、pretty writer が止まる、
-        // 保存済みの batch に 503 を返して再送で JSONL が重複する、SIGTERM を受けた
-        // task が落ちて以後のシグナルが無視される、という形で受信と終了処理に波及する。
-        // 書けない診断ログは、書けないまま捨てる。
+        // `fmt()` の既定では、writer への書き込みに失敗すると代わりに `eprintln!` で内部
+        // エラーを出そうとし、stderr が書けない (ディスク満杯の ENOSPC、読み手の消えた pipe の
+        // EPIPE) とその書き込みも失敗して panic する。ログを出した task ごと落ち、pretty writer
+        // の停止、保存済みの batch への 503 (再送で JSONL が重複する)、シグナル task の終了
+        // (以後の SIGTERM が無視される) につながった。DiagnosticWriter は失敗を返さないが、
+        // 書けない診断ログを panic に変える経路は両方で塞いでおく。
         .log_internal_errors(false)
         .init();
+    Ok(guard)
 }

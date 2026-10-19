@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod cli;
 pub mod config;
+pub mod diagnostics;
 pub mod format;
 pub mod forward;
 pub mod grpc;

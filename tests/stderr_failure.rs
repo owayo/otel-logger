@@ -24,6 +24,11 @@ const CUMULATIVE_METRICS: &str = r#"{"resourceMetrics":[{"resource":{"attributes
 fn spawn_with_closed_stderr(config: &Path, args: &[&str]) -> io::Result<Child> {
     let (reader, writer) = io::pipe()?;
     drop(reader);
+    spawn_with_stderr(config, args, writer)
+}
+
+/// 指定した stderr で otel-logger を起動する。
+fn spawn_with_stderr(config: &Path, args: &[&str], stderr: impl Into<Stdio>) -> io::Result<Child> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_otel-logger"));
     // 開発者や CI の環境変数で出力先・proxy・ログの水準が変わらないようにする。
     for (key, _) in std::env::vars_os() {
@@ -39,7 +44,7 @@ fn spawn_with_closed_stderr(config: &Path, args: &[&str]) -> io::Result<Child> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(writer)
+        .stderr(stderr)
         .spawn()
 }
 
@@ -173,6 +178,60 @@ fn batch_is_acknowledged_once_when_stderr_is_a_closed_pipe() {
         "保存済みの batch に失敗を返すと再送で重複する"
     );
     assert_eq!(lines.unwrap(), 1);
+}
+
+/// 回帰テスト: 読み手が読まない stderr でも、診断ログの書き込みで ACK を止めない。
+///
+/// `2>&1 | less` でスクロールを止めた場合や、Docker / systemd の log driver が詰まった場合、
+/// stderr の pipe は満杯のまま読まれない。修正前は JSONL へ保存した後の WARN が write(2) で
+/// 止まり、応答が返らなかった (exporter は timeout して再送し、JSONL に重複して書く)。
+#[test]
+fn ack_is_not_blocked_by_a_stalled_stderr_pipe() {
+    /// 1 batch ごとに WARN が 1 行 (約 130 byte) 出る。pipe の容量 (Linux / macOS は 64KiB、
+    /// Windows はそれ以下) を十分に超える数を送る。
+    const BATCHES: usize = 2000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = empty_config(dir.path()).unwrap();
+    let jsonl = dir.path().join("otel-logger.jsonl");
+    let http_port = free_port();
+    let grpc_addr = format!("127.0.0.1:{}", free_port());
+    let http_addr = format!("127.0.0.1:{http_port}");
+    // 読み出し側を持ったまま、読まない。
+    let (stalled_reader, writer) = io::pipe().unwrap();
+    let mut child = spawn_with_stderr(
+        &config,
+        &[
+            "--no-stdout",
+            "--log-file",
+            jsonl.to_str().unwrap(),
+            "--grpc-addr",
+            &grpc_addr,
+            "--http-addr",
+            &http_addr,
+        ],
+        writer,
+    )
+    .unwrap();
+    wait_until_listening(&mut child, http_port);
+
+    let mut failure = None;
+    for sent in 0..BATCHES {
+        match post_json(http_port, "/v1/metrics", CUMULATIVE_METRICS) {
+            Ok(200) => {}
+            other => {
+                failure = Some(format!("{sent} 件目で {other:?}"));
+                break;
+            }
+        }
+    }
+    let lines = std::fs::read_to_string(&jsonl).map(|text| text.lines().count());
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(stalled_reader);
+
+    assert_eq!(failure, None, "stderr が詰まっても応答を返し続ける");
+    assert_eq!(lines.unwrap(), BATCHES);
 }
 
 /// 回帰テスト: 診断ログが書けなくても SIGTERM で終了する。
