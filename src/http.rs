@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use anyhow::Context as _;
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,6 +23,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::decompression::RequestDecompressionLayer;
 
+use crate::admission::{ReceiveLimits, ReceivePermit, Rejected};
 use crate::server::OTLP_MAX_REQUEST_BYTES;
 use crate::sink::{Sink, TelemetryRecord};
 
@@ -43,6 +44,18 @@ enum HttpError {
     BadProtobuf(#[from] prost::DecodeError),
     #[error("failed to decode JSON body: {0}")]
     BadJson(#[from] serde_json::Error),
+    /// body を読めなかった (gzip の展開に失敗した、接続が切れたなど)。
+    #[error("failed to read request body: {0}")]
+    BadBody(#[source] axum::Error),
+    /// 展開後の body が `OTLP_MAX_REQUEST_BYTES` を超えた。
+    #[error("request body exceeds {OTLP_MAX_REQUEST_BYTES} bytes")]
+    BodyTooLarge,
+    /// 受信の枠が空かなかった (`admission`)。
+    #[error("{}", .0.message())]
+    Busy(Rejected),
+    /// 受け付けからの期限までに body を読み終えなかった。
+    #[error("request body was not received before the deadline; retry later")]
+    BodyTimeout,
     /// JSONL への永続化に失敗した。受信した payload を欠落させたくないので
     /// クライアントに retry 可能な応答を返し、OTLP exporter 側で再送させる。
     #[error("failed to persist telemetry: {0}")]
@@ -53,14 +66,64 @@ impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         let status = match &self {
             HttpError::UnsupportedContentType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            HttpError::BadProtobuf(_) | HttpError::BadJson(_) => StatusCode::BAD_REQUEST,
+            HttpError::BadProtobuf(_) | HttpError::BadJson(_) | HttpError::BadBody(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            HttpError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             // OTLP/HTTP が retry を許すのは 429 / 502 / 503 / 504 だけで、それ以外の
             // 4xx / 5xx は "MUST NOT be retried" (client は payload を drop する)。
-            // 500 を返すと再送されず欠測するため、503 で retry させる。
-            HttpError::Persistence(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // 500 を返すと再送されず欠測するため、503 で retry させる。受信の上限と期限で
+            // 断った request も、保存前なので同じく 503 で再送させる (408 は retry できない)。
+            HttpError::Busy(_) | HttpError::BodyTimeout | HttpError::Persistence(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         };
         (status, self.to_string()).into_response()
     }
+}
+
+/// 受信の枠を取ってから、受け付けからの期限までに body を読み切る。
+///
+/// 枠は body を読む前に取る。展開後の body (最大 32MiB) を溜め始めてから上限を数えても
+/// 総メモリは抑えられない。期限は request 全体ではなく受信だけに掛ける。保存の後で
+/// 打ち切ると、保存済みの batch に失敗を返して exporter の再送で JSONL が重複する。
+async fn receive_body(
+    limits: &ReceiveLimits,
+    body: Body,
+) -> Result<(ReceivePermit, Bytes), HttpError> {
+    let deadline = limits.deadline();
+    let permit = limits.admit(deadline).await.map_err(HttpError::Busy)?;
+    // body は `RequestDecompressionLayer` で展開されるので、上限は展開後のバイト数に効く
+    // (仕様が要求する "including after decompression")。
+    let bytes =
+        match tokio::time::timeout_at(deadline, axum::body::to_bytes(body, OTLP_MAX_REQUEST_BYTES))
+            .await
+        {
+            Err(_) => return Err(HttpError::BodyTimeout),
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) if exceeds_length_limit(&error) => return Err(HttpError::BodyTooLarge),
+            Ok(Err(error)) => return Err(HttpError::BadBody(error)),
+        };
+    Ok((permit, bytes))
+}
+
+/// `to_bytes` の失敗が、上限を超えたためか判定する。
+fn exceeds_length_limit(error: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// HTTP の handler が共有する状態。
+#[derive(Clone)]
+struct HttpState {
+    sink: Sink,
+    limits: ReceiveLimits,
 }
 
 fn detect_encoding(headers: &HeaderMap) -> Result<Encoding, HttpError> {
@@ -120,14 +183,21 @@ where
     }
 }
 
+// Content-Type の判定は枠を取る前に行う (415 で断る request に枠を使わない)。
+// decode した request を保存し終えるまで枠を持ち、保存の task へも渡す。
+
 async fn handle_traces(
-    State(sink): State<Sink>,
+    State(state): State<HttpState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
+    let (permit, body) = receive_body(&state.limits, body).await?;
     let req: ExportTraceServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Traces(Box::new(req)))
+    drop(body);
+    state
+        .sink
+        .record_with_permit(TelemetryRecord::Traces(Box::new(req)), Some(permit))
         .await
         .map_err(HttpError::Persistence)?;
     Ok(encode_response(
@@ -139,13 +209,17 @@ async fn handle_traces(
 }
 
 async fn handle_metrics(
-    State(sink): State<Sink>,
+    State(state): State<HttpState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
+    let (permit, body) = receive_body(&state.limits, body).await?;
     let req: ExportMetricsServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Metrics(Box::new(req)))
+    drop(body);
+    state
+        .sink
+        .record_with_permit(TelemetryRecord::Metrics(Box::new(req)), Some(permit))
         .await
         .map_err(HttpError::Persistence)?;
     Ok(encode_response(
@@ -157,13 +231,17 @@ async fn handle_metrics(
 }
 
 async fn handle_logs(
-    State(sink): State<Sink>,
+    State(state): State<HttpState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, HttpError> {
     let encoding = detect_encoding(&headers)?;
+    let (permit, body) = receive_body(&state.limits, body).await?;
     let req: ExportLogsServiceRequest = decode_request(encoding, &body)?;
-    sink.record(TelemetryRecord::Logs(Box::new(req)))
+    drop(body);
+    state
+        .sink
+        .record_with_permit(TelemetryRecord::Logs(Box::new(req)), Some(permit))
         .await
         .map_err(HttpError::Persistence)?;
     Ok(encode_response(
@@ -178,7 +256,8 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn handle_stats(State(sink): State<Sink>) -> Json<StatsResponse> {
+async fn handle_stats(State(state): State<HttpState>) -> Json<StatsResponse> {
+    let sink = &state.sink;
     let usage = sink.aggregator().snapshot();
     // proxy が設定されていれば route ごとの累計を含めて返す。
     let proxy = sink.proxy().map(|router| {
@@ -199,20 +278,19 @@ struct StatsResponse {
     proxy: Option<std::collections::BTreeMap<String, crate::forward::RouteMetricsSnapshot>>,
 }
 
-pub fn router(sink: Sink) -> Router {
+/// OTLP/HTTP の router。`limits` は gRPC 側と共有する (受信の上限はプロセス全体で 1 つ)。
+pub fn router(sink: Sink, limits: ReceiveLimits) -> Router {
     Router::new()
         .route("/v1/traces", post(handle_traces))
         .route("/v1/metrics", post(handle_metrics))
         .route("/v1/logs", post(handle_logs))
         .route("/healthz", get(health))
         .route("/stats", get(handle_stats))
-        .with_state(sink)
-        // 既定 (2MiB) では大きな batch が抽出前に 413 で拒否されるため、上限を引き上げる。
-        .layer(DefaultBodyLimit::max(OTLP_MAX_REQUEST_BYTES))
+        .with_state(HttpState { sink, limits })
         // `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` の exporter は body を圧縮して送る。
         // 解凍しないと decode 失敗で 400 を返し、OTLP 仕様上 400 は retry 禁止なので
-        // batch が恒久的に失われる。DefaultBodyLimit より外側に置くことで、size 上限は
-        // 解凍後の body に対して効く (仕様が要求する "including after decompression")。
+        // batch が恒久的に失われる。size 上限は handler の `to_bytes` が、ここで展開した
+        // 後の body に対して掛ける (仕様が要求する "including after decompression")。
         .layer(RequestDecompressionLayer::new().gzip(true))
 }
 
@@ -229,12 +307,13 @@ async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 pub async fn serve(
     addr: SocketAddr,
     sink: Sink,
+    limits: ReceiveLimits,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let listener = bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!(addr = %local, "OTLP/HTTP server listening");
-    let app = router(sink);
+    let app = router(sink, limits);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await?;
@@ -246,12 +325,22 @@ mod tests {
     use super::*;
 
     /// JSONL も stdout も出さない最小構成。router のテストで共有する。
+    /// テスト用の受信上限 (既定値と同じ)。
+    fn test_limits() -> ReceiveLimits {
+        ReceiveLimits::new(
+            crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            crate::admission::DEFAULT_RECEIVE_TIMEOUT,
+        )
+    }
+
     fn no_output_settings() -> crate::cli::Settings {
         use crate::cli::{ColorMode, Settings};
 
         Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: None,
             no_stdout: true,
             pretty_log_dir: None,
@@ -348,6 +437,8 @@ mod tests {
         let settings = Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: None,
             no_stdout: true,
             pretty_log_dir: None,
@@ -357,7 +448,7 @@ mod tests {
             proxy: None,
         };
         let sink = Sink::from_settings(&settings).await.unwrap();
-        let app = router(sink);
+        let app = router(sink, test_limits());
 
         // axum 既定の 2MiB を超えるが OTLP_MAX_REQUEST_BYTES (32MiB) には収まる body。
         // 中身は不正な protobuf なので、size 制限を通過できれば decode 失敗で 400 になる。
@@ -423,7 +514,7 @@ mod tests {
         use tower::ServiceExt as _;
 
         let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
-        let app = router(sink);
+        let app = router(sink, test_limits());
         let body = vec![0u8; crate::server::OTLP_MAX_REQUEST_BYTES + 1];
         let request = Request::builder()
             .method("POST")
@@ -448,7 +539,7 @@ mod tests {
         use tower::ServiceExt as _;
 
         let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
-        let app = router(sink);
+        let app = router(sink, test_limits());
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
             .write_all(&vec![0u8; crate::server::OTLP_MAX_REQUEST_BYTES + 1])
@@ -465,6 +556,85 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// 回帰テスト: gzip の body を送り切らない request は、受け付けからの期限で retryable な
+    /// 503 を返し、受信の枠を返す。
+    ///
+    /// 期限が無かった頃は、終端を送らずに止めた接続が展開後の body (最大 32MiB) を抱えたまま
+    /// 居座り、8 接続・合計 245KB の送信で RSS が 15MB から 264MB に増えて戻らなかった。
+    #[tokio::test(start_paused = true)]
+    async fn stalled_gzip_body_gets_a_retryable_status_at_the_deadline() {
+        use std::io::Write as _;
+
+        use axum::http::Request;
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tonic::codegen::tokio_stream::{self as stream, StreamExt as _};
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let app = router(
+            sink,
+            ReceiveLimits::new(1, std::time::Duration::from_millis(200)),
+        );
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        // gzip の前半だけを送り、残りは送らずに止める。
+        let head = Bytes::copy_from_slice(&compressed[..compressed.len() / 2]);
+        let body = Body::from_stream(
+            stream::iter([Ok::<_, std::io::Error>(head)]).chain(stream::pending()),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, PROTOBUF_CT)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(body)
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 枠は戻っているので、次の request は通る。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, JSON_CT)
+            .body(Body::from(r#"{"resourceLogs":[]}"#))
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// 処理中の上限に達したら、期限まで空きを待つ。間に合わなければ retryable な 503 を返し、
+    /// 期限内に空けば通す (瞬間的な重なりで断ると、retry しない exporter では欠測する)。
+    #[tokio::test(start_paused = true)]
+    async fn requests_over_the_inflight_limit_wait_for_a_free_slot() {
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
+        let limits = ReceiveLimits::new(1, std::time::Duration::from_millis(200));
+        let app = router(sink, limits.clone());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/logs")
+                .header(header::CONTENT_TYPE, JSON_CT)
+                .body(Body::from(r#"{"resourceLogs":[]}"#))
+                .unwrap()
+        };
+        let held = limits.admit(limits.deadline()).await.unwrap();
+
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let waiting = tokio::spawn(app.oneshot(request()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        let response = waiting.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// `/v1/traces` と `/v1/metrics` も実際に配線されていること。logs だけを叩く
     /// テストしか無いと、handler を取り違えて配線しても気づけない。
     #[tokio::test]
@@ -479,7 +649,7 @@ mod tests {
             ("/v1/metrics", r#"{"resourceMetrics":[]}"#),
         ] {
             let sink = Sink::from_settings(&no_output_settings()).await.unwrap();
-            let app = router(sink);
+            let app = router(sink, test_limits());
             let request = Request::builder()
                 .method("POST")
                 .uri(path)
@@ -509,7 +679,7 @@ mod tests {
         let mut settings = no_output_settings();
         settings.log_sink = Some(crate::cli::LogSink::File(path.clone()));
         let sink = Sink::from_settings(&settings).await.unwrap();
-        let app = router(sink);
+        let app = router(sink, test_limits());
         for signal in ["logs", "traces", "metrics"] {
             let request = Request::builder()
                 .method("POST")
@@ -566,7 +736,7 @@ mod tests {
             .header(header::CONTENT_TYPE, JSON_CT)
             .body(Body::from(payload.to_string()))
             .unwrap();
-        let response = router(sink).oneshot(request).await.unwrap();
+        let response = router(sink, test_limits()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let saved = std::fs::read_to_string(path).unwrap();
@@ -612,6 +782,8 @@ mod tests {
         let settings = Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: None,
             no_stdout: true,
             pretty_log_dir: None,
@@ -621,7 +793,7 @@ mod tests {
             proxy: None,
         };
         let sink = Sink::from_settings(&settings).await.unwrap();
-        let app = router(sink);
+        let app = router(sink, test_limits());
 
         // 解凍されなければ gzip のマジックバイトを protobuf として読もうとして失敗する。
         let payload = ExportLogsServiceRequest {

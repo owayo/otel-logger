@@ -5,8 +5,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 
+use crate::admission::ReceiveLimits;
 use crate::cli::Settings;
-use crate::grpc::OtlpService;
+use crate::grpc::{AdmissionLayer, OtlpService};
 use crate::http;
 use crate::sink::Sink;
 
@@ -55,7 +56,13 @@ fn bind_grpc(addr: SocketAddr) -> Result<TcpIncoming> {
 }
 
 /// `shutdown` が cancel されるまで、`addr` で OTLP/gRPC server を動かす。
-pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToken) -> Result<()> {
+/// `limits` は HTTP 側と共有する (受信の上限はプロセス全体で 1 つ)。
+pub async fn serve_grpc(
+    addr: SocketAddr,
+    sink: Sink,
+    limits: ReceiveLimits,
+    shutdown: CancellationToken,
+) -> Result<()> {
     // bind してから「listening」を出す (HTTP 側の `http::serve` と同じ順序)。
     let incoming = bind_grpc(addr)?;
     let local = incoming.local_addr()?;
@@ -88,7 +95,10 @@ pub async fn serve_grpc(addr: SocketAddr, sink: Sink, shutdown: CancellationToke
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
         // `timeout()` と `load_shed()` は付けない。前者は JSONL 保存後・ACK 前に
         // 発火すると exporter の retry で二重計上を招き、後者は `Overloaded` が
-        // `Status` に変換されず接続レベルのエラーとして漏れる。
+        // `Status` に変換されず接続レベルのエラーとして漏れる。代わりに受信の上限と
+        // 期限を `AdmissionLayer` で掛け、断る時は保存前に明示的な Unavailable を返す。
+        // 接続ごとの stream 数の上限だけでは、接続を増やせば総メモリを抑えられない。
+        .layer(AdmissionLayer::new(limits))
         .add_service(trace_srv)
         .add_service(metrics_srv)
         .add_service(logs_srv)
@@ -163,18 +173,21 @@ pub async fn run(settings: Settings, sink: Sink) -> Result<()> {
     // join できるように handle を持っておく。ここでは proxy handle は main が持っており、
     // sink 側は router 参照のみ。worker join は main で行う。
 
+    // 受信の上限はプロセス全体で 1 つ。HTTP と gRPC で別々に持つと、合計が倍になる。
+    let limits = ReceiveLimits::new(settings.max_inflight_requests, settings.receive_timeout);
     let mut grpc_handle = {
         let sink = sink.clone();
+        let limits = limits.clone();
         let token = shutdown.clone();
         let addr = settings.grpc_addr;
-        tokio::spawn(async move { serve_grpc(addr, sink, token).await })
+        tokio::spawn(async move { serve_grpc(addr, sink, limits, token).await })
     };
     let grpc_id = grpc_handle.id();
     let mut http_handle = {
         let sink = sink.clone();
         let token = shutdown.clone();
         let addr = settings.http_addr;
-        tokio::spawn(async move { http::serve(addr, sink, token).await })
+        tokio::spawn(async move { http::serve(addr, sink, limits, token).await })
     };
     let http_id = http_handle.id();
 

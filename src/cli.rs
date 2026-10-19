@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -37,6 +38,24 @@ pub struct Cli {
     /// OTLP/HTTP の bind address (仕様上のポートは 4318)。
     #[arg(long, env = "OTEL_LOGGER_HTTP_ADDR", value_name = "ADDR")]
     pub http_addr: Option<SocketAddr>,
+
+    /// Maximum number of OTLP requests received and saved at once (HTTP and gRPC combined).
+    /// Requests over it wait for a free slot until `--receive-timeout-ms`, then get a
+    /// retryable 503 / UNAVAILABLE.
+    /// 同時に受信・保存する OTLP request 数の上限 (HTTP と gRPC の合計)。
+    /// 超えた分は `--receive-timeout-ms` まで空きを待ち、間に合わなければ retry できる
+    /// 503 / UNAVAILABLE を返す。body を読む前に枠を取るので、gzip を展開した body を
+    /// 際限なく抱えない。既定値は 8。
+    #[arg(long, env = "OTEL_LOGGER_MAX_INFLIGHT_REQUESTS", value_name = "N")]
+    pub max_inflight_requests: Option<usize>,
+
+    /// Time limit in milliseconds from accepting an OTLP request until its body has been read,
+    /// including the wait for a free slot. Requests over it get a retryable 503 / UNAVAILABLE.
+    /// OTLP request を受け付けてから body を読み終えるまでの期限 (ミリ秒、空きを待つ時間を含む)。
+    /// 超えたら retry できる 503 / UNAVAILABLE を返す。保存と集計はこの期限で打ち切らない。
+    /// 既定値は 5000。
+    #[arg(long, env = "OTEL_LOGGER_RECEIVE_TIMEOUT_MS", value_name = "MS")]
+    pub receive_timeout_ms: Option<u64>,
 
     /// Persist received telemetry as lossless JSON Lines into this file.
     /// 受信した telemetry を欠落のない JSON Lines としてこのファイルへ保存する。
@@ -366,6 +385,10 @@ pub struct ProxySettings {
 pub struct Settings {
     pub grpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
+    /// 同時に受信・保存する OTLP request 数の上限 (`admission::ReceiveLimits`)。
+    pub max_inflight_requests: usize,
+    /// 受け付けから body を読み終えるまでの期限 (空きを待つ時間を含む)。
+    pub receive_timeout: Duration,
     pub log_sink: Option<LogSink>,
     pub no_stdout: bool,
     /// `--pretty-log` の書き出し先 (無効なら `None`)。優先順位を解決した後の `log-dir` と
@@ -459,6 +482,25 @@ impl Settings {
             home,
         )?;
 
+        // 0 は「何も受け付けない」設定ミスなので、既定値で置き換えずに起動を止める。
+        let max_inflight_requests = cli
+            .max_inflight_requests
+            .or(config.max_inflight_requests)
+            .unwrap_or(crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS);
+        anyhow::ensure!(
+            (1..=crate::admission::MAX_INFLIGHT_REQUESTS).contains(&max_inflight_requests),
+            "`max-inflight-requests` must be between 1 and {}",
+            crate::admission::MAX_INFLIGHT_REQUESTS
+        );
+        let receive_timeout = cli.receive_timeout_ms.or(config.receive_timeout_ms).map_or(
+            crate::admission::DEFAULT_RECEIVE_TIMEOUT,
+            Duration::from_millis,
+        );
+        anyhow::ensure!(
+            !receive_timeout.is_zero(),
+            "`receive-timeout-ms` must be greater than 0"
+        );
+
         Ok(Self {
             grpc_addr: cli
                 .grpc_addr
@@ -468,6 +510,8 @@ impl Settings {
                 .http_addr
                 .or(config.http_addr)
                 .unwrap_or_else(|| DEFAULT_HTTP_ADDR.parse().expect("valid default")),
+            max_inflight_requests,
+            receive_timeout,
             log_sink,
             // CLI / 環境変数 > 設定ファイル > 既定値。`||` で合成すると、環境変数の
             // 明示的な `false` が設定ファイルの `true` に負けて優先順位が逆転する。
@@ -947,6 +991,8 @@ mod tests {
             config: None,
             grpc_addr: None,
             http_addr: None,
+            max_inflight_requests: None,
+            receive_timeout_ms: None,
             log_file: None,
             log_dir: None,
             log_keep_days: None,
@@ -1166,6 +1212,47 @@ mod tests {
         let settings = Settings::merge_with_home(cli, config, None).unwrap();
         assert!(!settings.no_stdout);
         assert!(!settings.summary);
+    }
+
+    /// 受信の上限と期限は CLI / 環境変数 > 設定ファイル > 既定値の順で決まる。0 は
+    /// 「何も受け付けない」設定ミスなので、既定値で置き換えずに起動時に拒否する。
+    #[test]
+    fn merge_receive_limits_follow_precedence_and_reject_zero() {
+        use crate::admission::{DEFAULT_MAX_INFLIGHT_REQUESTS, DEFAULT_RECEIVE_TIMEOUT};
+
+        let limits =
+            |settings: Settings| (settings.max_inflight_requests, settings.receive_timeout);
+        let defaults = Settings::merge_with_home(empty_cli(), Config::default(), None).unwrap();
+        assert_eq!(
+            limits(defaults),
+            (DEFAULT_MAX_INFLIGHT_REQUESTS, DEFAULT_RECEIVE_TIMEOUT)
+        );
+
+        let config = Config {
+            max_inflight_requests: Some(3),
+            receive_timeout_ms: Some(1500),
+            ..Config::default()
+        };
+        let from_config = Settings::merge_with_home(empty_cli(), config.clone(), None).unwrap();
+        assert_eq!(limits(from_config), (3, Duration::from_millis(1500)));
+
+        let mut cli = empty_cli();
+        cli.max_inflight_requests = Some(5);
+        cli.receive_timeout_ms = Some(250);
+        let from_cli = Settings::merge_with_home(cli, config, None).unwrap();
+        assert_eq!(limits(from_cli), (5, Duration::from_millis(250)));
+
+        let mut zero_inflight = empty_cli();
+        zero_inflight.max_inflight_requests = Some(0);
+        let mut zero_timeout = empty_cli();
+        zero_timeout.receive_timeout_ms = Some(0);
+        for (cli, key) in [
+            (zero_inflight, "max-inflight-requests"),
+            (zero_timeout, "receive-timeout-ms"),
+        ] {
+            let error = Settings::merge_with_home(cli, Config::default(), None).unwrap_err();
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 
     /// 回帰テスト: proxy header のパースエラーに値を載せない。

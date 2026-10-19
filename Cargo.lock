@@ -1184,6 +1184,7 @@ dependencies = [
  "clap",
  "flate2",
  "http",
+ "http-body-util",
  "httpdate",
  "is-terminal",
  "opentelemetry-proto",

@@ -14,6 +14,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use serde::Serialize;
 
+use crate::admission::ReceivePermit;
 use crate::aggregator::Aggregator;
 use crate::cli::{LogSink, Settings};
 use crate::format;
@@ -824,6 +825,18 @@ impl Sink {
     /// 人が読める出力 (stdout / pretty-log) はベストエフォートで、書き込みに失敗しても
     /// tracing にだけ記録する。
     pub async fn record(&self, record: TelemetryRecord) -> Result<()> {
+        self.record_with_permit(record, None).await
+    }
+
+    /// `record` と同じく保存し、受信の枠 (`ReceivePermit`) を保存が終わるまで持つ。
+    ///
+    /// 枠は保存の task へ移す。handler が cancel されても保存が終わるまで枠を返さないため、
+    /// cancel を繰り返して上限を超える数の保存を同時に走らせることはできない。
+    pub async fn record_with_permit(
+        &self,
+        record: TelemetryRecord,
+        permit: Option<ReceivePermit>,
+    ) -> Result<()> {
         let admission = Arc::clone(&self.inner.admission).read_owned().await;
         anyhow::ensure!(*admission, "JSONL sink is shutting down");
         let sink = self.clone();
@@ -831,6 +844,7 @@ impl Sink {
         // listener を abort した後に接続 task が残っても、最後の fsync を追い越せない。
         tokio::spawn(async move {
             let _admission = admission;
+            let _permit = permit;
             sink.record_admitted(record).await
         })
         .await
@@ -1879,6 +1893,8 @@ mod tests {
         crate::cli::Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: Some(LogSink::File(path)),
             no_stdout: true,
             pretty_log_dir: None,
@@ -1894,6 +1910,8 @@ mod tests {
         crate::cli::Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: Some(LogSink::Directory { dir, keep_days: 1 }),
             no_stdout: true,
             pretty_log_dir: None,

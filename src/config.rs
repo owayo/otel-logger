@@ -123,6 +123,12 @@ color = "auto"
 # grpc-addr = "0.0.0.0:4317"
 # http-addr = "0.0.0.0:4318"
 
+# 同時に受信・保存する OTLP request 数の上限 (HTTP と gRPC の合計) と、受け付けから
+# body を読み終えるまでの期限 (ミリ秒、空きを待つ時間を含む)。上限を超えた request は
+# 期限まで空きを待ち、間に合わなければ retry できる 503 / UNAVAILABLE を返します。
+# max-inflight-requests = 8
+# receive-timeout-ms = 5000
+
 # ------------------------------------------------------------
 # OTLP proxy 転送 (受信 → JSONL 保存 → 上流 collector へ forward)
 # ------------------------------------------------------------
@@ -209,6 +215,10 @@ pub struct Config {
     pub grpc_addr: Option<SocketAddr>,
     /// OTLP/HTTP の bind アドレス。
     pub http_addr: Option<SocketAddr>,
+    /// 同時に受信・保存する OTLP request 数の上限 (HTTP と gRPC の合計)。省略時は 8。
+    pub max_inflight_requests: Option<usize>,
+    /// 受け付けから body を読み終えるまでの期限 (ミリ秒、空きを待つ時間を含む)。省略時は 5000。
+    pub receive_timeout_ms: Option<u64>,
     /// 受信した telemetry を JSON Lines としてこのファイルへ保存する。
     /// `log_dir` とは同時に指定できない。
     pub log_file: Option<PathBuf>,

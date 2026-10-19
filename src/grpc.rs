@@ -1,3 +1,8 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use http_body_util::BodyExt as _;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
     LogsService, LogsServiceServer,
 };
@@ -17,8 +22,108 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use tonic::{Request, Response, Status};
+use tower_http::timeout::{DeadlineBody, TimeoutError};
 
+use crate::admission::{ReceiveLimits, ReceivePermit};
 use crate::sink::{Sink, TelemetryRecord};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// OTLP/gRPC の受信を `ReceiveLimits` で制限する tower layer。tonic の `Server` に挟む。
+///
+/// 生成された service は handler を呼ぶ前に body を読んで decode するので、handler の中で
+/// 枠を取っても遅い。ここで枠を取り、body には受け付けからの期限を掛ける。枠は request
+/// extension で handler へ渡し、handler は保存の task まで持たせる。
+#[derive(Clone)]
+pub struct AdmissionLayer {
+    limits: ReceiveLimits,
+}
+
+impl AdmissionLayer {
+    pub fn new(limits: ReceiveLimits) -> Self {
+        Self { limits }
+    }
+}
+
+impl<S> tower::Layer<S> for AdmissionLayer {
+    type Service = Admission<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Admission {
+            inner,
+            limits: self.limits.clone(),
+        }
+    }
+}
+
+/// `AdmissionLayer` が包んだ service。
+#[derive(Clone)]
+pub struct Admission<S> {
+    inner: S,
+    limits: ReceiveLimits,
+}
+
+impl<S> tower::Service<http::Request<tonic::body::Body>> for Admission<S>
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        // ready になった inner をこの request に使い、次の request には clone を残す
+        // (tower の middleware の慣例。tonic の router は clone しても常に ready)。
+        let ready = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, ready);
+        let limits = self.limits.clone();
+        Box::pin(async move {
+            let deadline = limits.deadline();
+            let permit = match limits.admit(deadline).await {
+                Ok(permit) => permit,
+                // OTLP では Unavailable が retryable。保存前なので exporter に再送させる。
+                Err(rejected) => return Ok(Status::unavailable(rejected.message()).into_http()),
+            };
+            let (mut parts, body) = request.into_parts();
+            parts.extensions.insert(permit.clone());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let body = tonic::body::Body::new(
+                DeadlineBody::new(remaining, body).map_err(deadline_exceeded_as_unavailable),
+            );
+            let response = inner.call(http::Request::from_parts(parts, body)).await;
+            // handler が保存の task へ clone を渡しているので、保存が終わるまで枠は戻らない。
+            drop(permit);
+            response
+        })
+    }
+}
+
+/// body の期限切れを retryable な `Unavailable` にする。tonic は body のエラーが `Status`
+/// でなければ `Unknown` (OTLP では retry できない) を返し、exporter は batch を捨てる。
+fn deadline_exceeded_as_unavailable(error: BoxError) -> BoxError {
+    if error.is::<TimeoutError>() {
+        Box::new(Status::unavailable(
+            "request body was not received before the deadline; retry later",
+        ))
+    } else {
+        error
+    }
+}
+
+/// handler が受け取った request の枠 (`AdmissionLayer` を通っていなければ `None`)。
+fn receive_permit<T>(request: &Request<T>) -> Option<ReceivePermit> {
+    request.extensions().get::<ReceivePermit>().cloned()
+}
 
 #[derive(Clone)]
 pub struct OtlpService {
@@ -59,9 +164,10 @@ impl TraceService for OtlpService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        let permit = receive_permit(&request);
         let payload = request.into_inner();
         self.sink
-            .record(TelemetryRecord::Traces(Box::new(payload)))
+            .record_with_permit(TelemetryRecord::Traces(Box::new(payload)), permit)
             .await
             .map_err(persistence_status)?;
         Ok(Response::new(ExportTraceServiceResponse {
@@ -76,9 +182,10 @@ impl MetricsService for OtlpService {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        let permit = receive_permit(&request);
         let payload = request.into_inner();
         self.sink
-            .record(TelemetryRecord::Metrics(Box::new(payload)))
+            .record_with_permit(TelemetryRecord::Metrics(Box::new(payload)), permit)
             .await
             .map_err(persistence_status)?;
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -93,9 +200,10 @@ impl LogsService for OtlpService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        let permit = receive_permit(&request);
         let payload = request.into_inner();
         self.sink
-            .record(TelemetryRecord::Logs(Box::new(payload)))
+            .record_with_permit(TelemetryRecord::Logs(Box::new(payload)), permit)
             .await
             .map_err(persistence_status)?;
         Ok(Response::new(ExportLogsServiceResponse {
@@ -113,6 +221,8 @@ mod tests {
         crate::cli::Settings {
             grpc_addr: "127.0.0.1:0".parse().unwrap(),
             http_addr: "127.0.0.1:0".parse().unwrap(),
+            max_inflight_requests: crate::admission::DEFAULT_MAX_INFLIGHT_REQUESTS,
+            receive_timeout: crate::admission::DEFAULT_RECEIVE_TIMEOUT,
             log_sink: Some(LogSink::File(path)),
             no_stdout: true,
             pretty_log_dir: None,
@@ -121,6 +231,93 @@ mod tests {
             dry_run: false,
             proxy: None,
         }
+    }
+
+    /// 応答の `grpc-status` header (`Status::into_http` が書く値)。
+    fn grpc_status(response: &http::Response<tonic::body::Body>) -> Option<i32> {
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// body を最後まで読み、読めなければその `Status` で応答する inner service。
+    /// `tonic::body::Body::new` は包んだ body のエラーを `Status::from_error` で変換するので、
+    /// ここで受け取るのは tonic の decoder が受け取るのと同じ `Status`。枠が request
+    /// extension で届いたかも記録する。
+    fn reading_service(
+        saw_permit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl tower::Service<
+        http::Request<tonic::body::Body>,
+        Response = http::Response<tonic::body::Body>,
+        Error = std::convert::Infallible,
+        Future = impl Send,
+    > + Clone
+    + Send
+    + 'static {
+        tower::service_fn(move |request: http::Request<tonic::body::Body>| {
+            let saw_permit = std::sync::Arc::clone(&saw_permit);
+            async move {
+                if request.extensions().get::<ReceivePermit>().is_some() {
+                    saw_permit.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let status = match request.into_body().collect().await {
+                    Ok(_) => Status::new(tonic::Code::Ok, ""),
+                    Err(status) => status,
+                };
+                Ok::<_, std::convert::Infallible>(status.into_http())
+            }
+        })
+    }
+
+    /// 回帰テスト: gRPC も body の受信に受け付けからの期限を掛け、期限切れは retryable な
+    /// `Unavailable` (14) にする。`Status` 以外の body エラーは tonic が `Unknown` にするため、
+    /// 変換しないと exporter は batch を捨てる。枠は handler へ request extension で渡す。
+    #[tokio::test(start_paused = true)]
+    async fn admission_layer_turns_a_stalled_body_into_unavailable() {
+        use tonic::codegen::tokio_stream as stream;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let saw_permit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = ReceiveLimits::new(1, std::time::Duration::from_millis(200));
+        let mut service =
+            AdmissionLayer::new(limits).layer(reading_service(std::sync::Arc::clone(&saw_permit)));
+        let stalled = axum::body::Body::from_stream(stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = http::Request::new(tonic::body::Body::new(stalled));
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(
+            grpc_status(&response),
+            Some(tonic::Code::Unavailable as i32)
+        );
+        assert!(saw_permit.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// 処理中の上限に達したまま期限が来たら、inner (decode と handler) を呼ばずに
+    /// retryable な `Unavailable` を返す。
+    #[tokio::test(start_paused = true)]
+    async fn admission_layer_rejects_with_unavailable_when_no_slot_frees() {
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let saw_permit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limits = ReceiveLimits::new(1, std::time::Duration::from_millis(200));
+        let _held = limits.admit(limits.deadline()).await.unwrap();
+        let mut service = AdmissionLayer::new(limits.clone())
+            .layer(reading_service(std::sync::Arc::clone(&saw_permit)));
+        let request = http::Request::new(tonic::body::Body::empty());
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(
+            grpc_status(&response),
+            Some(tonic::Code::Unavailable as i32)
+        );
+        assert!(
+            !saw_permit.load(std::sync::atomic::Ordering::SeqCst),
+            "枠を取れない request は decode しない"
+        );
     }
 
     /// JSONL 永続化失敗は gRPC で必ず retryable な `Unavailable` を返し、exporter 側に
