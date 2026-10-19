@@ -876,7 +876,8 @@ impl Sink {
     }
 
     async fn write_jsonl(&self, record: &TelemetryRecord) -> Result<()> {
-        let mut line = serde_json::to_vec(record).context("serialize telemetry to JSON")?;
+        // 非有限の double を `null` に潰さず保存する (proto_json の説明を参照)。
+        let mut line = crate::proto_json::to_vec(record).context("serialize telemetry to JSON")?;
         line.push(b'\n');
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1901,6 +1902,49 @@ mod tests {
             dry_run: false,
             proxy: None,
         }
+    }
+
+    /// 回帰テスト: JSONL は非有限の double を `null` に潰さず、proto3 JSON mapping の文字列で
+    /// 保存する。serde_json へ直接渡すと NaN が `null` になり、値を失ったまま 200 を返していた。
+    #[tokio::test]
+    async fn jsonl_keeps_non_finite_doubles() {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let sink = Sink::from_settings(&settings_with_log_file(path.clone()))
+            .await
+            .unwrap();
+        let gauge = Metric {
+            name: "gauge".into(),
+            data: Some(Data::Gauge(Gauge {
+                data_points: vec![NumberDataPoint {
+                    value: Some(NumberValue::AsDouble(f64::NAN)),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        };
+        sink.record(TelemetryRecord::Metrics(Box::new(
+            ExportMetricsServiceRequest {
+                resource_metrics: vec![ResourceMetrics {
+                    scope_metrics: vec![ScopeMetrics {
+                        metrics: vec![gauge],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            },
+        )))
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(line.contains(r#""asDouble":"NaN""#), "{line}");
     }
 
     #[tokio::test]

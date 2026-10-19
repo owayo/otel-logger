@@ -7,6 +7,7 @@ pub mod forward;
 pub mod grpc;
 pub mod http;
 pub mod path;
+mod proto_json;
 pub mod server;
 pub mod sink;
 mod storage;
