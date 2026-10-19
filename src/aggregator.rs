@@ -267,21 +267,17 @@ struct AggregatorInner {
 
     /// `conversation.id` 付きの SSE 完了ログを受信したが、対応する `conversation_starts`
     /// session 未受信のまま暫定 provider / effort バケットに入った usage の内訳。
-    /// 後から session が届いた conversation の分だけを確定バケットへ移すために使う。
-    /// 並行する別 conversation の usage を巻き込まないことが目的。
-    codex_pending_sse: HashMap<PendingCodexSseKey, ModelStats>,
+    /// conversation.id → (計上したバケット → usage)。後から session が届いた conversation の
+    /// 分だけを確定バケットへ移すために使う。並行する別 conversation の usage を巻き込まない
+    /// ことが目的。
+    ///
+    /// conversation.id で直接引く。全件を走査すると、session の届かない conversation が多い
+    /// batch で 1 件ごとに全 pending をなめ、write lock を持ったまま O(n²) になる
+    /// (レビューでの実測: 1 request の 32,000 conversation で 7 秒)。
+    codex_pending_sse: HashMap<String, BTreeMap<Bucket, ModelStats>>,
 }
 
-/// `codex_pending_sse` 用の合成キー。
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct PendingCodexSseKey {
-    provider: String,
-    model: String,
-    effort: String,
-    conversation_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CodexSession {
     conversation_id: String,
     provider: String,
@@ -353,10 +349,13 @@ impl Aggregator {
                         count += 1;
                         continue;
                     }
+                    // session が遅れて届き、暫定バケットの usage を確定バケットへ移した時も
+                    // 累計の内訳が変わるので数える (`--summary` を出す合図になる)。
                     if is_codex_service(service)
                         && let Some(session) = extract_codex_conversation_starts(log)
+                        && update_codex_session(&mut g, service, session)
                     {
-                        update_codex_session(&mut g, service, session);
+                        count += 1;
                     }
                     if is_codex_service(service)
                         && let Some(parsed) = extract_codex_sse_response_completed(&g, service, log)
@@ -374,13 +373,12 @@ impl Aggregator {
                             // session 未着で暫定計上した分は、後で provider / effort が
                             // 確定した時に正しいバケットへ移せるよう pending として控える。
                             if let Some(cid) = pending_conversation_id {
-                                let key = PendingCodexSseKey {
-                                    provider: bucket.provider.clone(),
-                                    model: bucket.model.clone(),
-                                    effort: bucket.effort.clone(),
-                                    conversation_id: cid,
-                                };
-                                g.codex_pending_sse.entry(key).or_default().add(&stats);
+                                g.codex_pending_sse
+                                    .entry(cid)
+                                    .or_default()
+                                    .entry(bucket.clone())
+                                    .or_default()
+                                    .add(&stats);
                             }
                             g.codex_token_sources
                                 .insert(source_key, CodexTokenSource::Logs);
@@ -397,9 +395,10 @@ impl Aggregator {
     /// `codex.conversation_starts` span event としても届くため、ここから
     /// `reasoning_effort` を回収する。token/cost の計上は別経路に寄せる。
     ///
-    /// 戻り値はセッション情報が実際に変わった件数。Codex は `handle_responses` span を
-    /// 1 日に数万件送り、ほとんどは同じ effort を繰り返すだけなので、値が変わらない span まで
-    /// 数えると `--summary` が trace batch ごとに同じ累計を出し続ける。
+    /// 戻り値は、セッション情報の更新で累計の内訳が変わった (暫定バケットの usage を確定
+    /// バケットへ移した) 件数。Codex は `handle_responses` span を 1 日に数万件送り、
+    /// effort を記録し直すだけの span では累計は変わらない。それまで数えると、`--summary` が
+    /// trace batch ごとに同じ累計を出し続ける。
     pub fn ingest_traces(&self, req: &ExportTraceServiceRequest) -> usize {
         // Codex 以外の span しか無い batch では排他 lock を取らない。Claude Code は
         // 2.1.278 以降 `claude_code.llm_request` / `claude_code.tool` などの span を
@@ -440,8 +439,8 @@ impl Aggregator {
                 }
             }
         }
-        // spans 自体は usage stats のサンプルではない。セッション情報が実際に変わった時だけ
-        // >0 を返し、呼び出し側が必要に応じてサマリーを出せるようにする。
+        // spans 自体は usage stats のサンプルではない。セッション情報の更新で累計の内訳が
+        // 変わった時だけ >0 を返し、呼び出し側が必要に応じてサマリーを出せるようにする。
         session_updates
     }
 
@@ -757,6 +756,19 @@ fn extract_codex_sse_response_completed(
     })
 }
 
+/// Claude metric の data point の model 名を、バケットと同じ正規化 (空なら unknown) で返し、
+/// metrics が送ってきた名前として登録する。
+///
+/// 登録とバケットで名前がずれると、`unknown[1m]` の metric が model 属性の無い metric の
+/// `unknown` バケットを畳み込む一方、取り消し用の記録は `unknown` のまま残る。その後ログで
+/// token source が切り替わると、中身の無いバケットから引いて `total` だけが減り、
+/// `total == Σbuckets` が崩れる。
+fn claude_metric_model(g: &mut AggregatorInner, attrs: &[KeyValue]) -> String {
+    let model = non_empty(string_attr(attrs, "model").unwrap_or_default().to_string());
+    register_canonical_claude_model(g, &model);
+    model
+}
+
 fn ingest_claude_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
     let Some(MetricData::Sum(sum)) = metric.data.as_ref() else {
         return 0;
@@ -766,10 +778,7 @@ fn ingest_claude_token(g: &mut AggregatorInner, metric: &Metric) -> usize {
     }
     let mut hits = 0;
     for dp in &sum.data_points {
-        let model = string_attr(&dp.attributes, "model").unwrap_or_default();
-        if !model.is_empty() {
-            register_canonical_claude_model(g, model);
-        }
+        let model = claude_metric_model(g, &dp.attributes);
         let effort = string_attr(&dp.attributes, "effort")
             .map(str::to_string)
             .unwrap_or_default();
@@ -800,10 +809,7 @@ fn ingest_claude_cost(g: &mut AggregatorInner, metric: &Metric) -> usize {
     }
     let mut hits = 0;
     for dp in &sum.data_points {
-        let model = string_attr(&dp.attributes, "model").unwrap_or_default();
-        if !model.is_empty() {
-            register_canonical_claude_model(g, model);
-        }
+        let model = claude_metric_model(g, &dp.attributes);
         let effort = string_attr(&dp.attributes, "effort")
             .map(str::to_string)
             .unwrap_or_default();
@@ -971,7 +977,7 @@ fn claude_usage_source_key(model: &str, effort: &str) -> ClaudeUsageKey {
     }
 }
 
-/// セッション情報を更新し、記録や累計が実際に変わったかを返す。
+/// セッション情報を更新し、累計の内訳が変わった (pending を確定バケットへ移した) かを返す。
 fn update_codex_session(g: &mut AggregatorInner, service: &str, session: CodexSession) -> bool {
     update_codex_session_with_last(g, service, session, true)
 }
@@ -981,7 +987,8 @@ fn update_codex_session(g: &mut AggregatorInner, service: &str, session: CodexSe
 /// ためのフック。conversation.id を持たない後続 metric の effort バケットが、無関係な
 /// conversation の span に引きずられないようにする (AGENTS.md の方針)。
 ///
-/// 戻り値は、conversation ごとの session・last session・pending のどれかが実際に変わったか。
+/// 戻り値は、累計の内訳が変わったか。session の記録を書き換えただけでは snapshot も
+/// summary も変わらないので数えない。
 fn update_codex_session_with_last(
     g: &mut AggregatorInner,
     service: &str,
@@ -1012,10 +1019,6 @@ fn update_codex_session_with_last(
     let effort = session.effort.clone();
     let conversation_id = session.conversation_id.clone();
     let provider_confirmed = session.provider_confirmed;
-    // 欠けた属性を既存値で補った後の session で比べる。
-    let session_changed =
-        !conversation_id.is_empty() && g.codex_sessions.get(&conversation_id) != Some(&session);
-    let last_changed = update_last && g.codex_last_sessions.get(service) != Some(&session);
     if !conversation_id.is_empty() {
         g.codex_sessions
             .insert(conversation_id.clone(), session.clone());
@@ -1024,16 +1027,14 @@ fn update_codex_session_with_last(
         g.codex_last_sessions.insert(service.to_string(), session);
     }
     // session が同じでも、前回の後に pending が積まれていれば動かす必要がある。
-    // 変化が無いと分かっても、ここより前で打ち切らない。
-    let pending_changed = merge_codex_pending_sse(
+    merge_codex_pending_sse(
         g,
         &provider,
         &model,
         &conversation_id,
         &effort,
         provider_confirmed,
-    );
-    session_changed || last_changed || pending_changed
+    )
 }
 
 /// `conversation_starts` (または相当する span event) が遅れて届いたとき、
@@ -1043,7 +1044,7 @@ fn update_codex_session_with_last(
 /// 同じ model を共有していても、他の未解決 conversation を巻き込まない。conversation_id が
 /// 無い古い telemetry のみ、unknown バケット全体を寄せる旧挙動を維持する。
 ///
-/// 戻り値は、バケット間で usage を移したか、pending を確定して取り除いたか。
+/// 戻り値は、バケット間で usage を移したか (累計の内訳が変わったか)。
 fn merge_codex_pending_sse(
     g: &mut AggregatorInner,
     provider: &str,
@@ -1063,57 +1064,51 @@ fn merge_codex_pending_sse(
         // 取得し、各 from バケット (pending エントリが指す provider / effort) から
         // to バケット (session の provider / effort) へ個別に移す。
         //
-        // マッチは `conversation_id` だけで行う。pending キー自身が model を持つので
-        // session 側の model は不要で、`k.model == model` を要求すると
-        // `handle_responses` span から合成した session (model 属性を持たないことがある)
-        // で pending を解決できず、span から拾えた effort が失われて usage が
-        // `effort=unknown` バケットに取り残される。
-        let matching: Vec<(PendingCodexSseKey, ModelStats)> = g
-            .codex_pending_sse
-            .iter()
-            .filter(|(k, _)| k.conversation_id == conversation_id)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let mut changed = false;
-        for (key, pending) in matching {
-            let actual_from =
-                Bucket::from_parts(key.provider.clone(), key.model.clone(), key.effort.clone());
+        // マッチは `conversation_id` だけで行う。pending のバケット自身が model を持つので
+        // session 側の model は不要で、model の一致を要求すると `handle_responses` span から
+        // 合成した session (model 属性を持たないことがある) で pending を解決できず、span から
+        // 拾えた effort が失われて usage が `effort=unknown` バケットに取り残される。
+        //
+        // 当該 conversation の pending はまとめて取り出し、置き直す分は別の map に集めてから
+        // 戻す。1 件ずつ remove / insert すると、置き直した先がまだ処理していない別の
+        // バケットと同じときに、そのバケットの remove が置き直した分ごと消してしまう
+        // (HashMap の反復順で結果が変わり、provider の振り分けを誤る)。
+        let Some(entries) = g.codex_pending_sse.remove(conversation_id) else {
+            return false;
+        };
+        let mut kept: BTreeMap<Bucket, ModelStats> = BTreeMap::new();
+        let mut moved_any = false;
+        for (actual_from, pending) in entries {
             // response に最も近い SSE 自身の effort を優先し、SSE が unknown の場合だけ
             // 遅着した session の effort で補完する。
-            let resolved_effort = if key.effort == UNKNOWN {
+            let resolved_effort = if actual_from.effort == UNKNOWN {
                 non_empty(effort.to_string())
             } else {
-                key.effort.clone()
+                actual_from.effort.clone()
             };
-            let actual_to =
-                Bucket::from_parts(provider.to_string(), key.model.clone(), resolved_effort);
-            g.codex_pending_sse.remove(&key);
+            let actual_to = Bucket::from_parts(
+                provider.to_string(),
+                actual_from.model.clone(),
+                resolved_effort,
+            );
             // provider が暫定 (`handle_responses` span から合成した session) のうちは
             // pending を捨てず、確定した effort と暫定 provider で置き直す。ここで
             // 捨てると、後から本物の `conversation_starts` が非既定 provider (Azure や
             // openai-compatible endpoint) で届いても usage を移せず、暫定 provider の
             // バケットに取り残される。effort が unknown の場合も、後続の補完に備えて保留する。
-            let keep_pending = !provider_confirmed || actual_to.effort == UNKNOWN;
-            if keep_pending {
-                let moved_key = PendingCodexSseKey {
-                    provider: actual_to.provider.clone(),
-                    model: actual_to.model.clone(),
-                    effort: actual_to.effort.clone(),
-                    conversation_id: key.conversation_id.clone(),
-                };
-                g.codex_pending_sse
-                    .entry(moved_key)
-                    .or_default()
-                    .add(&pending);
+            if !provider_confirmed || actual_to.effort == UNKNOWN {
+                kept.entry(actual_to.clone()).or_default().add(&pending);
             }
-            let moved = actual_from != actual_to;
-            if moved {
+            if actual_from != actual_to {
                 move_codex_bucket_stats(g, &actual_from, &actual_to, &pending);
+                moved_any = true;
             }
-            // 同じ key で置き直しただけなら何も変わっていない。
-            changed |= moved || !keep_pending;
         }
-        return changed;
+        if !kept.is_empty() {
+            g.codex_pending_sse
+                .insert(conversation_id.to_string(), kept);
+        }
+        return moved_any;
     }
     // ここから下は conversation_id を持たない古い telemetry 向けの互換経路。
     // model が分からないと移動元バケットを特定できない (`non_empty` で "unknown" に
@@ -1129,13 +1124,14 @@ fn merge_codex_pending_sse(
     // conversation_id が空: 古い telemetry 互換。unknown バケットの残り全体を新 effort へ移す。
     // ただし他 conversation の pending と取り違えないよう、pending として保留されている分は
     // 残しておく (該当 conversation の session 到達時に正しく動かすため)。
-    let pending_total = sum_pending_for_bucket(g, &from);
+    // 移動元のバケットが無ければ pending を数える必要もない (全 conversation をなめない)。
     let Some(agent_stats) = g.agents.get(AGENT_CODEX) else {
         return false;
     };
     let Some(from_stats) = agent_stats.buckets.get(&from.key()).cloned() else {
         return false;
     };
+    let pending_total = sum_pending_for_bucket(g, &from);
     let movable = from_stats.stats.saturating_sub_stats(&pending_total);
     if !movable.has_any_value() {
         return false;
@@ -1173,13 +1169,12 @@ fn move_codex_bucket_stats(
 
 fn sum_pending_for_bucket(g: &AggregatorInner, bucket: &Bucket) -> ModelStats {
     let mut total = ModelStats::default();
-    for (key, stats) in &g.codex_pending_sse {
-        if key.provider == bucket.provider
-            && key.model == bucket.model
-            && key.effort == bucket.effort
-        {
-            total.add(stats);
-        }
+    for stats in g
+        .codex_pending_sse
+        .values()
+        .filter_map(|per_bucket| per_bucket.get(bucket))
+    {
+        total.add(stats);
     }
     total
 }
@@ -1237,7 +1232,8 @@ fn update_codex_effort_from_request_attrs(
 }
 
 /// `conversation.id` を持たない `handle_responses` span の effort を、同じ service の
-/// fallback (last session) にだけ反映する。戻り値は last session が変わったか。
+/// fallback (last session) にだけ反映する。戻り値は累計の内訳が変わったか (旧形式の
+/// unknown バケットを移した時だけ true。effort を記録し直すだけでは累計は変わらない)。
 ///
 /// Codex 0.163.0 の `handle_responses` span は `conversation.id` を持たない (親の
 /// `codex.sampling` span が持つ)。どの conversation の span か分からないので、
@@ -1270,10 +1266,9 @@ fn update_codex_last_effort(g: &mut AggregatorInner, service: &str, effort: &str
         )
     });
     g.codex_last_sessions.insert(service.to_string(), last);
-    if let Some((provider, model, provider_confirmed)) = legacy_merge {
-        merge_codex_pending_sse(g, &provider, &model, "", effort, provider_confirmed);
-    }
-    true
+    legacy_merge.is_some_and(|(provider, model, provider_confirmed)| {
+        merge_codex_pending_sse(g, &provider, &model, "", effort, provider_confirmed)
+    })
 }
 
 /// Anthropic logs では `claude-opus-4-7`、metrics/spans では
@@ -1318,10 +1313,19 @@ fn register_canonical_claude_model(g: &mut AggregatorInner, full: &str) {
 }
 
 fn merge_bare_into_full(agent_stats: &mut AgentStats, bare: &str, full: &str) {
+    // Claude のバケットは provider が常に anthropic で、key は各 component を escape して
+    // `/` で連結している。`anthropic/<bare>/` で始まる key が、ちょうど bare 名のバケット。
+    // 全バケットをなめると、異なる model 名を大量に含む batch で O(n²) になる
+    // (レビューでの実測: 1 request の 16,000 model で 2 秒、その間 write lock を持つ)。
+    let prefix = format!(
+        "{}/{}/",
+        escape_bucket_component(PROVIDER_ANTHROPIC),
+        escape_bucket_component(bare)
+    );
     let bare_keys: Vec<String> = agent_stats
         .buckets
-        .iter()
-        .filter(|(_, bucket)| bucket.model == bare)
+        .range(prefix.clone()..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
         .map(|(key, _)| key.clone())
         .collect();
     for bare_key in bare_keys {
@@ -3247,13 +3251,14 @@ mod tests {
             ));
         }
         // last session は conv-b/medium。conv-a の span が conversation.id 無しで xhigh を運ぶ。
+        // service 単位の fallback は更新するが (下の turn metric で確かめる)、累計の内訳は
+        // 変わらないので summary の合図にはならない。
         assert_eq!(
             agg.ingest_traces(&make_trace_req(
                 SERVICE_CODEX_TUI,
                 vec![handle_responses_span("xhigh")],
             )),
-            1,
-            "service 単位の fallback は更新する"
+            0
         );
         // model_reasoning_effort を持たない conv-b の SSE は、conv-b 自身の effort で振り分ける。
         agg.ingest_logs(&make_log_req(
@@ -3294,13 +3299,15 @@ mod tests {
         assert_eq!(agent.total.input_tokens, 30);
     }
 
-    /// 回帰テスト: 同じ effort を繰り返すだけの span はセッション更新として数えない。
+    /// 回帰テスト: セッション情報の更新は、累計の内訳が変わった時だけ summary の合図として
+    /// 数える。
     ///
     /// Codex は `handle_responses` span を 1 日に数万件送る (2026-10-20 の手元の実ログで
-    /// codex_cli_rs 41,861 件)。値の変わらない span まで数えると、`--summary` が trace batch
-    /// ごとに同じ累計を出し続ける。
+    /// codex_cli_rs 41,861 件)。effort を記録し直すだけの span まで数えると、`--summary` が
+    /// trace batch ごとに同じ累計を出し続ける。逆に、遅れて届いた session で暫定バケットの
+    /// usage を移した batch は、ログで届いても数える (内訳が変わったのに summary が出ない)。
     #[test]
-    fn codex_repeated_span_effort_is_not_counted_as_a_session_update() {
+    fn codex_session_updates_are_counted_only_when_buckets_move() {
         let agg = Aggregator::new();
         agg.ingest_logs(&make_log_req(
             SERVICE_CODEX_TUI,
@@ -3312,48 +3319,231 @@ mod tests {
                 kv_str("reasoning_effort", "high"),
             ],
         ));
-        let spans = |effort: &str| {
-            make_trace_req(
-                SERVICE_CODEX_TUI,
-                vec![handle_responses_span(effort), handle_responses_span(effort)],
-            )
-        };
+        // 並行する conversation の span が、conversation.id 無しで effort を交互に運ぶ。
+        for effort in ["high", "xhigh", "medium", "xhigh"] {
+            assert_eq!(
+                agg.ingest_traces(&make_trace_req(
+                    SERVICE_CODEX_TUI,
+                    vec![handle_responses_span(effort), handle_responses_span(effort)],
+                )),
+                0,
+                "effort を記録し直すだけでは数えない ({effort})"
+            );
+        }
         assert_eq!(
-            agg.ingest_traces(&spans("high")),
-            0,
-            "conversation_starts と同じ effort"
-        );
-        assert_eq!(
-            agg.ingest_traces(&spans("xhigh")),
-            1,
-            "effort が変わった span だけを数える"
-        );
-        assert_eq!(agg.ingest_traces(&spans("xhigh")), 0);
-
-        // conversation.id 付きの span と conversation_starts の span event も、変化した時だけ数える。
-        let with_conversation_id = |effort: &str| {
-            make_trace_req(
+            agg.ingest_traces(&make_trace_req(
                 SERVICE_CODEX_TUI,
                 vec![handle_responses_span_with_attrs(vec![
                     kv_str("conversation.id", "conv-a"),
-                    kv_str("codex.request.reasoning_effort", effort),
+                    kv_str("codex.request.reasoning_effort", "medium"),
                 ])],
+            )),
+            0
+        );
+
+        let pending_sse = |cid: &str| {
+            make_log_req(
+                SERVICE_CODEX_TUI,
+                "",
+                vec![
+                    kv_str("event.name", "codex.sse_event"),
+                    kv_str("event.kind", "response.completed"),
+                    kv_str("conversation.id", cid),
+                    kv_str("model", "gpt-6.1-sol"),
+                    kv_str("input_token_count", "40"),
+                ],
             )
         };
-        assert_eq!(agg.ingest_traces(&with_conversation_id("medium")), 1);
-        assert_eq!(agg.ingest_traces(&with_conversation_id("medium")), 0);
-        let starts = make_trace_req(
-            SERVICE_CODEX_TUI,
-            vec![conversation_starts_span(vec![
+        let starts = |cid: &str| {
+            vec![
                 kv_str("event.name", "codex.conversation_starts"),
-                kv_str("conversation.id", "conv-b"),
-                kv_str("provider_name", PROVIDER_OPENAI),
+                kv_str("conversation.id", cid),
+                kv_str("provider_name", "azure"),
                 kv_str("model", "gpt-6.1-sol"),
                 kv_str("reasoning_effort", "low"),
-            ])],
+            ]
+        };
+        // span event の session が、session 未着の SSE を確定バケットへ移す。
+        agg.ingest_logs(&pending_sse("conv-b"));
+        let span_starts = make_trace_req(
+            SERVICE_CODEX_TUI,
+            vec![conversation_starts_span(starts("conv-b"))],
         );
-        assert_eq!(agg.ingest_traces(&starts), 1);
-        assert_eq!(agg.ingest_traces(&starts), 0);
+        assert_eq!(agg.ingest_traces(&span_starts), 1, "内訳が変わった");
+        assert_eq!(
+            agg.ingest_traces(&span_starts),
+            0,
+            "移す pending はもう無い"
+        );
+        // ログで届いた session でも、移した分を数える。
+        assert_eq!(agg.ingest_logs(&pending_sse("conv-c")), 1);
+        assert_eq!(
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_TUI,
+                "codex.conversation_starts",
+                starts("conv-c")
+            )),
+            1
+        );
+        let snap = agg.snapshot();
+        assert_eq!(
+            snap.agents[AGENT_CODEX]
+                .buckets
+                .get("azure/gpt-6.1-sol/low")
+                .map(|b| b.stats.input_tokens),
+            Some(80)
+        );
+    }
+
+    /// 回帰テスト: 同じ conversation の pending を置き直しても、別のバケットの分を失わない。
+    ///
+    /// 1 件ずつ remove / insert していた頃は、置き直した先がまだ処理していない別のバケットと
+    /// 同じだと、そのバケットの remove が置き直した分ごと消していた。HashMap の反復順で結果が
+    /// 変わるので (レビューでの実測: 64 回中 29 回)、新しい集計器で繰り返して確かめる。
+    #[test]
+    fn codex_pending_rekey_keeps_usage_from_every_bucket() {
+        for _ in 0..64 {
+            let agg = Aggregator::new();
+            let sse = |effort: Option<&str>, input: &str| {
+                let mut attrs = vec![
+                    kv_str("event.name", "codex.sse_event"),
+                    kv_str("event.kind", "response.completed"),
+                    kv_str("conversation.id", "conv-x"),
+                    kv_str("model", "gpt-m"),
+                    kv_str("input_token_count", input),
+                ];
+                if let Some(effort) = effort {
+                    attrs.push(kv_str("model_reasoning_effort", effort));
+                }
+                make_log_req(SERVICE_CODEX_EXEC, "", attrs)
+            };
+            agg.ingest_logs(&sse(Some("high"), "100"));
+            agg.ingest_logs(&sse(None, "10"));
+            // provider を運ばない session 更新が effort を運ぶ (pending は暫定のまま置き直す)。
+            agg.ingest_traces(&make_trace_req(
+                SERVICE_CODEX_EXEC,
+                vec![handle_responses_span_with_attrs(vec![
+                    kv_str("conversation.id", "conv-x"),
+                    kv_str("codex.request.reasoning_effort", "high"),
+                ])],
+            ));
+            agg.ingest_logs(&make_log_req(
+                SERVICE_CODEX_EXEC,
+                "codex.conversation_starts",
+                vec![
+                    kv_str("conversation.id", "conv-x"),
+                    kv_str("provider_name", "azure"),
+                    kv_str("model", "gpt-m"),
+                ],
+            ));
+
+            let snap = agg.snapshot();
+            let buckets = &snap.agents[AGENT_CODEX].buckets;
+            assert_eq!(
+                buckets
+                    .get("azure/gpt-m/high")
+                    .map(|b| b.stats.input_tokens),
+                Some(110),
+                "{buckets:?}"
+            );
+            assert_eq!(
+                buckets.len(),
+                1,
+                "暫定 provider のバケットに残さない: {buckets:?}"
+            );
+        }
+    }
+
+    /// 回帰テスト: session の届かない conversation が大量にあっても、1 batch の処理は線形に
+    /// 収まる。pending を全件なめていた頃は、1 request に 32,000 conversation で 7 秒
+    /// (release) かかり、その間 write lock を持って全 batch の ACK を止めていた。
+    #[test]
+    fn many_pending_conversations_are_resolved_in_linear_time() {
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        const CONVERSATIONS: usize = 20_000;
+        let record = |attrs: Vec<KeyValue>| LogRecord {
+            attributes: attrs,
+            ..Default::default()
+        };
+        let mut records = Vec::with_capacity(CONVERSATIONS * 2);
+        for i in 0..CONVERSATIONS {
+            records.push(record(vec![
+                kv_str("event.name", "codex.sse_event"),
+                kv_str("event.kind", "response.completed"),
+                kv_str("conversation.id", &format!("sse-{i}")),
+                kv_str("model", "gpt-m"),
+                kv_str("input_token_count", "1"),
+            ]));
+        }
+        for i in 0..CONVERSATIONS {
+            // SSE とは別の conversation の session (pending は解決されないまま残る)。
+            records.push(record(vec![
+                kv_str("event.name", "codex.conversation_starts"),
+                kv_str("conversation.id", &format!("other-{i}")),
+                kv_str("model", "gpt-m"),
+            ]));
+        }
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv_str("service.name", SERVICE_CODEX_EXEC)],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope::default()),
+                    log_records: records,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let agg = Aggregator::new();
+        let started = std::time::Instant::now();
+        agg.ingest_logs(&req);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "pending の解決が conversation 数に対して線形でない: {elapsed:?}"
+        );
+        assert_eq!(
+            agg.snapshot().agents[AGENT_CODEX].total.input_tokens,
+            CONVERSATIONS as u64
+        );
+    }
+
+    /// 回帰テスト: model 属性の無い Claude metric でも `total == Σbuckets` を保つ。
+    ///
+    /// 登録 (空のまま) とバケット (`unknown`) で名前がずれていた頃は、`unknown[1m]` の metric
+    /// が model 無しの metric の `unknown` バケットを畳み込み、取り消し用の記録とずれていた。
+    /// その後ログで token source が切り替わると、中身の無いバケットから引いて total だけが減った。
+    #[test]
+    fn claude_metrics_without_model_keep_totals_consistent() {
+        let agg = Aggregator::new();
+        let mut no_model = claude_token_metric("", "high", "input", 100);
+        if let Some(MetricData::Sum(ref mut sum)) = no_model.data {
+            for dp in &mut sum.data_points {
+                dp.attributes.retain(|kv| kv.key != "model");
+            }
+        }
+        agg.ingest_metrics(&make_metric_req(SERVICE_CLAUDE, vec![no_model]));
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CLAUDE,
+            vec![claude_token_metric("unknown[1m]", "high", "input", 50)],
+        ));
+        agg.ingest_logs(&make_log_req(
+            SERVICE_CLAUDE,
+            "claude_code.api_request",
+            vec![kv_str("effort", "high"), kv_int("input_tokens", 30)],
+        ));
+
+        let snap = agg.snapshot();
+        let agent = &snap.agents[AGENT_CLAUDE];
+        let sum: u64 = agent.buckets.values().map(|b| b.stats.input_tokens).sum();
+        assert_eq!(agent.total.input_tokens, sum, "{:?}", agent.buckets);
     }
 
     /// conversation.id を一切持たない古い telemetry では、conversation.id 無しの span が
@@ -4083,7 +4273,8 @@ mod tests {
                 kv_str("reasoning_effort", "high"),
             ],
         ));
-        // Desktop も span から当該 conversation の effort を補完する。
+        // Desktop も span から当該 conversation の effort を補完する。effort を記録し直す
+        // だけでは累計の内訳は変わらないので、summary の合図 (戻り値) は 0 のまま。
         assert_eq!(
             agg.ingest_traces(&make_trace_req(
                 service,
@@ -4092,7 +4283,7 @@ mod tests {
                     kv_str("codex.request.reasoning_effort", "xhigh"),
                 ])],
             )),
-            1
+            0
         );
         assert_eq!(
             agg.ingest_logs(&make_log_req(
@@ -4190,8 +4381,21 @@ mod tests {
                 "xhigh",
             )])],
         ));
-        // span だけでは sessions が未登録のため、新しく seed されて 1 件として数えられる。
-        assert_eq!(updates, 1);
+        // span だけでは累計の内訳は変わらないので、summary の合図にはならない。
+        assert_eq!(updates, 0);
+        // それでも session は seed され、後続の metric は span の effort で振り分けられる。
+        agg.ingest_metrics(&make_metric_req(
+            SERVICE_CODEX_APP_SERVER,
+            vec![codex_turn_count("gpt-5.5", 1)],
+        ));
+        let snap = agg.snapshot();
+        assert_eq!(
+            snap.agents[AGENT_CODEX]
+                .buckets
+                .get(&format!("{PROVIDER_OPENAI}/gpt-5.5/xhigh"))
+                .map(|b| b.stats.request_count),
+            Some(1)
+        );
     }
 
     /// `is_codex_service` は Desktop と各 Codex server も Codex として扱い、
