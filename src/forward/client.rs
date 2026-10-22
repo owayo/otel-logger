@@ -814,6 +814,105 @@ mod tests {
         assert!(err.to_string().contains("500"), "got: {err}");
     }
 
+    /// リダイレクト先へカスタム認証ヘッダと payload を送らない。
+    #[tokio::test]
+    async fn http_redirect_does_not_forward_credentials_or_payload() {
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let (destination, received) = spawn_mock_http().await;
+            let location = format!("{destination}/v1/logs");
+            let router = Router::new().route(
+                "/v1/logs",
+                post(move || {
+                    let location = location.clone();
+                    async move { (status, [(axum::http::header::LOCATION, location)]) }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let route = ProxyRoute {
+                name: "redirect-test".into(),
+                service_names: vec!["claude-code".into()],
+                signals: ProxySignal::ALL.to_vec(),
+                transport: ProxyTransport::HttpProtobuf,
+                endpoint: format!("http://{addr}"),
+                headers: vec![("api-key".into(), "test-secret".into())],
+            };
+            let client = RouteClient::build(&route, 3000).unwrap();
+            let error = client
+                .export(ExportRequest::Logs(Box::new(logs_request_with_service(
+                    "claude-code",
+                ))))
+                .await
+                .unwrap_err();
+            server.abort();
+
+            assert_eq!(
+                error.downcast_ref::<HttpExportFailure>().unwrap().status,
+                status
+            );
+            assert_eq!(retry_delay(&error), None, "3xx は再送しない");
+            assert!(
+                received.lock().await.body.is_empty(),
+                "別 origin へ転送しない"
+            );
+        }
+    }
+
+    /// 非 2xx は本文を待たずに判定する。巨大な本文や止まった本文を読み込まない。
+    #[tokio::test]
+    async fn http_error_status_does_not_wait_for_the_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buf = [0; 1024];
+                let read = socket.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 1000000000\r\nRetry-After: 7\r\n\r\n")
+                .await
+                .unwrap();
+            // 本文を送らずに接続を保つ。client の全体 timeout より前に status が返る必要がある。
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let route = ProxyRoute {
+            name: "stalled-body-test".into(),
+            service_names: vec!["claude-code".into()],
+            signals: ProxySignal::ALL.to_vec(),
+            transport: ProxyTransport::HttpProtobuf,
+            endpoint: format!("http://{addr}"),
+            headers: Vec::new(),
+        };
+        let client = RouteClient::build(&route, 30_000).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.export(ExportRequest::Logs(Box::new(logs_request_with_service(
+                "claude-code",
+            )))),
+        )
+        .await;
+        server.abort();
+        let error = result
+            .expect("本文の完了を待たずに status を返す")
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<HttpExportFailure>().unwrap().status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(retry_delay(&error), Some(Duration::from_secs(7)));
+    }
+
     /// 送信失敗の chain に原因を残しつつ、URL は載せない。
     ///
     /// reqwest の Display は URL 全体を含むため、そのまま包むと worker のログに endpoint が

@@ -5,7 +5,7 @@
 # 初回コンパイルが数分かかるため、アプリ本体の変更と分離する。
 # Rust の版は mise.toml の rust と同じにする (Cargo.toml の rust-version もこの版なので、
 # 古いイメージのままでは cargo がビルドを拒む)。
-FROM rust:1.99.0-slim-bookworm AS chef
+FROM rust:1.99.1-slim-bookworm AS chef
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config \
