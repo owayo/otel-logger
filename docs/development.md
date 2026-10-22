@@ -12,11 +12,13 @@ mise exec -- cargo run --release --locked --example replay_check -- otel-logger.
 
 Decode failures are reported on stderr and produce a nonzero exit status. Totals from valid batches are still printed for diagnosis; a successful verification requires zero failures. Read errors also return a nonzero status.
 
-## Real-log verification (2026-10-08)
+## Real-log verification (2026-10-22)
 
-A successful CI capture from Claude Code 2.1.292 and Codex 0.160.1 replayed all 180 batches in arrival order with zero decode failures. Claude's 14 API requests matched metrics for all four token types and cost. Codex's 34 SSE completions, excluding two tool-only events, matched turn metrics for every token type.
+A successful CI capture from Claude Code 2.1.306 and Codex 0.163.0 replayed all 161 batches in arrival order with zero decode failures. Claude's 12 API requests matched metrics for all four token types and cost. Codex's 38 SSE completions, excluding two tool-only events, matched turn metrics for every token type.
 
-Local captures from October 7 and a frozen October 8 snapshot contained 23,467 and 2,584 batches. Retaining usage and session metadata and hashing conversation IDs yielded 8,725 and 1,314 replay batches, both with zero decode failures. Independent totals matched the aggregator, and each agent's total equaled the sum of its buckets. Five Desktop conversations used `Codex Desktop`; none shared a conversation or completion with another service. Exec Server emitted operational traces without usage. Active logs and metrics cover different arrival ranges, so comparing their entire raw totals is not a regression criterion. Raw logs and sanitized replay files are kept outside the repository.
+Local captures from October 21 and a frozen October 22 snapshot contained 25,191 and 17,861 batches. After scanning the complete captures, retaining usage and session metadata yielded 10,861 and 7,824 replay batches, both with zero decode failures. Independent token, cost, request count, and duration totals matched the aggregator, and each agent's total equaled the sum of its buckets.
+
+The local captures included Claude Code 2.1.304–2.1.308, Codex 0.163.0, and Desktop builds 0.163.0-alpha.10.2 / alpha.11.1. Existing aggregation handled new model names. The `node_repl` event `codex.browser_use.authority_acquisition` carried operational metadata without usage. Active logs and metrics cover different arrival ranges, so comparing their entire raw totals is not a regression criterion. Raw logs and processed replay files are kept outside the repository.
 
 ## Dependency audit
 
