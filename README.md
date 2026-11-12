@@ -238,6 +238,8 @@ otel-logger \
 
 Routing, retries, the TOML form and per-route counters: [docs/proxy.md](docs/proxy.md)
 
+Routes can require exact string resource attributes and rewrite or remove attributes on forwarded metric points. This lets clients opt in with a profile marker while local JSONL keeps the original payload. See the [profile routing example](docs/proxy.md#forward-metrics-from-an-opted-in-profile).
+
 ## Development
 
 <!-- standard:dev:start -->

@@ -184,6 +184,9 @@ mod tests {
             retry_max: 0,
             checkpoint_dir: std::path::PathBuf::from(".otel-logger-proxy"),
             routes: vec![ProxyRoute {
+                resource_attributes: Default::default(),
+                metric_attribute_overrides: Default::default(),
+                metric_attribute_removals: Default::default(),
                 name: "test".to_string(),
                 service_names: vec!["claude-code".to_string()],
                 signals: ProxySignal::ALL.to_vec(),

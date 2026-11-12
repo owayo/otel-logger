@@ -656,6 +656,9 @@ mod tests {
     async fn client_header_validation_does_not_echo_an_invalid_key() {
         for transport in [ProxyTransport::Grpc, ProxyTransport::HttpProtobuf] {
             let route = ProxyRoute {
+                resource_attributes: Default::default(),
+                metric_attribute_overrides: Default::default(),
+                metric_attribute_removals: Default::default(),
                 name: "test".to_string(),
                 service_names: vec![],
                 signals: ProxySignal::ALL.to_vec(),
@@ -761,6 +764,9 @@ mod tests {
         let (endpoint, state) = spawn_mock_http().await;
 
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "anthropic".to_string(),
             service_names: vec!["claude-code".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -799,6 +805,9 @@ mod tests {
         });
 
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "openai".to_string(),
             service_names: vec!["codex_cli_rs".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -834,6 +843,9 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             let route = ProxyRoute {
+                resource_attributes: Default::default(),
+                metric_attribute_overrides: Default::default(),
+                metric_attribute_removals: Default::default(),
                 name: "redirect-test".into(),
                 service_names: vec!["claude-code".into()],
                 signals: ProxySignal::ALL.to_vec(),
@@ -887,6 +899,9 @@ mod tests {
             drop(socket);
         });
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "stalled-body-test".into(),
             service_names: vec!["claude-code".into()],
             signals: ProxySignal::ALL.to_vec(),
@@ -925,6 +940,9 @@ mod tests {
             .local_addr()
             .unwrap();
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "openai".to_string(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),
@@ -983,6 +1001,9 @@ mod tests {
 
     fn assert_endpoint_rejected(transport: ProxyTransport, endpoint: &str) {
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "openai".to_string(),
             service_names: vec!["codex_cli_rs".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -1016,6 +1037,9 @@ mod tests {
             .local_addr()
             .unwrap();
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "openai".to_string(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),
@@ -1050,6 +1074,9 @@ mod tests {
     #[test]
     fn http_client_appends_signal_paths_after_base_path() {
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "openai".to_string(),
             service_names: vec!["codex_cli_rs".to_string()],
             signals: ProxySignal::ALL.to_vec(),

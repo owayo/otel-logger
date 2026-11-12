@@ -353,6 +353,9 @@ pub const DEFAULT_OPENAI_SERVICES: &[&str] = &[
 /// (`env:VAR`) も展開済みなので、あとは forwarder が使うだけの状態。
 #[derive(Debug, Clone)]
 pub struct ProxyRoute {
+    pub resource_attributes: BTreeMap<String, String>,
+    pub metric_attribute_overrides: BTreeMap<String, String>,
+    pub metric_attribute_removals: Vec<String>,
     pub name: String,
     pub service_names: Vec<String>,
     pub signals: Vec<ProxySignal>,
@@ -713,6 +716,18 @@ fn build_vendor_route(
     cli_headers: Vec<String>,
     config: Option<ProxyRouteConfig>,
 ) -> anyhow::Result<Option<ProxyRoute>> {
+    let resource_attributes = config
+        .as_ref()
+        .map(|c| c.resource_attributes.clone())
+        .unwrap_or_default();
+    let metric_attribute_overrides = config
+        .as_ref()
+        .map(|c| c.metric_attribute_overrides.clone())
+        .unwrap_or_default();
+    let metric_attribute_removals = config
+        .as_ref()
+        .map(|c| c.metric_attribute_removals.clone())
+        .unwrap_or_default();
     // CLI で endpoint を指定した場合、config の同名 route を base にしつつ CLI 値で override する。
     let (endpoint, transport, headers_map, signals, service_names) = match (cli_endpoint, config) {
         (Some(endpoint), Some(mut cfg)) => {
@@ -761,9 +776,17 @@ fn build_vendor_route(
         }
     };
 
+    validate_metric_rewrite(
+        &resource_attributes,
+        &metric_attribute_overrides,
+        &metric_attribute_removals,
+    )?;
     let headers = resolve_headers(headers_map, name)?;
 
     Ok(Some(ProxyRoute {
+        resource_attributes,
+        metric_attribute_overrides,
+        metric_attribute_removals,
         name: name.to_string(),
         service_names,
         signals,
@@ -786,8 +809,16 @@ fn build_custom_route(cfg: ProxyRouteConfig) -> anyhow::Result<ProxyRoute> {
     } else {
         cfg.service_names
     };
+    validate_metric_rewrite(
+        &cfg.resource_attributes,
+        &cfg.metric_attribute_overrides,
+        &cfg.metric_attribute_removals,
+    )?;
     let headers = resolve_headers(cfg.headers, &cfg.name)?;
     Ok(ProxyRoute {
+        resource_attributes: cfg.resource_attributes,
+        metric_attribute_overrides: cfg.metric_attribute_overrides,
+        metric_attribute_removals: cfg.metric_attribute_removals,
         name: cfg.name,
         service_names,
         signals,
@@ -795,6 +826,27 @@ fn build_custom_route(cfg: ProxyRouteConfig) -> anyhow::Result<ProxyRoute> {
         endpoint: cfg.endpoint,
         headers,
     })
+}
+
+// 共有 receiver での属性の書き換えには、対象を絞る resource 条件を必須にする。
+fn validate_metric_rewrite(
+    required: &BTreeMap<String, String>,
+    overrides: &BTreeMap<String, String>,
+    removals: &[String],
+) -> anyhow::Result<()> {
+    if (!overrides.is_empty() || !removals.is_empty())
+        && !required
+            .keys()
+            .any(|k| k != "service.name" && !k.is_empty())
+    {
+        anyhow::bail!(
+            "metric attribute rewrites require a resource-attributes condition other than service.name"
+        );
+    }
+    if removals.iter().any(|key| overrides.contains_key(key)) {
+        anyhow::bail!("metric attribute overrides and removals must not overlap");
+    }
+    Ok(())
 }
 
 fn normalize_signals(signals: Vec<ProxySignal>) -> Vec<ProxySignal> {
@@ -1697,12 +1749,96 @@ mod tests {
     }
 
     #[test]
+    fn metric_rewrite_requires_profile_boundary_and_disjoint_keys() {
+        let overrides = BTreeMap::from([("user.email".into(), "you@example.com".into())]);
+        assert!(validate_metric_rewrite(&BTreeMap::new(), &overrides, &[]).is_err());
+        assert!(
+            validate_metric_rewrite(
+                &BTreeMap::from([("service.name".into(), "claude-code".into())]),
+                &overrides,
+                &[]
+            )
+            .is_err()
+        );
+        let required = BTreeMap::from([("profile".into(), "work".into())]);
+        assert!(validate_metric_rewrite(&required, &overrides, &["user.email".into()]).is_err());
+        assert!(
+            validate_metric_rewrite(&required, &overrides, &["user.account_uuid".into()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn merge_proxy_preserves_resource_conditions_and_metric_rewrites() {
+        for name in ["anthropic", "custom"] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+[[proxy.routes]]
+name = "{name}"
+service-names = ["claude-code"]
+endpoint = "https://collector.example.com"
+signal-types = ["metrics"]
+metric-attribute-removals = ["user.account_uuid"]
+[proxy.routes.resource-attributes]
+"profile" = "work"
+[proxy.routes.metric-attribute-overrides]
+"user.email" = "you@example.com"
+"#
+            ))
+            .unwrap();
+            let mut cli = cli_with_log_file();
+            if name == "anthropic" {
+                cli.proxy_anthropic_endpoint = Some("https://override.example.com".into());
+                cli.proxy_anthropic_transport = Some(ProxyTransportArg::HttpProtobuf);
+            }
+            let settings = Settings::merge_with_home(cli, config, None).unwrap();
+            let proxy = settings.proxy.unwrap();
+            let route = &proxy.routes[0];
+            assert_eq!(
+                route.resource_attributes,
+                BTreeMap::from([("profile".into(), "work".into())])
+            );
+            assert_eq!(
+                route.metric_attribute_overrides,
+                BTreeMap::from([("user.email".into(), "you@example.com".into())])
+            );
+            assert_eq!(route.metric_attribute_removals, vec!["user.account_uuid"]);
+            assert_eq!(route.signals, vec![ProxySignal::Metrics]);
+            if name == "anthropic" {
+                assert_eq!(route.endpoint, "https://override.example.com");
+                assert_eq!(route.transport, ProxyTransport::HttpProtobuf);
+            }
+        }
+    }
+
+    #[test]
+    fn merge_proxy_rejects_unscoped_or_conflicting_metric_rewrites() {
+        for name in ["anthropic", "custom"] {
+            for invalid in [
+                "metric-attribute-removals = ['user.email']",
+                "[proxy.routes.metric-attribute-overrides]\n'user.email' = 'you@example.com'",
+                "metric-attribute-removals = ['user.email']\n[proxy.routes.resource-attributes]\nprofile = 'work'\n[proxy.routes.metric-attribute-overrides]\n'user.email' = 'you@example.com'",
+                "metric-attribute-removals = ['user.email']\n[proxy.routes.resource-attributes]\n'service.name' = 'claude-code'",
+            ] {
+                let config: Config = toml::from_str(&format!(
+                    "[[proxy.routes]]\nname = '{name}'\nservice-names = ['claude-code']\nendpoint = 'https://collector.example.com'\n{invalid}"
+                )).unwrap();
+                let err = Settings::merge_with_home(cli_with_log_file(), config, None).unwrap_err();
+                assert!(err.to_string().contains("metric attribute"), "{err}");
+                assert!(!err.to_string().contains("you@example.com"));
+            }
+        }
+    }
+
+    #[test]
     fn merge_proxy_config_route_overrides_service_names() {
         use crate::config::ProxyConfig;
         let cli = cli_with_log_file();
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "anthropic".to_string(),
                     service_names: vec![
                         "claude-code".to_string(),
@@ -1739,6 +1875,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "openai".to_string(),
                     service_names: Vec::new(),
                     signal_types: Vec::new(),
@@ -1772,6 +1911,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "custom".to_string(),
                     service_names: vec![String::new()],
                     signal_types: Vec::new(),
@@ -1798,6 +1940,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "custom".to_string(),
                     service_names: vec!["my-service".to_string()],
                     signal_types: Vec::new(),
@@ -1826,6 +1971,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "custom".to_string(),
                     service_names: Vec::new(),
                     signal_types: Vec::new(),
@@ -2027,6 +2175,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "anthropic".to_string(),
                     service_names: Vec::new(),
                     signal_types: vec![ProxySignal::Logs, ProxySignal::Logs, ProxySignal::Metrics],
@@ -2055,6 +2206,9 @@ mod tests {
             proxy: Some(ProxyConfig {
                 routes: vec![
                     ProxyRouteConfig {
+                        resource_attributes: Default::default(),
+                        metric_attribute_overrides: Default::default(),
+                        metric_attribute_removals: Default::default(),
                         name: "anthropic".to_string(),
                         service_names: vec!["claude-code".to_string()],
                         signal_types: vec![],
@@ -2063,6 +2217,9 @@ mod tests {
                         headers: BTreeMap::new(),
                     },
                     ProxyRouteConfig {
+                        resource_attributes: Default::default(),
+                        metric_attribute_overrides: Default::default(),
+                        metric_attribute_removals: Default::default(),
                         name: "conflicting".to_string(),
                         service_names: vec!["claude-code".to_string()],
                         signal_types: vec![],
@@ -2091,6 +2248,9 @@ mod tests {
         let config = Config {
             proxy: Some(ProxyConfig {
                 routes: vec![ProxyRouteConfig {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: "openai".to_string(),
                     service_names: Vec::new(),
                     signal_types: Vec::new(),

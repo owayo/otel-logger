@@ -3,7 +3,9 @@
 //! Sink はここの `notify` を呼ぶだけでよい。Router 内部で route ごとの channel に
 //! `try_send` し、overflow は drop counter に加算する (drop-newest)。
 
-use std::collections::HashMap;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::{ResourceMetrics, metric::Data};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -187,7 +189,7 @@ fn filter_metrics(
     let target_idx = *matcher
         .get(lane.route.service_names.first()?)
         .unwrap_or(&usize::MAX);
-    let resource_metrics: Vec<_> = req
+    let mut resource_metrics: Vec<_> = req
         .resource_metrics
         .iter()
         .filter(|rm| service_name_matches_lane(rm.resource.as_ref(), matcher, target_idx, lane))
@@ -195,6 +197,14 @@ fn filter_metrics(
         .collect();
     if resource_metrics.is_empty() {
         return None;
+    }
+    // 元の resource を条件で選んでから、転送するコピーだけを書き換える。
+    for resource in &mut resource_metrics {
+        override_metric_attributes(
+            resource,
+            &lane.route.metric_attribute_overrides,
+            &lane.route.metric_attribute_removals,
+        );
     }
     Some(ExportRequest::Metrics(Box::new(
         ExportMetricsServiceRequest { resource_metrics },
@@ -211,6 +221,9 @@ fn service_name_matches_lane(
     _first_target_idx: usize,
     lane: &RouteLane,
 ) -> bool {
+    if !resource_attributes_match(resource, &lane.route.resource_attributes) {
+        return false;
+    }
     let service = extract_service_name(resource);
     match matcher.get(service) {
         Some(idx) => {
@@ -220,6 +233,82 @@ fn service_name_matches_lane(
             *idx == lane_idx
         }
         None => false,
+    }
+}
+
+// 完全一致によって、共有 receiver 上の対象外プロファイルを転送しない。
+fn resource_attributes_match(
+    resource: Option<&Resource>,
+    required: &BTreeMap<String, String>,
+) -> bool {
+    required.iter().all(|(key, expected)| {
+        let mut values = resource
+            .into_iter()
+            .flat_map(|r| &r.attributes)
+            .filter(|kv| &kv.key == key);
+        let first = values.next();
+        values.next().is_none()
+            && matches!(
+                first.and_then(|kv| kv.value.as_ref()).and_then(|v| v.value.as_ref()),
+                Some(OtlpValue::StringValue(value)) if value == expected
+            )
+    })
+}
+
+fn upsert_attributes(
+    attributes: &mut Vec<KeyValue>,
+    overrides: &BTreeMap<String, String>,
+    removals: &[String],
+) {
+    attributes.retain(|kv| !overrides.contains_key(&kv.key) && !removals.contains(&kv.key));
+    attributes.extend(overrides.iter().map(|(key, value)| KeyValue {
+        key: key.clone(),
+        value: Some(AnyValue {
+            value: Some(OtlpValue::StringValue(value.clone())),
+        }),
+        ..KeyValue::default()
+    }));
+}
+
+fn override_metric_attributes(
+    resource: &mut ResourceMetrics,
+    overrides: &BTreeMap<String, String>,
+    removals: &[String],
+) {
+    if overrides.is_empty() && removals.is_empty() {
+        return;
+    }
+    for scope in &mut resource.scope_metrics {
+        for metric in &mut scope.metrics {
+            match metric.data.as_mut() {
+                Some(Data::Gauge(data)) => {
+                    for point in &mut data.data_points {
+                        upsert_attributes(&mut point.attributes, overrides, removals);
+                    }
+                }
+                Some(Data::Sum(data)) => {
+                    for point in &mut data.data_points {
+                        upsert_attributes(&mut point.attributes, overrides, removals);
+                    }
+                }
+                Some(Data::Histogram(data)) => {
+                    for point in &mut data.data_points {
+                        upsert_attributes(&mut point.attributes, overrides, removals);
+                    }
+                }
+                Some(Data::ExponentialHistogram(data)) => {
+                    for point in &mut data.data_points {
+                        upsert_attributes(&mut point.attributes, overrides, removals);
+                    }
+                }
+                Some(Data::Summary(data)) => {
+                    for point in &mut data.data_points {
+                        upsert_attributes(&mut point.attributes, overrides, removals);
+                    }
+                }
+                None => {}
+            }
+        }
     }
 }
 
@@ -258,6 +347,223 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use std::sync::Arc;
+
+    #[test]
+    fn resource_filter_requires_one_exact_string_per_key() {
+        let required = BTreeMap::from([("profile".into(), "work".into())]);
+        assert!(!resource_attributes_match(None, &required));
+        let mut r = resource_for("claude-code");
+        assert!(!resource_attributes_match(Some(&r), &required));
+        r.attributes.push(kv_str("profile", "home"));
+        assert!(!resource_attributes_match(Some(&r), &required));
+        r.attributes.pop();
+        r.attributes.push(kv_str("profile", "work"));
+        assert!(resource_attributes_match(Some(&r), &required));
+        r.attributes.push(kv_str("profile", "work"));
+        assert!(!resource_attributes_match(Some(&r), &required));
+    }
+
+    #[test]
+    fn resource_filter_rejects_non_string_values_and_requires_every_condition() {
+        let required = BTreeMap::from([
+            ("profile".into(), "work".into()),
+            ("region".into(), "west".into()),
+        ]);
+        let mut resource = resource_for("claude-code");
+        resource.attributes.push(kv_str("region", "west"));
+        for value in [
+            None,
+            Some(AnyValue { value: None }),
+            Some(AnyValue {
+                value: Some(OtlpValue::BoolValue(true)),
+            }),
+            Some(AnyValue {
+                value: Some(OtlpValue::IntValue(1)),
+            }),
+        ] {
+            resource.attributes.push(KeyValue {
+                key: "profile".into(),
+                value,
+                ..Default::default()
+            });
+            assert!(!resource_attributes_match(Some(&resource), &required));
+            resource.attributes.pop();
+        }
+        resource.attributes.push(kv_str("profile", "work"));
+        assert!(resource_attributes_match(Some(&resource), &required));
+        resource.attributes.remove(1);
+        assert!(!resource_attributes_match(Some(&resource), &required));
+        assert!(resource_attributes_match(None, &BTreeMap::new()));
+    }
+
+    #[test]
+    fn resource_conditions_filter_logs_and_traces_without_rewriting_them() {
+        use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
+
+        let (lane, mut rx) = make_lane("work", vec!["claude-code"]);
+        let mut lane = Arc::try_unwrap(lane).ok().unwrap();
+        lane.route.resource_attributes = BTreeMap::from([("profile".into(), "work".into())]);
+        lane.route.metric_attribute_overrides =
+            BTreeMap::from([("user.email".into(), "you@example.com".into())]);
+        lane.route.metric_attribute_removals = vec!["profile".into()];
+        let router = ProxyRouter::new(vec![Arc::new(lane)]);
+        let mut marked = resource_for("claude-code");
+        marked.attributes.push(kv_str("profile", "work"));
+        marked
+            .attributes
+            .push(kv_str("user.email", "original@example.com"));
+        router.notify(&TelemetryRecord::Logs(Box::new(ExportLogsServiceRequest {
+            resource_logs: vec![
+                resource_logs_for("claude-code"),
+                ResourceLogs {
+                    resource: Some(marked.clone()),
+                    ..Default::default()
+                },
+            ],
+        })));
+        let ExportRequest::Logs(logs) = rx.try_recv().unwrap() else {
+            panic!("logs expected")
+        };
+        assert_eq!(logs.resource_logs.len(), 1);
+        assert_eq!(logs.resource_logs[0].resource.as_ref(), Some(&marked));
+        router.notify(&TelemetryRecord::Traces(Box::new(
+            ExportTraceServiceRequest {
+                resource_spans: vec![
+                    ResourceSpans {
+                        resource: Some(resource_for("claude-code")),
+                        ..Default::default()
+                    },
+                    ResourceSpans {
+                        resource: Some(marked.clone()),
+                        ..Default::default()
+                    },
+                ],
+            },
+        )));
+        let ExportRequest::Traces(traces) = rx.try_recv().unwrap() else {
+            panic!("traces expected")
+        };
+        assert_eq!(traces.resource_spans.len(), 1);
+        assert_eq!(traces.resource_spans[0].resource.as_ref(), Some(&marked));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn metric_forwarding_filters_mixed_profiles_and_preserves_original() {
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, NumberDataPoint, ScopeMetrics, Sum};
+        let (lane, mut rx) = make_lane("work", vec!["claude-code"]);
+        let mut lane = Arc::try_unwrap(lane).ok().unwrap();
+        lane.route.resource_attributes = BTreeMap::from([("profile".into(), "work".into())]);
+        lane.route.metric_attribute_overrides =
+            BTreeMap::from([("user.email".into(), "you@example.com".into())]);
+        lane.route.metric_attribute_removals = vec!["user.account_uuid".into()];
+        let mut marked = ResourceMetrics {
+            resource: Some(resource_for("claude-code")),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "tokens".into(),
+                    data: Some(Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                kv_str("user.email", "bot@example.com"),
+                                kv_str("user.email", "duplicate@example.com"),
+                                kv_str("user.account_uuid", "account"),
+                                kv_str("session.id", "session-1"),
+                            ],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let unmarked = marked.clone();
+        marked
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .push(kv_str("profile", "work"));
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![unmarked, marked],
+        };
+        let before = req.clone();
+        let router = ProxyRouter::new(vec![Arc::new(lane)]);
+        router.notify(&TelemetryRecord::Metrics(Box::new(req.clone())));
+        let ExportRequest::Metrics(out) = rx.try_recv().unwrap() else {
+            panic!("metrics expected")
+        };
+        assert_eq!(out.resource_metrics.len(), 1);
+        let Some(Data::Sum(sum)) = &out.resource_metrics[0].scope_metrics[0].metrics[0].data else {
+            panic!("sum expected")
+        };
+        assert_eq!(
+            sum.data_points[0].attributes,
+            vec![
+                kv_str("session.id", "session-1"),
+                kv_str("user.email", "you@example.com")
+            ]
+        );
+        assert_eq!(req, before);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rewriting_supports_all_metric_kinds_and_inserts_missing_keys() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+            HistogramDataPoint, Metric, NumberDataPoint, ScopeMetrics, Sum, Summary,
+            SummaryDataPoint,
+        };
+        let variants = vec![
+            Data::Gauge(Gauge {
+                data_points: vec![NumberDataPoint::default()],
+            }),
+            Data::Sum(Sum {
+                data_points: vec![NumberDataPoint::default()],
+                ..Default::default()
+            }),
+            Data::Histogram(Histogram {
+                data_points: vec![HistogramDataPoint::default()],
+                ..Default::default()
+            }),
+            Data::ExponentialHistogram(ExponentialHistogram {
+                data_points: vec![ExponentialHistogramDataPoint::default()],
+                ..Default::default()
+            }),
+            Data::Summary(Summary {
+                data_points: vec![SummaryDataPoint::default()],
+            }),
+        ];
+        for data in variants {
+            let mut resource = ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        data: Some(data),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            override_metric_attributes(
+                &mut resource,
+                &BTreeMap::from([("user.email".into(), "you@example.com".into())]),
+                &[],
+            );
+            let attrs = match resource.scope_metrics[0].metrics[0].data.as_ref().unwrap() {
+                Data::Gauge(v) => &v.data_points[0].attributes,
+                Data::Sum(v) => &v.data_points[0].attributes,
+                Data::Histogram(v) => &v.data_points[0].attributes,
+                Data::ExponentialHistogram(v) => &v.data_points[0].attributes,
+                Data::Summary(v) => &v.data_points[0].attributes,
+            };
+            assert_eq!(attrs, &vec![kv_str("user.email", "you@example.com")]);
+        }
+    }
 
     fn kv_str(k: &str, v: &str) -> KeyValue {
         KeyValue {
@@ -298,6 +604,9 @@ mod tests {
             Arc::new(RouteLane {
                 name: name.to_string(),
                 route: ProxyRoute {
+                    resource_attributes: Default::default(),
+                    metric_attribute_overrides: Default::default(),
+                    metric_attribute_removals: Default::default(),
                     name: name.to_string(),
                     service_names: service_names.into_iter().map(|s| s.to_string()).collect(),
                     signals: ProxySignal::ALL.to_vec(),
@@ -436,6 +745,9 @@ mod tests {
         let lane = Arc::new(RouteLane {
             name: "anthropic".to_string(),
             route: ProxyRoute {
+                resource_attributes: Default::default(),
+                metric_attribute_overrides: Default::default(),
+                metric_attribute_removals: Default::default(),
                 name: "anthropic".to_string(),
                 service_names: vec!["claude-code".to_string()],
                 signals: ProxySignal::ALL.to_vec(),

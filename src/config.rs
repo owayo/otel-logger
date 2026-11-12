@@ -268,6 +268,15 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProxyRouteConfig {
+    /// 転送に必要な resource 属性の完全一致条件。キーの欠落・重複や文字列以外の値は拒否する。
+    #[serde(default)]
+    pub resource_attributes: BTreeMap<String, String>,
+    /// 転送する metric point に追加・置換する文字列属性。保存済み JSONL は変更しない。
+    #[serde(default)]
+    pub metric_attribute_overrides: BTreeMap<String, String>,
+    /// 転送するコピーの metric point から削除する属性キー。
+    #[serde(default)]
+    pub metric_attribute_removals: Vec<String>,
     /// route の識別子。同一 config 内で unique。Phase B の checkpoint ファイル名にも使う。
     pub name: String,
     /// この route にマッチさせる `service.name` の集合。組み込み既定
