@@ -238,6 +238,8 @@ otel-logger \
 
 振り分け、再送、TOML での書き方、route ごとの送信件数: [docs/proxy.ja.md](docs/proxy.ja.md)
 
+route ごとに resource 属性の完全一致条件を指定し、転送する metric point の属性だけを置換・削除できます。プロファイルの目印を付けたクライアントだけを転送し、JSONL には元の payload を残せます。[プロファイル別の転送例](docs/proxy.ja.md#プロファイルを指定したクライアントの-metrics-だけを転送する)を参照してください。
+
 ## 開発
 
 <!-- standard:dev:start -->

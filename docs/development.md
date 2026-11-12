@@ -12,13 +12,13 @@ mise exec -- cargo run --release --locked --example replay_check -- otel-logger.
 
 Decode failures are reported on stderr and produce a nonzero exit status. Totals from valid batches are still printed for diagnosis; a successful verification requires zero failures. Read errors also return a nonzero status.
 
-## Real-log verification (2026-10-22)
+## Real-log verification (2026-11-12)
 
-A successful CI capture from Claude Code 2.1.306 and Codex 0.163.0 replayed all 161 batches in arrival order with zero decode failures. Claude's 12 API requests matched metrics for all four token types and cost. Codex's 38 SSE completions, excluding two tool-only events, matched turn metrics for every token type.
+Frozen local captures from November 11 and 12 contained 6,971 and 10,254 complete batches. Replaying every batch in arrival order produced zero decode failures. Independently calculated token, cost, request count, and duration totals matched the aggregator; each agent's total also equaled the sum of all its buckets. This verification did not include a new CI artifact.
 
-Local captures from October 21 and a frozen October 22 snapshot contained 25,191 and 17,861 batches. After scanning the complete captures, retaining usage and session metadata yielded 10,861 and 7,824 replay batches, both with zero decode failures. Independent token, cost, request count, and duration totals matched the aggregator, and each agent's total equaled the sum of its buckets.
+The captures included Claude Code 2.1.322, Codex 0.167.0–0.167.2, and Desktop server builds 0.167.0-alpha.3.2 / alpha.4.1. Of 312 and 759 Codex SSE completions, 37 and 25 tool-only events were excluded according to the existing rule. Active logs and metrics cover different arrival ranges, so comparing their entire raw totals is not a regression criterion.
 
-The local captures included Claude Code 2.1.304–2.1.308, Codex 0.163.0, and Desktop builds 0.163.0-alpha.10.2 / alpha.11.1. Existing aggregation handled new model names. The `node_repl` event `codex.browser_use.authority_acquisition` carried operational metadata without usage. Active logs and metrics cover different arrival ranges, so comparing their entire raw totals is not a regression criterion. Raw logs and processed replay files are kept outside the repository.
+Usage extraction continues to use Claude's aggregate `cache_creation_tokens`; additional cache-duration and agent attributes do not add usage a second time. Regression cases cover the non-usage events `claude_code.compaction`, `claude_code.subagent_completed`, and `codex.sandbox_outcome`. No new aggregation branch was needed. Raw logs and replay files are kept outside the repository.
 
 ## Dependency audit
 

@@ -258,6 +258,9 @@ mod tests {
         });
 
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec!["test-service".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -294,6 +297,9 @@ mod tests {
         });
 
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec!["test-service".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -344,6 +350,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),
@@ -398,6 +407,9 @@ mod tests {
             }
         });
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),
@@ -459,6 +471,9 @@ mod tests {
                 .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
         );
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),
@@ -530,6 +545,9 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let route = ProxyRoute {
+                resource_attributes: Default::default(),
+                metric_attribute_overrides: Default::default(),
+                metric_attribute_removals: Default::default(),
                 name: "test".to_string(),
                 service_names: vec![],
                 signals: ProxySignal::ALL.to_vec(),
@@ -596,6 +614,9 @@ mod tests {
         });
 
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".to_string(),
             service_names: vec!["test-service".to_string()],
             signals: ProxySignal::ALL.to_vec(),
@@ -662,6 +683,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let route = ProxyRoute {
+            resource_attributes: Default::default(),
+            metric_attribute_overrides: Default::default(),
+            metric_attribute_removals: Default::default(),
             name: "test".into(),
             service_names: vec![],
             signals: ProxySignal::ALL.to_vec(),

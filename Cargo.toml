@@ -30,7 +30,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 
 # gRPC 関連。`channel` を明示的に含めて OTLP proxy 転送 (client 側) にも使う。
 # TLS は webpki-roots を採用し、追加のシステム依存を抱えないビルドにする。
-tonic = { version = "0.14.6", default-features = false, features = [
+tonic = { version = "0.14.8", default-features = false, features = [
     "server",
     "router",
     "transport",
@@ -42,7 +42,7 @@ tonic = { version = "0.14.6", default-features = false, features = [
     "tls-ring",
     "tls-webpki-roots",
 ] }
-tonic-prost = "0.14.6"
+tonic-prost = "0.14.8"
 prost = "0.14.4"
 
 # HTTP 関連

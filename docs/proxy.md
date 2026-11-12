@@ -52,6 +52,40 @@ Authorization = "env:OPENAI_PROXY_TOKEN"
 
 Add more `[[proxy.routes]]` blocks for internal collectors, staging clones, etc. A `service.name` claimed by more than one route is rejected at startup to prevent duplicate delivery.
 
+## Forward metrics from an opted-in profile
+
+A shared receiver can require exact string resource attributes on each route. All conditions must match on the original resource. Missing, non-string, or duplicate required keys do not match, even when duplicate values are identical. These conditions apply to logs, traces, and metrics.
+
+```toml
+log-file = "./otel.jsonl"
+
+[[proxy.routes]]
+name = "work-metrics"
+service-names = ["claude-code"]
+signal-types = ["metrics"]
+transport = "http-protobuf"
+endpoint = "https://collector.example.com"
+metric-attribute-removals = ["user.account_uuid", "user.account_id"]
+
+[proxy.routes.resource-attributes]
+"analytics.profile" = "work"
+
+[proxy.routes.metric-attribute-overrides]
+"user.email" = "you@example.com"
+```
+
+Set `analytics.profile=work` in the opted-in client's `OTEL_RESOURCE_ATTRIBUTES`. Resources from other profiles are not forwarded by this route. The existing rule that each `service.name` belongs to at most one route still applies, even when resource conditions differ.
+
+| Route setting | Type | Behavior |
+|---|---|---|
+| `resource-attributes` | String-to-string table | Require all attributes on each resource; empty means no extra filter |
+| `metric-attribute-overrides` | String-to-string table | Insert missing attributes or replace every copy of the key with one string value |
+| `metric-attribute-removals` | Array of strings | Remove every copy of the listed keys from metric point attributes |
+
+Rewrites apply after filtering, to the forwarding copy of all five OTLP metric kinds: gauge, sum, histogram, exponential histogram, and summary. Resource attributes, logs, spans, and exemplars are unchanged. Local JSONL, human-readable output, and usage totals keep the original payload.
+
+Overrides and removals require at least one non-empty resource condition key other than `service.name`. A key cannot appear in both settings. Invalid combinations fail at startup. CLI endpoint or transport overrides for built-in routes retain these resource conditions and rewrites from the configuration file. Retry behavior and `/stats` counters are unchanged.
+
 ## Counters
 
 Per-route counters are exposed at `GET /stats`:

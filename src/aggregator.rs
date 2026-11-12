@@ -2632,6 +2632,8 @@ mod tests {
             "claude_code.hook_execution_complete",
             "claude_code.assistant_response",
             "claude_code.tool_decision",
+            "claude_code.compaction",
+            "claude_code.subagent_completed",
         ] {
             let count = agg.ingest_logs(&make_log_req(
                 SERVICE_CLAUDE,
@@ -4799,6 +4801,7 @@ mod tests {
             "codex.turn_ttft",
             "codex.agent_communication",
             "codex.skill_invocation",
+            "codex.sandbox_outcome",
         ] {
             agg.ingest_logs(&make_log_req(
                 SERVICE_CODEX_EXEC,
