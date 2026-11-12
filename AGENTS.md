@@ -27,6 +27,7 @@ mise exec -- cargo audit  # mise で固定した cargo-audit で Cargo.lock を�
 ## 実装上の注意
 
 - proxy の `resource-attributes` は元の resource に対して全条件を完全一致で検査し、必要なキーの欠落・重複・非文字列値を拒否する。`metric-attribute-overrides` / `metric-attribute-removals` は条件で選んだ転送用コピーの metric point だけに適用し、JSONL・表示・累計を変えない。5種類の metric を扱い、組み込み route を CLI で上書きしても条件と書き換え設定を保持する。書き換えには `service.name` 以外の resource 条件を要求し、置換と削除のキーの重複は起動時に拒否する。条件が異なっていても同一 service を複数 route に割り当てることはできない。
+- 2026-11-12 のローカル実ログ (Claude Code 2.1.322 / Codex 0.167系、2日分の6,971 / 10,254 batch) を全件再生し、decode 失敗0件、独立集計との全累計一致、`total == Σbuckets` を確認した。`claude_code.compaction` / `claude_code.subagent_completed` / `codex.sandbox_outcome` は使用量を持たず、既存の抽出規則で除外する。詳細と検証範囲は `docs/development.md` / `docs/development.ja.md` に記録する。
 
 - `Sink::shutdown` は admission の write lock で受理済み record の完了を待ち、新しい record を拒否してから最終 fsync する。`record` は read guard を専用 task に移すため、handler の cancel でも blocking write の完了まで保持する。listener の abort だけでは接続 task が止まるとは限らず、gate 無しでは最終同期後に ACK が出る (回帰テスト: `shutdown_waits_for_cancelled_handler_and_rejects_later_records`)。
 - JSONL 永続化の障害も `WriteHealth` で開始・10 分ごとの継続・最後の失敗から 60 秒後の回復を診断する。エラー chain は制御文字を escape して記録し、exporter へは retryable status を返す。
